@@ -59,8 +59,9 @@ reach Postgres and Redis.
 - [x] **1.3 · Scaffold Nest 12** — ESM (`"type": "module"`), tsconfig, npm scripts.
   *The CLI now emits ESM by default (`nodenext`, `.js` import extensions) — no conversion needed.
   Vitest and oxlint are the generated defaults; `@nestjs/mau` removed, as M11 deploys by hand.*
-- [ ] **1.4 · `ConfigModule` + Zod env schema**, validated at boot.
-  *Invalid configuration fails startup, not a request in production.*
+- [x] **1.4 · `ConfigModule` + Zod env schema**, validated at boot.
+  *Invalid configuration fails startup, not a request in production. Nest 12 accepts Zod
+  directly as a Standard Schema validator — no Joi, one definition of the contract.*
 - [ ] **1.5 · Prisma** — `prisma-client` generator with `output`, `PrismaService`, driver adapter.
   *Single injectable client; `prisma-client-js` is deprecated.*
 - [ ] **1.6 · `RedisModule`** exporting an ioredis client.
@@ -72,7 +73,7 @@ reach Postgres and Redis.
 
 - [x] `docker compose up -d` brings postgres and redis to `healthy`
 - [x] `npm run start:dev` boots the API
-- [ ] Removing a required env var crashes at startup with a readable message
+- [x] Removing a required env var crashes at startup with a readable message
 - [ ] `GET /ready` returns 200, and 503 when the Postgres container is stopped
 
 ---
