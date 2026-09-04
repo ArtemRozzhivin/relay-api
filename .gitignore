@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# generated Prisma client (regenerated from schema.prisma)
+src/generated/
+
+# environment — never commit real secrets
+.env
+.env.*
+!.env.example
+
+# test + coverage
+coverage/
+.vitest/
+
+# logs
+*.log
+npm-debug.log*
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
