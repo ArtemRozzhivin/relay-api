@@ -4,6 +4,8 @@ import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { apiEnvSchema } from './config/env.schema.js';
 import { PrismaModule } from './prisma/prisma.module.js';
+import { RedisModule } from './redis/redis.module.js';
+import { HealthModule } from './health/health.module.js';
 
 @Module({
   imports: [
@@ -14,6 +16,8 @@ import { PrismaModule } from './prisma/prisma.module.js';
       validationSchema: apiEnvSchema,
     }),
     PrismaModule,
+    RedisModule,
+    HealthModule,
   ],
   controllers: [AppController],
   providers: [AppService],
