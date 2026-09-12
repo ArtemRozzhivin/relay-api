@@ -5,7 +5,9 @@ const duration = z
   .regex(/^\d+(ms|s|m|h|d)$/, 'expected a duration such as 15m, 24h or 30d');
 
 export const sharedEnvSchema = z.object({
-  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  NODE_ENV: z
+    .enum(['development', 'test', 'production'])
+    .default('development'),
   LOG_LEVEL: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
     .default('info'),
@@ -29,6 +31,8 @@ export const apiEnvSchema = sharedEnvSchema.extend({
         .map((origin) => origin.trim())
         .filter(Boolean),
     ),
+  ARGONID_TIME_COST: z.coerce.number().int().positive().default(2),
+  ARGONID_MEMORY_COST: z.coerce.number().int().positive().default(19456),
 });
 
 export type SharedEnv = z.infer<typeof sharedEnvSchema>;

@@ -99,7 +99,7 @@ reach Postgres and Redis.
 
 ### Tasks
 
-- [ ] **2.1 ·** `User` **+** `RefreshToken` **models**, first migration.
+- [x] **2.1 ·** `User` **+** `RefreshToken` **models**, first migration.
   ```
   `ON DELETE CASCADE` _is a schema-level policy decision._
   ```
