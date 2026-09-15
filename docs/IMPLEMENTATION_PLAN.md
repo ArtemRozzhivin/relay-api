@@ -103,19 +103,19 @@ reach Postgres and Redis.
   ```
   `ON DELETE CASCADE` _is a schema-level policy decision._
   ```
-- [ ] **2.2 · Register + login**, argon2id hashing.
+- [x] **2.2 · Register + login**, argon2id hashing.
   ```
   _Memory-hard hashing defeats GPU parallelism._
   ```
-- [ ] **2.3 ·** `JwtAuthGuard` via `APP_GUARD`, `@Public()` to opt out.
+- [x] **2.3 ·** `JwtAuthGuard` via `APP_GUARD`, `@Public()` to opt out.
   ```
   _Token-form registration goes through DI;_ `new Guard()` _cannot inject._
   ```
-- [ ] **2.4 · Refresh-token rotation + logout.**
+- [x] **2.4 · Refresh-token rotation + logout.**
   ```
   _Access tokens cannot be revoked; refresh tokens can, because they are stored._
   ```
-- [ ] **2.5 ·** `RolesGuard` **+** `@Roles()`**.**
+- [x] **2.5 ·** `RolesGuard` **+** `@Roles()`**.**
   ```
   _Coarse-grained RBAC at the guard layer._
   ```
@@ -125,9 +125,9 @@ validated body. Ownership checks requiring a DB read belong in the service layer
 
 ### Done when
 
-- [ ] The full register → login → refresh → logout flow works over curl
-- [ ] A protected route returns 401 without a token
-- [ ] A replayed refresh token is rejected
+- [x] The full register → login → refresh → logout flow works over curl
+- [x] A protected route returns 401 without a token
+- [x] A replayed refresh token is rejected
 
 ---
 

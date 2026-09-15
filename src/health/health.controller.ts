@@ -6,6 +6,7 @@ import {
 } from '@nestjs/terminus';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisHealthIndicator } from './redis.health.js';
+import { Public } from '../auth/decorators/public.decorator.js';
 
 @Controller()
 export class HealthController {
@@ -16,12 +17,14 @@ export class HealthController {
     private readonly redis: RedisHealthIndicator,
   ) {}
 
+  @Public()
   @Get('health')
   @HealthCheck()
   liveness() {
     return this.health.check([]);
   }
 
+  @Public()
   @Get('ready')
   @HealthCheck()
   readiness() {
