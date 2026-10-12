@@ -1,8 +1,8 @@
 import { Test } from '@nestjs/testing';
-import { UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthService } from './auth.service.js';
+import { InvalidCredentialsError } from '../common/errors/app-error.js';
 import { PasswordService } from './password.service.js';
 import { TokenService } from './token.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
@@ -43,7 +43,7 @@ describe('AuthService', () => {
 
     await expect(
       service.signIn({ email: 'nobody@example.com', password: 'password123' }),
-    ).rejects.toBeInstanceOf(UnauthorizedException);
+    ).rejects.toBeInstanceOf(InvalidCredentialsError);
   });
 
   it('rejects a wrong password', async () => {
@@ -52,7 +52,7 @@ describe('AuthService', () => {
 
     await expect(
       service.signIn({ email: user.email, password: 'wrong-password' }),
-    ).rejects.toBeInstanceOf(UnauthorizedException);
+    ).rejects.toBeInstanceOf(InvalidCredentialsError);
   });
 
   it('returns tokens and never returns the password hash', async () => {

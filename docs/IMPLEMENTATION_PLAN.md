@@ -138,11 +138,11 @@ validated body. Ownership checks requiring a DB read belong in the service layer
 
 ### Tasks
 
-- [ ] **3.1 · Global** `StandardSchemaValidationPipe` + Zod schemas, `.strict()` throughout.
+- [x] **3.1 · Global** `StandardSchemaValidationPipe` + Zod schemas, `.strict()` throughout.
   ```
   `.strict()` _is mass-assignment protection at the edge._
   ```
-- [ ] **3.2 · Domain error classes +** `DomainExceptionFilter` → the envelope.
+- [x] **3.2 · Domain error classes +** `DomainExceptionFilter` → the envelope.
   ```
   _Operational errors surface their message; unexpected ones never leak internals._
   ```

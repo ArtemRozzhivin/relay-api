@@ -1,9 +1,10 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { createHash, randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service.js';
 import type { ApiEnv } from '../config/env.schema.js';
+import { InvalidRefreshTokenError } from '../common/errors/app-error.js';
 
 interface RefreshPayload {
   sub: string;
@@ -53,7 +54,7 @@ export class TokenService {
         secret: this.config.get('JWT_REFRESH_SECRET', { infer: true }),
       });
     } catch {
-      throw new UnauthorizedException('Invalid refresh token');
+      throw new InvalidRefreshTokenError();
     }
 
     const { count } = await this.prisma.refreshToken.updateMany({
@@ -66,7 +67,7 @@ export class TokenService {
     });
 
     if (count === 0) {
-      throw new UnauthorizedException('Invalid refresh token');
+      throw new InvalidRefreshTokenError();
     }
 
     return {

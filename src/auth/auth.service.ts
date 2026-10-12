@@ -1,14 +1,14 @@
-import {
-  ConflictException,
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { PasswordService } from './password.service.js';
 import { JwtService } from '@nestjs/jwt';
 import { TokenService } from './token.service.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { LoginInput, RegisterInput } from './auth.schema.js';
+import {
+  EmailAlreadyRegisteredError,
+  InvalidCredentialsError,
+} from '../common/errors/app-error.js';
 
 @Injectable()
 export class AuthService {
@@ -23,7 +23,7 @@ export class AuthService {
     const user = await this.dbService.user.findUnique({ where: { email } });
 
     if (!user) {
-      throw new UnauthorizedException('Invalid credentials');
+      throw new InvalidCredentialsError();
     }
 
     const verify = await this.passwordService.verify(
@@ -32,7 +32,7 @@ export class AuthService {
     );
 
     if (!verify) {
-      throw new UnauthorizedException('Invalid credentials');
+      throw new InvalidCredentialsError();
     }
 
     const payload = { sub: user.id, email: user.email, role: user.role };
@@ -69,7 +69,7 @@ export class AuthService {
         error instanceof Prisma.PrismaClientKnownRequestError &&
         error.code === 'P2002'
       ) {
-        throw new ConflictException('Email already registered');
+        throw new EmailAlreadyRegisteredError();
       }
       throw error;
     }
@@ -84,7 +84,7 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new UnauthorizedException();
+      throw new InvalidCredentialsError();
     }
 
     const payload = { sub: user.id, email: user.email, role: user.role };
