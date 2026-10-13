@@ -1,6 +1,6 @@
 import { Module, StandardSchemaValidationPipe } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { APP_FILTER, APP_PIPE } from '@nestjs/core';
+import { APP_FILTER, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { apiEnvSchema } from './config/env.schema.js';
@@ -9,6 +9,7 @@ import { RedisModule } from './redis/redis.module.js';
 import { HealthModule } from './health/health.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { DomainExceptionFilter } from './common/filters/domain-exception.filter.js';
+import { ResponseEnvelopeInterceptor } from './common/interceptors/response-envelope.interceptor.js';
 
 @Module({
   imports: [
@@ -33,6 +34,10 @@ import { DomainExceptionFilter } from './common/filters/domain-exception.filter.
     {
       provide: APP_FILTER,
       useClass: DomainExceptionFilter,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: ResponseEnvelopeInterceptor,
     },
   ],
 })

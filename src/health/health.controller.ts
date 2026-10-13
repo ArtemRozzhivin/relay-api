@@ -7,6 +7,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisHealthIndicator } from './redis.health.js';
 import { Public } from '../auth/decorators/public.decorator.js';
+import { NoEnvelope } from '../common/decorators/no-envelope.decorator.js';
 
 @Controller()
 export class HealthController {
@@ -18,6 +19,7 @@ export class HealthController {
   ) {}
 
   @Public()
+  @NoEnvelope()
   @Get('health')
   @HealthCheck()
   liveness() {
@@ -25,6 +27,7 @@ export class HealthController {
   }
 
   @Public()
+  @NoEnvelope()
   @Get('ready')
   @HealthCheck()
   readiness() {
