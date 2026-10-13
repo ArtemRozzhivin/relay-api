@@ -1,5 +1,5 @@
 import { Module, StandardSchemaValidationPipe } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_FILTER, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
@@ -10,6 +10,8 @@ import { HealthModule } from './health/health.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { DomainExceptionFilter } from './common/filters/domain-exception.filter.js';
 import { ResponseEnvelopeInterceptor } from './common/interceptors/response-envelope.interceptor.js';
+import { LoggerModule } from 'nestjs-pino';
+import { buildLoggerParams } from './common/logging/logger.params.js';
 
 @Module({
   imports: [
@@ -18,6 +20,10 @@ import { ResponseEnvelopeInterceptor } from './common/interceptors/response-enve
       cache: true,
       envFilePath: ['.env'],
       validationSchema: apiEnvSchema,
+    }),
+    LoggerModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: buildLoggerParams,
     }),
     PrismaModule,
     RedisModule,

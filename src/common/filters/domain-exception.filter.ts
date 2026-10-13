@@ -6,7 +6,6 @@ import {
   HttpStatus,
   Logger,
 } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { AppError, type ErrorKind } from '../errors/app-error.js';
 
@@ -34,8 +33,7 @@ export class DomainExceptionFilter implements ExceptionFilter {
     const request = http.getRequest<Request>();
     const response = http.getResponse<Response>();
 
-    const requestId =
-      (request.headers['x-request-id'] as string | undefined) ?? randomUUID();
+    const requestId = String(request.id);
 
     const { status, error } = this.describe(exception, requestId);
 

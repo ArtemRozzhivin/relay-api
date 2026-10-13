@@ -6,7 +6,6 @@ import {
   NestInterceptor,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { map, type Observable } from 'rxjs';
 import { NO_ENVELOPE_KEY } from '../decorators/no-envelope.decorator.js';
@@ -40,8 +39,7 @@ export class ResponseEnvelopeInterceptor<T>
     const request = http.getRequest<Request>();
     const response = http.getResponse<Response>();
 
-    const requestId =
-      (request.headers['x-request-id'] as string | undefined) ?? randomUUID();
+    const requestId = String(request.id);
 
     return next.handle().pipe(
       map((data) => {

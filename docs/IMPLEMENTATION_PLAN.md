@@ -12,7 +12,7 @@ in a runnable, demonstrable state.
 
 - [x] **M1** · Service skeleton
 - [ ] **M2** · Authentication
-- [ ] **M3** · Cross-cutting concerns
+- [x] **M3** · Cross-cutting concerns
 - [ ] **M4** · Jobs API
 - [ ] **M5** · Queue and worker
 - [ ] **M6** · Reliability
@@ -146,19 +146,19 @@ validated body. Ownership checks requiring a DB read belong in the service layer
   ```
   _Operational errors surface their message; unexpected ones never leak internals._
   ```
-- [ ] **3.3 ·** `ResponseEnvelopeInterceptor`**.**
+- [x] **3.3 ·** `ResponseEnvelopeInterceptor`**.**
   ```
   _Interceptors wrap both sides of the handler._
   ```
-- [ ] **3.4 ·** `nestjs-pino`, request id, `X-Request-Id` header.
+- [x] **3.4 ·** `nestjs-pino`, request id, `X-Request-Id` header.
   ```
   _Structured JSON is queryable by field; a correlation id makes one request traceable._
   ```
 
 ### Done when
 
-- [ ] Every success and every error share one envelope shape
-- [ ] Every log line carries the same `requestId` as its response header
+- [x] Every success and every error share one envelope shape
+- [x] Every log line carries the same `requestId` as its response header
 
 ---
 
