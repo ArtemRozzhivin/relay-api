@@ -42,3 +42,21 @@ export class EmailAlreadyRegisteredError extends AppError {
     super('Email already registered');
   }
 }
+
+export class JobNotFoundError extends AppError {
+  readonly kind = 'NOT_FOUND' as const;
+  readonly code = 'JOB_NOT_FOUND';
+
+  constructor() {
+    super('Job not found');
+  }
+}
+
+export class IdempotencyKeyRequiredError extends AppError {
+  readonly kind = 'VALIDATION' as const;
+  readonly code = 'IDEMPOTENCY_KEY_REQUIRED';
+
+  constructor() {
+    super('The Idempotency-Key header is required');
+  }
+}

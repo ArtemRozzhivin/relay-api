@@ -11,9 +11,9 @@ in a runnable, demonstrable state.
 ## Progress
 
 - [x] **M1** · Service skeleton
-- [ ] **M2** · Authentication
+- [x] **M2** · Authentication
 - [x] **M3** · Cross-cutting concerns
-- [ ] **M4** · Jobs API
+- [x] **M4** · Jobs API
 - [ ] **M5** · Queue and worker
 - [ ] **M6** · Reliability
 - [ ] **M7** · Realtime
@@ -169,23 +169,23 @@ validated body. Ownership checks requiring a DB read belong in the service layer
 
 ### Tasks
 
-- [ ] **4.1 ·** `Job` **model**, enums, indexes; raw-SQL migration for the `CHECK` constraints.
+- [x] **4.1 ·** `Job` **model**, enums, indexes; raw-SQL migration for the `CHECK` constraints.
   ```
   _Prisma's schema language cannot express CHECK — use the_ `--create-only` _flow._
   ```
-- [ ] **4.2 ·** `UNIQUE (userId, idempotencyKey)`**.**
+- [x] **4.2 ·** `UNIQUE (userId, idempotencyKey)`**.**
   ```
   _The index is the guarantee; application code is only the coordinator._
   ```
-- [ ] **4.3 ·** `POST /jobs` — insert, catch `P2002`, return the existing job with `replayed: true`.
+- [x] **4.3 ·** `POST /jobs` — insert, catch `P2002`, return the existing job with `replayed: true`.
   ```
   _SELECT-then-INSERT races; the insert is the check._
   ```
-- [ ] **4.4 · The guarded-transition helper** (`updateMany` + row count).
+- [x] **4.4 · The guarded-transition helper** (`updateMany` + row count).
   ```
   _The affected row count is the source of truth, never a previously read value._
   ```
-- [ ] **4.5 ·** `GET /jobs/:id`**,** `GET /jobs`, 404-before-403 on ownership.
+- [x] **4.5 ·** `GET /jobs/:id`**,** `GET /jobs`, 404-before-403 on ownership.
   ```
   _The API does not reveal a resource exists to a caller with no right to it._
   ```
@@ -195,8 +195,8 @@ the same job id rather than `409`, so retry logic stays out of the client.
 
 ### Done when
 
-- [ ] Submitting twice with the same `Idempotency-Key` returns the same job id
-- [ ] Another user's job id returns 404
+- [x] Submitting twice with the same `Idempotency-Key` returns the same job id
+- [x] Another user's job id returns 404
 
 ---
 

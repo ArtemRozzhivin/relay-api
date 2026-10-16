@@ -8,6 +8,7 @@ import { PrismaModule } from './prisma/prisma.module.js';
 import { RedisModule } from './redis/redis.module.js';
 import { HealthModule } from './health/health.module.js';
 import { AuthModule } from './auth/auth.module.js';
+import { JobsModule } from './jobs/jobs.module.js';
 import { DomainExceptionFilter } from './common/filters/domain-exception.filter.js';
 import { ResponseEnvelopeInterceptor } from './common/interceptors/response-envelope.interceptor.js';
 import { LoggerModule } from 'nestjs-pino';
@@ -29,6 +30,7 @@ import { buildLoggerParams } from './common/logging/logger.params.js';
     RedisModule,
     HealthModule,
     AuthModule,
+    JobsModule,
   ],
   controllers: [AppController],
   providers: [
