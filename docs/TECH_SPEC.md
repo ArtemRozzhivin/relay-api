@@ -576,7 +576,11 @@ Three rules that are checkable in review:
 
 ### 8.1 Queues
 
-One queue, `relay:jobs`, with the BullMQ **job name** set to the `Job.type`.
+One queue, `relay-jobs`, with the BullMQ **job name** set to the `Job.type`.
+
+> **Corrected 2026-10-16:** originally specified as `relay:jobs`. BullMQ v6 rejects a queue name
+> containing `:`, which it reserves as its Redis key separator (`Error: Queue name cannot
+> contain :`). Namespacing belongs in the `prefix` option, not the name.
 
 > **DECISION — D6a · One queue or one per type?**
 >
@@ -630,12 +634,12 @@ rides along so the worker's logs join the submitting request's logs (§12.1).
 |---|---|
 | Concurrency | `5` per worker process (`WORKER_CONCURRENCY`) |
 | Instances | 1 in dev; ≥2 in the load test, to prove no double-processing |
-| Registration | `BullModule.registerQueue({ name: 'relay:jobs' })` **+** a `WorkerHost` class — in the worker root only |
+| Registration | `BullModule.registerQueue({ name: 'relay-jobs' })` **+** a `WorkerHost` class — in the worker root only |
 
 Processor shape is BullMQ v6 / `@nestjs/bullmq` v12:
 
 ```ts
-@Processor('relay:jobs')
+@Processor('relay-jobs')
 export class JobsProcessor extends WorkerHost {
   async process(job: Job<JobMessage>): Promise<unknown> { /* … */ }
 }
@@ -768,14 +772,14 @@ ApiModule  (bootstrap: NestFactory.create)
 ├── RedisModule             (global; exports the ioredis client)
 ├── AuthModule              → AuthController, AuthService, TokenService, JwtStrategy
 ├── JobsModule              → JobsController, JobsService, JobsRepository
-│    └── imports BullModule.registerQueue({ name: 'relay:jobs' })   // PRODUCER ONLY
+│    └── imports BullModule.registerQueue({ name: 'relay-jobs' })   // PRODUCER ONLY
 ├── EventsModule            → EventsGateway (+ the bridge subscriber, D8)
 └── HealthModule            → Terminus: Postgres + Redis
 
 WorkerModule  (bootstrap: NestFactory.createApplicationContext)
 ├── ConfigModule / PrismaModule / RedisModule    (same modules, reused)
 ├── ProcessingModule        → JobsProcessor (WorkerHost), the handler registry
-│    └── imports BullModule.registerQueue({ name: 'relay:jobs' })   // CONSUMER
+│    └── imports BullModule.registerQueue({ name: 'relay-jobs' })   // CONSUMER
 └── HealthModule            (optional: a tiny HTTP listener for container health)
 ```
 
@@ -1048,4 +1052,5 @@ A spec line that survives contact with code should be **edited, not defended**.
 | Date | Change |
 |---|---|
 | 2026-09-01 | v0.2 — phases 8–11 brought into v1 scope (§15, §17). Testing stated as a standing practice across all phases, not a phase-9 activity (§14). |
+| 2026-10-16 | Queue renamed `relay:jobs` → `relay-jobs`: BullMQ v6 rejects `:` in queue names (§8.1). |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

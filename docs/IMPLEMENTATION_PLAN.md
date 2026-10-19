@@ -207,23 +207,23 @@ the same job id rather than `409`, so retry logic stays out of the client.
 
 ### Tasks
 
-- [ ] **5.1 ·** `BullModule.forRoot` **+** `registerQueue` in `JobsModule` — producer only.
+- [x] **5.1 ·** `BullModule.forRoot` **+** `registerQueue` in `JobsModule` — producer only.
   ```
   _Producer and consumer registration are the same call; the distinction is deliberate._
   ```
-- [ ] **5.2 ·** `worker.ts` — second bootstrap via `createApplicationContext()`.
+- [x] **5.2 ·** `worker.ts` — second bootstrap via `createApplicationContext()`.
   ```
   _A Nest context with no HTTP server; two disjoint root modules._
   ```
-- [ ] **5.3 ·** `JobsProcessor extends WorkerHost`**.**
+- [x] **5.3 ·** `JobsProcessor extends WorkerHost`**.**
   ```
   _The_ `@nestjs/bullmq` _v12 shape; the legacy_ `@Process()` _API does not apply._
   ```
-- [ ] **5.4 · Handler registry** — `MOCK` (awaited sleep) and `CHARGE`.
+- [x] **5.4 · Handler registry** — `MOCK` (awaited sleep) and `CHARGE`.
   ```
   _A CPU-blocking processor fails to renew its lock and stalls itself._
   ```
-- [ ] **5.5 · Worker-side transitions** `QUEUED → RUNNING → SUCCEEDED`.
+- [x] **5.5 · Worker-side transitions** `QUEUED → RUNNING → SUCCEEDED`.
   ```
   _Only the worker moves a job past_ `QUEUED`_._
   ```
@@ -237,9 +237,9 @@ entirely — the worker continues draining the queue, confirming the process bou
 
 ### Done when
 
-- [ ] **A2 passes** — N jobs submitted, N terminal, none stuck
-- [ ] The worker keeps draining with the API stopped
-- [ ] `AppModule` provably does not import `ProcessingModule`
+- [x] **A2 passes** — N jobs submitted, N terminal, none stuck
+- [x] The worker keeps draining with the API stopped
+- [x] `AppModule` provably does not import `ProcessingModule`
 
 ---
 

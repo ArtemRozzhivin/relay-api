@@ -35,5 +35,10 @@ export const apiEnvSchema = sharedEnvSchema.extend({
   ARGONID_MEMORY_COST: z.coerce.number().int().positive().default(19456),
 });
 
+export const workerEnvSchema = sharedEnvSchema.extend({
+  WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(5),
+});
+
 export type SharedEnv = z.infer<typeof sharedEnvSchema>;
+export type WorkerEnv = z.infer<typeof workerEnvSchema>;
 export type ApiEnv = z.infer<typeof apiEnvSchema>;

@@ -1,10 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
-import { JobTransitionService } from './job-transition.service.js';
-import { jobHandlers } from './job-handlers.js';
 import { JobNotFoundError } from '../common/errors/app-error.js';
 import { Prisma } from '../generated/prisma/client.js';
-import type { Job } from '../generated/prisma/client.js';
+import { JOBS_QUEUE, type JobMessage } from './job-queue.js';
 import type { ListJobsQuery, SubmitJobInput } from './jobs.schema.js';
 
 interface SubmitArgs {
@@ -20,12 +20,14 @@ export class JobsService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly transitions: JobTransitionService,
+    @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
   ) {}
 
   async submit({ userId, idempotencyKey, correlationId, input }: SubmitArgs) {
+    let job;
+
     try {
-      const job = await this.prisma.job.create({
+      job = await this.prisma.job.create({
         data: {
           userId,
           idempotencyKey,
@@ -35,10 +37,6 @@ export class JobsService {
           maxAttempts: input.maxAttempts,
         },
       });
-
-      const executed = await this.execute(job);
-
-      return { job: executed, replayed: false };
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -53,6 +51,25 @@ export class JobsService {
 
       throw error;
     }
+
+    // Decision D5(b): the row is committed before the enqueue, so a crash in
+    // this gap leaves a QUEUED job nobody will run. Assertion A6 measures it;
+    // the transactional outbox in M6 closes it.
+    await this.queue.add(
+      job.type,
+      { jobId: job.id, correlationId },
+      {
+        jobId: job.id,
+        attempts: job.maxAttempts,
+        backoff: { type: 'exponential', delay: 1000 },
+        removeOnComplete: { age: 3600, count: 1000 },
+        removeOnFail: { age: 86_400 },
+      },
+    );
+
+    this.logger.log(`Enqueued job ${job.id} (${job.type})`);
+
+    return { job, replayed: false };
   }
 
   async findOne(userId: string, jobId: string) {
@@ -83,36 +100,5 @@ export class JobsService {
     ]);
 
     return { items, total, limit: query.limit, offset: query.offset };
-  }
-
-  private async execute(job: Job) {
-    const claimed = await this.transitions.claim(job.id);
-
-    if (!claimed) {
-      return job;
-    }
-
-    try {
-      const handler = jobHandlers[claimed.type];
-      const result = await handler(claimed.payload as never);
-
-      return (
-        (await this.transitions.succeed(
-          claimed.id,
-          result as Prisma.InputJsonValue,
-        )) ?? claimed
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-
-      this.logger.warn(`Job ${claimed.id} failed: ${message}`);
-
-      return (
-        (await this.transitions.deadLetter(claimed.id, {
-          code: 'HANDLER_FAILED',
-          message,
-        })) ?? claimed
-      );
-    }
   }
 }
