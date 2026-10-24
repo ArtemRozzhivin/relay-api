@@ -60,3 +60,17 @@ export class IdempotencyKeyRequiredError extends AppError {
     super('The Idempotency-Key header is required');
   }
 }
+
+export class TerminalJobError extends AppError {
+  readonly kind = 'VALIDATION' as const;
+  readonly code = 'JOB_TERMINAL_FAILURE';
+}
+
+export class JobNotDeadLetteredError extends AppError {
+  readonly kind = 'CONFLICT' as const;
+  readonly code = 'JOB_NOT_DEAD_LETTERED';
+
+  constructor() {
+    super('Only a dead-lettered job can be re-driven');
+  }
+}

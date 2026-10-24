@@ -11,6 +11,7 @@ const chargePayloadSchema = z
   .object({
     amountCents: z.coerce.number().int().positive(),
     reference: z.string().min(1).max(200),
+    delayMs: z.coerce.number().int().min(0).max(60_000).default(0),
   })
   .strict();
 

@@ -179,7 +179,16 @@ every line of application code is wrong; constraints listed as **APP** are polic
 - `(userId, status, createdAt DESC)` — the list endpoint's query.
 - `(status)` partial `WHERE status IN ('QUEUED','RUNNING')` — operational "what is in flight".
 
-**DB** `CHECK (attempts >= 0 AND attempts <= maxAttempts)`.
+**DB** `CHECK (attempts >= 0)`.
+
+> `attempts <= maxAttempts` was specified and had to be dropped — it is unsatisfiable. The two
+> counters count different things: `Job.attempts` is incremented by `claim()` on **every
+> delivery**, while BullMQ's retry budget (`attemptsMade`) is incremented only on an **actual
+> failure**. A stalled redelivery therefore consumes one of ours and none of BullMQ's, so
+> `attempts` can legitimately exceed `maxAttempts` by the number of stalls. The dead-letter
+> boundary is a policy decision in the worker; the database only enforces that the counter is
+> sane. (The migration's own comment states the mechanism imprecisely — it says BullMQ redelivers
+> "in addition to its configured retries", which is true of our counter, not of `attemptsMade`.)
 
 ### 4.4 `SideEffect` — the effect-level ledger
 
@@ -501,6 +510,12 @@ Worth stating precisely, because the mental model most people have is wrong:
   and never spin — otherwise reliability measurements reflect the fixture, not the system.
 - A stall-induced redelivery is **not** an error retry. It interacts with whichever attempt
   counter D7 makes authoritative, and the two counters will diverge the first time it happens.
+- **When `maxStalledCount` is exceeded, `process()` is never called.** The worker reads the
+  deferred failure the stalled-checker wrote and goes straight to `handleFailed`, so no code in
+  this repo observes the job — it would stay `RUNNING` for ever, below its own retry budget, and
+  `POST /jobs/:id/retry` would refuse it because the row is not `DEAD_LETTERED`. The worker must
+  therefore finalise from the `failed` **event**, gated on `job.finishedOn`: `failed` fires on
+  every failed attempt, but `finishedOn` is set only once the queue has stopped redelivering.
 
 ### 7.7 Error taxonomy
 
@@ -1053,4 +1068,8 @@ A spec line that survives contact with code should be **edited, not defended**.
 |---|---|
 | 2026-09-01 | v0.2 — phases 8–11 brought into v1 scope (§15, §17). Testing stated as a standing practice across all phases, not a phase-9 activity (§14). |
 | 2026-10-16 | Queue renamed `relay:jobs` → `relay-jobs`: BullMQ v6 rejects `:` in queue names (§8.1). |
+| 2026-10-19 | `CHECK (attempts <= maxAttempts)` dropped as unsatisfiable (§4.3). Corrected 2026-10-24: the cause is that our counter counts deliveries and BullMQ's counts failures, not that stalls enlarge BullMQ's budget. |
+| 2026-10-19 | No custom backoff strategy needed: `backoff.jitter` is built into BullMQ's `exponential` strategy (§7.4). Verified in `backoffs.js` — `jitter: 1` gives a delay uniform in `[0, 2^(n-1) · delay)`. |
+| 2026-10-24 | §7.6 — a job past `maxStalledCount` is failed **without `process()` running**. The worker now finalises such jobs from the `failed` event gated on `finishedOn`; `deadLetter()` accepts `QUEUED` as well as `RUNNING` so an abandoned row can still reach a terminal state. |
+| 2026-10-24 | §7.2 — `redrive()` now writes its own `Outbox` row inside the transition transaction. The commit-then-enqueue gap A6 exists to prove was closed for `submit()` only. |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

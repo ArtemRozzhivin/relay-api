@@ -68,8 +68,36 @@ model Job {
   startedAt      DateTime? @db.Timestamptz(6)
   finishedAt     DateTime? @db.Timestamptz(6)
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sideEffects SideEffect[]
+  outbox      Outbox[]
 
   @@unique([userId, idempotencyKey])
   @@index([userId, status, createdAt(sort: Desc)])
+}
+
+model SideEffect {
+  id        String   @id @default(uuid()) @db.Uuid
+  effectKey String   @unique
+  jobId     String   @db.Uuid
+  kind      String
+  detail    Json
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+}
+
+model Outbox {
+  id            BigInt    @id @default(autoincrement())
+  jobId         String    @db.Uuid
+  queue         String
+  jobName       String
+  payload       Json
+  attempts      Int       @default(0)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(6)
+  publishedAt   DateTime? @db.Timestamptz(6)
+
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
 }

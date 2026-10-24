@@ -35,6 +35,16 @@ export class JobsController {
     return { ...job, replayed };
   }
 
+  @Post(':id/retry')
+  @HttpCode(202)
+  redrive(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', { schema: jobIdSchema }) id: string,
+    @Req() request: Request,
+  ) {
+    return this.jobs.redrive(user.id, id, String(request.id));
+  }
+
   @Get(':id')
   findOne(
     @CurrentUser() user: AuthenticatedUser,

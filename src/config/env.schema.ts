@@ -31,6 +31,7 @@ export const apiEnvSchema = sharedEnvSchema.extend({
         .map((origin) => origin.trim())
         .filter(Boolean),
     ),
+  RELAY_FAULT_AFTER_COMMIT: z.stringbool().default(false),
   ARGONID_TIME_COST: z.coerce.number().int().positive().default(2),
   ARGONID_MEMORY_COST: z.coerce.number().int().positive().default(19456),
 });

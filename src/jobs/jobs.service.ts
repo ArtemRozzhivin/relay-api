@@ -1,11 +1,18 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
+import { ConfigService } from '@nestjs/config';
 import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
-import { JobNotFoundError } from '../common/errors/app-error.js';
+import {
+  JobNotDeadLetteredError,
+  JobNotFoundError,
+} from '../common/errors/app-error.js';
+import { JobTransitionService } from './job-transition.service.js';
+import type { JobType } from '../generated/prisma/enums.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { JOBS_QUEUE, type JobMessage } from './job-queue.js';
 import type { ListJobsQuery, SubmitJobInput } from './jobs.schema.js';
+import type { ApiEnv } from '../config/env.schema.js';
 
 interface SubmitArgs {
   userId: string;
@@ -20,22 +27,41 @@ export class JobsService {
 
   constructor(
     private readonly prisma: PrismaService,
+    private readonly transitions: JobTransitionService,
+    private readonly config: ConfigService<ApiEnv, true>,
     @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
   ) {}
 
   async submit({ userId, idempotencyKey, correlationId, input }: SubmitArgs) {
-    let job;
+    let committed;
 
     try {
-      job = await this.prisma.job.create({
-        data: {
-          userId,
-          idempotencyKey,
-          correlationId,
-          type: input.type,
-          payload: input.payload,
-          maxAttempts: input.maxAttempts,
-        },
+      committed = await this.prisma.$transaction(async (tx) => {
+        const job = await tx.job.create({
+          data: {
+            userId,
+            idempotencyKey,
+            correlationId,
+            type: input.type,
+            payload: input.payload,
+            maxAttempts: input.maxAttempts,
+          },
+        });
+
+        const outbox = await tx.outbox.create({
+          data: {
+            jobId: job.id,
+            queue: JOBS_QUEUE,
+            jobName: job.type,
+            payload: {
+              jobId: job.id,
+              correlationId,
+              maxAttempts: job.maxAttempts,
+            },
+          },
+        });
+
+        return { job, outboxId: outbox.id };
       });
     } catch (error) {
       if (
@@ -52,28 +78,93 @@ export class JobsService {
       throw error;
     }
 
-    // Decision D5(b): the row is committed before the enqueue, so a crash in
-    // this gap leaves a QUEUED job nobody will run. Assertion A6 measures it;
-    // the transactional outbox in M6 closes it.
+    if (this.config.get('RELAY_FAULT_AFTER_COMMIT', { infer: true })) {
+      throw new Error('Injected fault: committed the job row, never enqueued it');
+    }
+
+    const { job, outboxId } = committed;
+
+    await this.enqueue(job.id, job.type, job.maxAttempts, correlationId);
+    await this.markPublished(outboxId);
+
+    return { job, replayed: false };
+  }
+
+  private async enqueue(
+    jobId: string,
+    type: JobType,
+    maxAttempts: number,
+    correlationId: string,
+  ) {
+    // BullMQ ignores an add() whose jobId still exists in the queue, including
+    // in the completed/failed sets kept by removeOnComplete/removeOnFail. A
+    // re-driven job reuses its id, so the stale entry has to go first.
+    await this.queue.remove(jobId).catch(() => undefined);
+
     await this.queue.add(
-      job.type,
-      { jobId: job.id, correlationId },
+      type,
+      { jobId, correlationId },
       {
-        jobId: job.id,
-        attempts: job.maxAttempts,
-        backoff: { type: 'exponential', delay: 1000 },
+        jobId,
+        attempts: maxAttempts,
+        backoff: { type: 'exponential', delay: 1000, jitter: 1 },
         removeOnComplete: { age: 3600, count: 1000 },
         removeOnFail: { age: 86_400 },
       },
     );
 
-    this.logger.log(`Enqueued job ${job.id} (${job.type})`);
+    this.logger.log(`Enqueued job ${jobId} (${type})`);
+  }
 
-    return { job, replayed: false };
+  private async markPublished(outboxId: bigint) {
+    await this.prisma.outbox.updateMany({
+      where: { id: outboxId, publishedAt: null },
+      data: { publishedAt: new Date() },
+    });
+  }
+
+  async redrive(userId: string, jobId: string, correlationId: string) {
+    const existing = await this.findOne(userId, jobId);
+
+    const requeued = await this.prisma.$transaction(async (tx) => {
+      const job = await this.transitions.redrive(existing.id, tx);
+
+      if (!job) {
+        return null;
+      }
+
+      const outbox = await tx.outbox.create({
+        data: {
+          jobId: job.id,
+          queue: JOBS_QUEUE,
+          jobName: job.type,
+          payload: {
+            jobId: job.id,
+            correlationId,
+            maxAttempts: job.maxAttempts,
+          },
+        },
+      });
+
+      return { job, outboxId: outbox.id };
+    });
+
+    if (!requeued) {
+      throw new JobNotDeadLetteredError();
+    }
+
+    const { job, outboxId } = requeued;
+
+    await this.enqueue(job.id, job.type, job.maxAttempts, correlationId);
+    await this.markPublished(outboxId);
+
+    return job;
   }
 
   async findOne(userId: string, jobId: string) {
-    const job = await this.prisma.job.findFirst({ where: { id: jobId, userId } });
+    const job = await this.prisma.job.findFirst({
+      where: { id: jobId, userId },
+    });
 
     if (!job) {
       throw new JobNotFoundError();
