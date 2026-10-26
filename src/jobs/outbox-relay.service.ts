@@ -3,7 +3,7 @@ import { Interval } from '@nestjs/schedule';
 import { InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
-import { JOBS_QUEUE, type JobMessage } from './job-queue.js';
+import { JOBS_QUEUE, messageId, type JobMessage } from './job-queue.js';
 
 const BATCH_SIZE = 100;
 
@@ -48,13 +48,11 @@ export class OutboxRelayService {
         maxAttempts: number;
       };
 
-      await this.queue.remove(message.jobId).catch(() => undefined);
-
       await this.queue.add(
         row.jobName,
         { jobId: message.jobId, correlationId: message.correlationId },
         {
-          jobId: message.jobId,
+          jobId: messageId(message.jobId, row.id),
           attempts: message.maxAttempts,
           backoff: { type: 'exponential', delay: 1000, jitter: 1 },
           removeOnComplete: { age: 3600, count: 1000 },

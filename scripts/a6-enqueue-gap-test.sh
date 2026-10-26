@@ -30,7 +30,8 @@ echo "  waiting for the outbox relay…"
 sleep 8
 JID=$($PSQL -c "SELECT id FROM \"Job\" WHERE \"userId\"='$USER_ID';")
 STATUS=$($PSQL -c "SELECT status FROM \"Job\" WHERE id='$JID';")
-INQ=$($REDIS EXISTS "bull:relay-jobs:$JID" | tr -d '\r')
+OID=$($PSQL -c "SELECT id FROM \"Outbox\" WHERE \"jobId\"='$JID' ORDER BY id DESC LIMIT 1;")
+INQ=$($REDIS EXISTS "bull:relay-jobs:$JID.$OID" | tr -d '\r')
 LEDGER=$($PSQL -c "SELECT count(*) FROM \"SideEffect\" WHERE \"jobId\"='$JID';")
 UNPUBLISHED=$($PSQL -c "SELECT count(*) FROM \"Outbox\" WHERE \"jobId\"='$JID' AND \"publishedAt\" IS NULL;")
 RELAY_PUBLISHED=$($PSQL -c "SELECT coalesce(max(attempts),0) FROM \"Outbox\" WHERE \"jobId\"='$JID';")

@@ -497,14 +497,36 @@ per-step-guarded will redo earlier steps on retry.
 BullMQ implements the backoff (`attempts`, `backoff: { type: 'custom' }` for jitter). Which
 counter is *policy* is D7.
 
+### 7.5a One queue entry per outbox row
+
+The BullMQ job id is `${jobId}.${outboxId}`, not `jobId`. This is forced by two facts that
+only show up together:
+
+- `add()` is **silently ignored** when a job with that id already exists in any set, including
+  the `completed`/`failed` sets that `removeOnComplete`/`removeOnFail` retain. It returns the
+  existing job, so the caller cannot tell the difference from the return value.
+- `remove()` **refuses a locked job** and returns `0` rather than throwing.
+
+With a job-scoped id, a re-drive issued while an earlier delivery still holds the lock therefore
+removed nothing, enqueued nothing, and reported success — and `markPublished()` then stamped the
+outbox row, disarming the one guard that would have recovered it. A re-drive is a **new message**,
+so it gets a new row and a new entry, and `add()` can only ever collide with a redelivery of the
+same message, where deduplication is the correct behaviour. Duplicate *delivery* is still handled
+where it always was: `claim()` and `effectKey`, not the queue id.
+
+(`.` as the separator because BullMQ rejects `:` in a custom job id unless it splits into exactly
+three parts — the same restriction that renamed the queue in §8.1.)
+
 ### 7.6 Stalled jobs — what BullMQ actually does
 
 Worth stating precisely, because the mental model most people have is wrong:
 
 - **There is no `stalled` state.** There is a *stalled event*, fired when an active job's lock is
   not renewed within the check window (~30 s default).
-- A stalled job is moved **back to wait** and redelivered — or failed, once `maxStalledCount`
-  (default **1**) is exceeded, with the error *"job stalled more than allowable limit"*.
+- A stalled job is moved **back to wait** and redelivered. Once `maxStalledCount` (default **1**)
+  is exceeded it is *still* moved back to wait, but with a deferred failure recorded
+  (*"job stalled more than allowable limit"*); the next worker to pick it up short-circuits to
+  its failure path instead of running it. The queue never fails it in place.
 - **A job can stall itself.** Blocking the event loop prevents lock renewal, so a CPU-bound
   processor is redelivered even though nothing crashed. This is why `MOCK` must `await sleep()`
   and never spin — otherwise reliability measurements reflect the fixture, not the system.
@@ -963,6 +985,8 @@ cases.
 | **A1** | **Duplicate submit creates one job.** Fire M concurrent `POST /jobs` with the same key | `SELECT count(*) FROM "Job" WHERE "userId"=$1 AND "idempotencyKey"=$2` **= 1**; every response is `202` with the same `id`; `SELECT count(*) FROM "SideEffect"` **= 1** | 6 |
 | **A2** | **No lost work.** Submit N jobs, N distinct keys | After drain: terminal jobs **= N**, and `SELECT count(*) FROM "Job" WHERE status IN ('QUEUED','RUNNING')` **= 0** | 5 |
 | **A3** | **Crash mid-job — the headline test.** Submit N; `SIGKILL` the worker while jobs are `RUNNING`; restart | Terminal jobs **= N** *and* `SELECT count(*) FROM "SideEffect"` **= N** — not N + in-flight. **Fails if §7.1's effect guard was skipped** | 6 |
+| **A3b** | **A stale worker must not write over the live one.** Freeze a worker mid-handler, let the stalled checker hand its jobs to a second worker, then thaw the first | Every job terminal and `SELECT count(*) FROM "Job" WHERE status NOT IN ('SUCCEEDED','DEAD_LETTERED')` **= 0**. **Inconclusive unless the log shows refused stale writes** — otherwise the interleaving never happened | 6 |
+| **A5b** | **A job the queue abandons still terminates.** Stall a job past `maxStalledCount` so `process()` is never called again | `status = 'DEAD_LETTERED'` with `error->>'code' = 'DELIVERY_ABANDONED'`, exactly 2 deliveries against a budget of 5, and a re-drive that is *observed to be delivered* — a `202` alone is not evidence (§7.5a) | 6 |
 | **A4** | **Redelivery of a succeeded job is a no-op.** Force redelivery of a `SUCCEEDED` job | `SUCCEEDED → RUNNING` never occurs; `SideEffect` count unchanged; the guarded update returns count `0` | 6 |
 | **A5** | **A poison job dead-letters exactly once.** Submit a job that always fails | `attempts = maxAttempts`; exactly one `DEAD_LETTERED` row; `error` populated; it never returns to `QUEUED` without an explicit re-drive | 6 |
 | **A6** | **The enqueue gap is real.** With a fault injected between commit and enqueue | A `QUEUED` job exists with no queue entry — i.e. **prove the hole exists in the v1 design**. After the outbox lands, the same test must show the job eventually runs | 6 |
@@ -1072,4 +1096,6 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-19 | No custom backoff strategy needed: `backoff.jitter` is built into BullMQ's `exponential` strategy (§7.4). Verified in `backoffs.js` — `jitter: 1` gives a delay uniform in `[0, 2^(n-1) · delay)`. |
 | 2026-10-24 | §7.6 — a job past `maxStalledCount` is failed **without `process()` running**. The worker now finalises such jobs from the `failed` event gated on `finishedOn`; `deadLetter()` accepts `QUEUED` as well as `RUNNING` so an abandoned row can still reach a terminal state. |
 | 2026-10-24 | §7.2 — `redrive()` now writes its own `Outbox` row inside the transition transaction. The commit-then-enqueue gap A6 exists to prove was closed for `submit()` only. |
+| 2026-10-26 | §7.5a — the queue entry is now keyed by the outbox row, not the job. A job-scoped id let a re-drive silently deduplicate against a still-locked earlier delivery, enqueue nothing, and be marked published. |
+| 2026-10-26 | §7.3 — the attempt number is the worker's **ownership token**. `succeed`, `requeueForRetry` and `deadLetter` all require `attempts = <the attempt that claimed>`, so a worker that lost a job while still running it cannot write over whoever holds it now. `succeed` also accepts `QUEUED`, because a refused `succeed` is unrecoverable: the work is done and no later delivery exists. |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

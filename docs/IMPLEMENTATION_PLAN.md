@@ -15,7 +15,7 @@ in a runnable, demonstrable state.
 - [x] **M3** · Cross-cutting concerns
 - [x] **M4** · Jobs API
 - [ ] **M5** · Queue and worker
-- [ ] **M6** · Reliability
+- [x] **M6** · Reliability
 - [ ] **M7** · Realtime
 - [ ] **M8** · Observability and hardening
 - [ ] **M9** · Test harness and CI
@@ -252,47 +252,47 @@ Each step is motivated by the failure of the one before it.
 
 ### Tasks
 
-- [ ] **6.1 · Write A3 and confirm it fails** — submit jobs, `SIGKILL` the worker mid-charge, count ledger rows.
+- [x] **6.1 · Write A3 and confirm it fails** — submit jobs, `SIGKILL` the worker mid-charge, count ledger rows.
   ```
   _Establishes the baseline defect the effect guard must eliminate._
   ```
-- [ ] **6.2 ·** `SideEffect` **table** + `effectKey = ${jobId}:${kind}`.
+- [x] **6.2 ·** `SideEffect` **table** + `effectKey = ${jobId}:${kind}`.
   ```
   _Deterministic derivation — never a clock, a random source, or an attempt number._
   ```
-- [ ] **6.3 ·** `CHARGE` **writes the ledger row** in the same transaction as the status.
+- [x] **6.3 ·** `CHARGE` **writes the ledger row** in the same transaction as the status.
   ```
   _The effect guard. A3 now passes._
   ```
-- [ ] **6.4 · Retries** — attempts, exponential backoff with full jitter.
+- [x] **6.4 · Retries** — attempts, exponential backoff with full jitter.
   ```
   _Without jitter a batch that fails together retries in lockstep at every doubling._
   ```
-- [ ] **6.5 · Error taxonomy** — plain `Error` vs `UnrecoverableError`.
+- [x] **6.5 · Error taxonomy** — plain `Error` vs `UnrecoverableError`.
   ```
   _A terminal error should not consume the full retry budget._
   ```
-- [ ] **6.6 ·** `DEAD_LETTERED` **+** `POST /jobs/:id/retry` → resolve **D6b**.
+- [x] **6.6 ·** `DEAD_LETTERED` **+** `POST /jobs/:id/retry` → resolve **D6b**.
   ```
   _Anything that must survive a Redis flush is a Postgres row._
   ```
-- [ ] **6.7 · Induce a stalled worker**, observe the stuck `RUNNING` row → resolve **D7**.
+- [x] **6.7 · Induce a stalled worker**, observe the stuck `RUNNING` row → resolve **D7**.
   ```
   _The claim guard is decided against observed behaviour, not assumption._
   ```
-- [ ] **6.8 · Write A6** to demonstrate the commit-then-enqueue gap.
+- [x] **6.8 · Write A6** to demonstrate the commit-then-enqueue gap.
   ```
   _A test written to fail documents an accepted risk precisely._
   ```
-- [ ] **6.9 ·** `Outbox` **+** `@nestjs/schedule` **relay tick** → A6 passes.
+- [x] **6.9 ·** `Outbox` **+** `@nestjs/schedule` **relay tick** → A6 passes.
   ```
   _The transactional outbox closes the dual-write hole._
   ```
 
 ### Done when
 
-- [ ] **A1, A3, A4, A5, A6 all pass**
-- [ ] Killing the worker at any point during a run leaves ledger rows equal to job count
+- [x] **A1, A3, A4, A5, A6 all pass**
+- [x] Killing the worker at any point during a run leaves ledger rows equal to job count
 
 ---
 

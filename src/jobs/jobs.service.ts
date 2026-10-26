@@ -10,7 +10,7 @@ import {
 import { JobTransitionService } from './job-transition.service.js';
 import type { JobType } from '../generated/prisma/enums.js';
 import { Prisma } from '../generated/prisma/client.js';
-import { JOBS_QUEUE, type JobMessage } from './job-queue.js';
+import { JOBS_QUEUE, messageId, type JobMessage } from './job-queue.js';
 import type { ListJobsQuery, SubmitJobInput } from './jobs.schema.js';
 import type { ApiEnv } from '../config/env.schema.js';
 
@@ -84,7 +84,7 @@ export class JobsService {
 
     const { job, outboxId } = committed;
 
-    await this.enqueue(job.id, job.type, job.maxAttempts, correlationId);
+    await this.enqueue(job.id, outboxId, job.type, job.maxAttempts, correlationId);
     await this.markPublished(outboxId);
 
     return { job, replayed: false };
@@ -92,20 +92,16 @@ export class JobsService {
 
   private async enqueue(
     jobId: string,
+    outboxId: bigint,
     type: JobType,
     maxAttempts: number,
     correlationId: string,
   ) {
-    // BullMQ ignores an add() whose jobId still exists in the queue, including
-    // in the completed/failed sets kept by removeOnComplete/removeOnFail. A
-    // re-driven job reuses its id, so the stale entry has to go first.
-    await this.queue.remove(jobId).catch(() => undefined);
-
     await this.queue.add(
       type,
       { jobId, correlationId },
       {
-        jobId,
+        jobId: messageId(jobId, outboxId),
         attempts: maxAttempts,
         backoff: { type: 'exponential', delay: 1000, jitter: 1 },
         removeOnComplete: { age: 3600, count: 1000 },
@@ -155,7 +151,7 @@ export class JobsService {
 
     const { job, outboxId } = requeued;
 
-    await this.enqueue(job.id, job.type, job.maxAttempts, correlationId);
+    await this.enqueue(job.id, outboxId, job.type, job.maxAttempts, correlationId);
     await this.markPublished(outboxId);
 
     return job;

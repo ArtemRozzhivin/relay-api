@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import { Logger, type OnModuleDestroy } from '@nestjs/common';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { UnrecoverableError, type Job as QueueJob } from 'bullmq';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
@@ -9,8 +9,9 @@ import { TerminalJobError } from '../common/errors/app-error.js';
 @Processor(JOBS_QUEUE, {
   concurrency: Number(process.env.WORKER_CONCURRENCY ?? 5),
 })
-export class JobsProcessor extends WorkerHost {
+export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   private readonly logger = new Logger(JobsProcessor.name);
+  private readonly finalising = new Set<Promise<void>>();
 
   constructor(
     private readonly transitions: JobTransitionService,
@@ -30,16 +31,18 @@ export class JobsProcessor extends WorkerHost {
       return;
     }
 
+    const attempt = claimed.attempts;
+
     this.logger.log(
-      `Running job ${jobId} (${claimed.type}) attempt ${claimed.attempts}/${claimed.maxAttempts} [correlationId=${correlationId}]`,
+      `Running job ${jobId} (${claimed.type}) attempt ${attempt}/${claimed.maxAttempts} [correlationId=${correlationId}]`,
     );
 
     try {
       const result = await this.handlers.run(claimed);
 
-      if (!(await this.transitions.succeed(jobId, result))) {
+      if (!(await this.transitions.succeed(jobId, attempt, result))) {
         this.logger.warn(
-          `Job ${jobId} finished but was already finalised elsewhere`,
+          `Job ${jobId} finished on attempt ${attempt} but that attempt no longer owns it`,
         );
       }
 
@@ -49,22 +52,22 @@ export class JobsProcessor extends WorkerHost {
 
       const isTerminal =
         cause instanceof TerminalJobError || cause instanceof UnrecoverableError;
-      const isExhausted = claimed.attempts >= claimed.maxAttempts;
+      const isExhausted = attempt >= claimed.maxAttempts;
 
       if (isTerminal || isExhausted) {
         if (
-          await this.transitions.deadLetter(jobId, {
+          await this.transitions.deadLetter(jobId, attempt, {
             code: isTerminal ? 'TERMINAL_FAILURE' : 'ATTEMPTS_EXHAUSTED',
             message: reason,
-            attempt: claimed.attempts,
+            attempt,
           })
         ) {
           this.logger.error(
-            `Job ${jobId} dead-lettered after ${claimed.attempts} attempt(s): ${reason}`,
+            `Job ${jobId} dead-lettered after ${attempt} attempt(s): ${reason}`,
           );
         } else {
           this.logger.warn(
-            `Job ${jobId} was already finalised elsewhere; dead-letter skipped`,
+            `Job ${jobId} failed on attempt ${attempt}, which no longer owns it; dead-letter skipped`,
           );
         }
 
@@ -72,20 +75,20 @@ export class JobsProcessor extends WorkerHost {
       }
 
       if (
-        !(await this.transitions.requeueForRetry(jobId, {
+        !(await this.transitions.requeueForRetry(jobId, attempt, {
           code: 'ATTEMPT_FAILED',
           message: reason,
-          attempt: claimed.attempts,
+          attempt,
         }))
       ) {
         this.logger.warn(
-          `Job ${jobId} could not be requeued; it is already finalised`,
+          `Job ${jobId} failed on attempt ${attempt}, which no longer owns it; retry not scheduled`,
+        );
+      } else {
+        this.logger.warn(
+          `Job ${jobId} attempt ${attempt}/${claimed.maxAttempts} failed, will retry: ${reason}`,
         );
       }
-
-      this.logger.warn(
-        `Job ${jobId} attempt ${claimed.attempts}/${claimed.maxAttempts} failed, will retry: ${reason}`,
-      );
 
       throw cause;
     }
@@ -97,19 +100,28 @@ export class JobsProcessor extends WorkerHost {
   // finishedOn is set only once the queue has stopped redelivering, so it is
   // the one signal that distinguishes "will retry" from "gave up".
   @OnWorkerEvent('failed')
-  async onFailed(message: QueueJob<JobMessage> | undefined, error: Error) {
+  onFailed(message: QueueJob<JobMessage> | undefined, error: Error) {
     const jobId = message?.data?.jobId;
 
     if (!jobId || !message?.finishedOn) {
       return;
     }
 
+    // Registered as a bare event listener, so nothing holds this promise or
+    // waits for it on shutdown; tracking it is what makes onModuleDestroy able
+    // to finish a dead-letter that is in flight when SIGTERM arrives.
+    const task = this.finalise(jobId, error);
+
+    this.finalising.add(task);
+    void task.finally(() => this.finalising.delete(task));
+  }
+
+  private async finalise(jobId: string, error: Error) {
     try {
       if (
-        await this.transitions.deadLetter(jobId, {
+        await this.transitions.abandon(jobId, {
           code: 'DELIVERY_ABANDONED',
           message: error.message,
-          attempt: message.attemptsMade,
         })
       ) {
         this.logger.error(
@@ -123,6 +135,10 @@ export class JobsProcessor extends WorkerHost {
         }`,
       );
     }
+  }
+
+  async onModuleDestroy() {
+    await Promise.allSettled(this.finalising);
   }
 
   @OnWorkerEvent('stalled')

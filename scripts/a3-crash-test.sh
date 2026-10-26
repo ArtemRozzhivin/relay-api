@@ -2,6 +2,7 @@
 # A3 — every submitted job runs its side effect exactly once, even when the
 # worker is killed mid-charge.
 set -uo pipefail
+FAILED=0
 N=${N:-6}
 DELAY_MS=${DELAY_MS:-10000}
 KILL_AFTER=${KILL_AFTER:-3}
@@ -64,13 +65,17 @@ if [ "$INTERRUPTED" = "0" ]; then
   echo "  RESULT: INCONCLUSIVE — nothing was interrupted, so no redelivery happened."
   echo "          Raise DELAY_MS or lower KILL_AFTER."
 elif [ "$LEDGER" -gt "$N" ]; then
+  FAILED=1
   echo "  RESULT: FAIL — $((LEDGER - N)) duplicate charge(s); effectKey is not deduplicating"
   $PSQL -F' x ' -c "SELECT se.\"jobId\", count(*) FROM \"SideEffect\" se JOIN \"Job\" j ON j.id=se.\"jobId\" WHERE j.\"userId\"='$USER_ID' GROUP BY se.\"jobId\" HAVING count(*) > 1;" | sed 's/^/          doubled: /'
 elif [ "$SUCCEEDED" = "$N" ] && [ "$LEDGER" = "$N" ]; then
   echo "  RESULT: PASS"
 else
+  FAILED=1
   echo "  RESULT: FAIL — lost work: $SUCCEEDED/$N succeeded, $LEDGER/$N charged"
   $PSQL -F' | ' -c "SELECT status, count(*) FROM \"Job\" WHERE \"userId\"='$USER_ID' GROUP BY status;" | sed 's/^/          /'
 fi
 
 kill -TERM $API $W2 2>/dev/null
+# INCONCLUSIVE exits 0 on purpose: the run proved nothing, but nothing is broken.
+exit $FAILED
