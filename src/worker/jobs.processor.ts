@@ -3,6 +3,7 @@ import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { UnrecoverableError, type Job as QueueJob } from 'bullmq';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
+import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { TerminalJobError } from '../common/errors/app-error.js';
 
@@ -16,6 +17,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   constructor(
     private readonly transitions: JobTransitionService,
     private readonly handlers: JobHandlerRegistry,
+    private readonly events: JobEventsPublisher,
   ) {
     super();
   }
@@ -33,6 +35,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
     const attempt = claimed.attempts;
 
+    await this.events.jobUpdated(claimed);
+
     this.logger.log(
       `Running job ${jobId} (${claimed.type}) attempt ${attempt}/${claimed.maxAttempts} [correlationId=${correlationId}]`,
     );
@@ -40,7 +44,11 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     try {
       const result = await this.handlers.run(claimed);
 
-      if (!(await this.transitions.succeed(jobId, attempt, result))) {
+      const succeeded = await this.transitions.succeed(jobId, attempt, result);
+
+      if (succeeded) {
+        await this.events.jobUpdated(succeeded);
+      } else {
         this.logger.warn(
           `Job ${jobId} finished on attempt ${attempt} but that attempt no longer owns it`,
         );
@@ -55,13 +63,15 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       const isExhausted = attempt >= claimed.maxAttempts;
 
       if (isTerminal || isExhausted) {
-        if (
-          await this.transitions.deadLetter(jobId, attempt, {
-            code: isTerminal ? 'TERMINAL_FAILURE' : 'ATTEMPTS_EXHAUSTED',
-            message: reason,
-            attempt,
-          })
-        ) {
+        const dead = await this.transitions.deadLetter(jobId, attempt, {
+          code: isTerminal ? 'TERMINAL_FAILURE' : 'ATTEMPTS_EXHAUSTED',
+          message: reason,
+          attempt,
+        });
+
+        if (dead) {
+          await this.events.jobUpdated(dead);
+
           this.logger.error(
             `Job ${jobId} dead-lettered after ${attempt} attempt(s): ${reason}`,
           );
@@ -74,17 +84,19 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         throw new UnrecoverableError(reason);
       }
 
-      if (
-        !(await this.transitions.requeueForRetry(jobId, attempt, {
-          code: 'ATTEMPT_FAILED',
-          message: reason,
-          attempt,
-        }))
-      ) {
+      const requeued = await this.transitions.requeueForRetry(jobId, attempt, {
+        code: 'ATTEMPT_FAILED',
+        message: reason,
+        attempt,
+      });
+
+      if (!requeued) {
         this.logger.warn(
           `Job ${jobId} failed on attempt ${attempt}, which no longer owns it; retry not scheduled`,
         );
       } else {
+        await this.events.jobUpdated(requeued);
+
         this.logger.warn(
           `Job ${jobId} attempt ${attempt}/${claimed.maxAttempts} failed, will retry: ${reason}`,
         );
@@ -118,12 +130,14 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
   private async finalise(jobId: string, error: Error) {
     try {
-      if (
-        await this.transitions.abandon(jobId, {
-          code: 'DELIVERY_ABANDONED',
-          message: error.message,
-        })
-      ) {
+      const abandoned = await this.transitions.abandon(jobId, {
+        code: 'DELIVERY_ABANDONED',
+        message: error.message,
+      });
+
+      if (abandoned) {
+        await this.events.jobUpdated(abandoned);
+
         this.logger.error(
           `Job ${jobId} dead-lettered: the queue stopped redelivering it (${error.message})`,
         );

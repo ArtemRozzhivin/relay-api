@@ -8,6 +8,7 @@ import {
   JobNotFoundError,
 } from '../common/errors/app-error.js';
 import { JobTransitionService } from './job-transition.service.js';
+import { JobEventsPublisher } from './job-events.publisher.js';
 import type { JobType } from '../generated/prisma/enums.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { JOBS_QUEUE, messageId, type JobMessage } from './job-queue.js';
@@ -28,6 +29,7 @@ export class JobsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly transitions: JobTransitionService,
+    private readonly events: JobEventsPublisher,
     private readonly config: ConfigService<ApiEnv, true>,
     @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
   ) {}
@@ -86,6 +88,7 @@ export class JobsService {
 
     await this.enqueue(job.id, outboxId, job.type, job.maxAttempts, correlationId);
     await this.markPublished(outboxId);
+    await this.events.jobUpdated(job);
 
     return { job, replayed: false };
   }
@@ -153,6 +156,7 @@ export class JobsService {
 
     await this.enqueue(job.id, outboxId, job.type, job.maxAttempts, correlationId);
     await this.markPublished(outboxId);
+    await this.events.jobUpdated(job);
 
     return job;
   }

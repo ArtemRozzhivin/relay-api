@@ -16,11 +16,34 @@ in a runnable, demonstrable state.
 - [x] **M4** · Jobs API
 - [ ] **M5** · Queue and worker
 - [x] **M6** · Reliability
-- [ ] **M7** · Realtime
+- [x] **M7** · Realtime
 - [ ] **M8** · Observability and hardening
 - [ ] **M9** · Test harness and CI
 - [ ] **M10** · Load testing
 - [ ] **M11** · Deployment
+
+### Product phases — the real-job proposal (2026-10-24)
+
+- [ ] **PA** · Handler registry, progress, cancellation
+- [ ] **PB** · Object storage, `Product` domain, `import.csv`
+- [ ] **PC** · `image.process`
+- [ ] **PD** · `ai.enrich`
+- [ ] **PE** · Pipeline fan-out
+- [ ] **PF** · API keys and public docs
+- [ ] **PH** · Presentation — README, diagram, demo
+- [ ] **PI** · Billing
+- **PG** · Dashboard — owner's track, not planned here
+
+M1–M11 are the engine; PA–PI are the product built on it. They are lettered, not numbered,
+because **they do not run in numeric order**:
+
+```
+M7 ✓ → M9 → PA → PB → PC → M8 → PD → PE → PF → M10 → M11 → PH → PI
+```
+
+M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
+takes ~15 minutes of booting processes by hand. M8 lands before PD because rate limiting and cost
+tracking are the first things you cannot tune without metrics.
 
 A milestone is complete when every task **and** every _Done when_ item under it is checked.
 
@@ -303,26 +326,28 @@ Each step is motivated by the failure of the one before it.
 
 ### Tasks
 
-- [ ] **7.1 ·** `EventsGateway` — auth on connect, room `user:<userId>` from the verified token.
+- [x] **7.1 ·** `EventsGateway` — auth on connect, room `user:<userId>` from the verified token.
   ```
   _A socket cannot carry an auth header per frame; the room is assigned server-side._
   ```
-- [ ] **7.2 · Resolve D8** — Redis pub/sub bridge from worker to API.
+- [x] **7.2 · Resolve D8** — Redis pub/sub bridge from worker to API.
   ```
   _Transitions occur in the worker; sockets live in the API._
   ```
-- [ ] **7.3 ·** `job.updated` **emitted after commit**, never inside the transaction.
+- [x] **7.3 ·** `job.updated` **emitted after commit**, never inside the transaction.
   ```
   _Emitting pre-commit can broadcast a state the DB rolls back._
   ```
-- [ ] **7.4 · A static HTML page** that opens the socket.
+- [x] **7.4 · A socket client script** that asserts A7: connect, submit, drop the socket
+  mid-processing, reconnect, reconcile against `GET /jobs/:id`.
   ```
-  _Sufficient to demonstrate realtime; the frontend is out of scope._
+  _No UI. A7 needs a client that can be scripted and run in CI, not one that needs a human
+  with a browser; the dashboard is built separately and is not this assertion's vehicle._
   ```
 
 ### Done when
 
-- [ ] **A7 passes** — a client disconnected mid-processing reconciles to the correct terminal
+- [x] **A7 passes** — a client disconnected mid-processing reconciles to the correct terminal
   ```
   state via `GET /jobs/:id` on reconnect
   ```
@@ -335,6 +360,13 @@ Each step is motivated by the failure of the one before it.
 **Spec:** §12, §15
 
 ### Tasks
+
+- [ ] **8.0 · A config-driven socket.io adapter** — the gateway's CORS is `{ origin: true }`,
+  which reflects any origin. Tighten it to `CORS_ORIGINS` once a browser client exists.
+  ```
+  _Harmless while the only client is a scripted one; wrong the moment a dashboard is served from
+  another origin._
+  ```
 
 - [ ] **8.1 · Prometheus** `/metrics` — queue depth, job duration histogram, failure rate, dead-letter count.
   ```
@@ -509,3 +541,287 @@ M1 ─▶ M2 ─▶ M3 ─▶ M4 ─▶ M5 ─▶ M6 ─▶ M7 ─▶ M8 ─▶ 
 M1–M4 are conventional API work. **M5 and M6 carry the system's core risk** and take
 proportionally more of the schedule. M9 must precede M10 — an unautomated assertion cannot be
 checked under load. M10 must precede M11, so the box is sized against measured numbers.
+
+---
+
+# PA · Handler registry, progress, cancellation
+
+**Goal:** job types are pluggable, long jobs report progress, and a running job can be stopped.
+**Spec:** §9.2, D21, D22, D25, D11 · _Consumes: D21, D22, D25, D11._
+
+### Tasks
+
+- [ ] **A.1 ·** `Job.type` **becomes a string** (D21) — one `JOB_TYPES` tuple feeds both the Zod
+  union and the TS literal union; migration drops the `JobType` enum.
+  ```
+  _An enum makes every new type a migration, and Postgres enum labels can never be removed._
+  ```
+- [ ] **A.2 ·** `JobHandler` **interface** — `type`, `payloadSchema`, `queue`, `handle(ctx, payload)`;
+  the registry resolves by type via DI and the processor stops knowing any type by name.
+  ```
+  _Adding a job type becomes adding one provider. Validate the payload at submit AND in the
+  worker: the worker's copy is what protects it from a row written by an older deploy._
+  ```
+- [ ] **A.3 ·** `JobContext` — `reportProgress`, `log`, `isCancelRequested`, job id, attempt,
+  idempotency key.
+  ```
+  _Handlers get a capability object, not the Prisma client; what a handler may do is a
+  deliberate list._
+  ```
+- [ ] **A.4 ·** `progress Json?` **on** `Job`, written per batch with the `attempts` ownership
+  predicate (D25).
+  ```
+  _Progress is not a status transition, but a stale worker must still not overwrite it._
+  ```
+- [ ] **A.5 · Throttle the emits** — at most one per job per 500 ms, and always the final one.
+  ```
+  _A 20k-row import at one event per row floods the socket and the client repaints uselessly._
+  ```
+- [ ] **A.6 ·** `CANCELLED` **+** `cancelRequested` (D22) and `POST /jobs/:id/cancel` — remove from
+  the queue if it has not started, otherwise set the flag and let the handler exit at a batch
+  boundary.
+  ```
+  _You cannot safely kill code mid-flight. Cancellation is a request plus an acknowledgement,
+  which is why it is two fields and not one status._
+  ```
+- [ ] **A.7 · Bulk re-drive by filter** (D11) — type, error code, time range.
+  ```
+  _One dead letter is a row; four thousand is an operation._
+  ```
+
+### Done when
+
+- [ ] **A11 passes** — a cancelled mid-flight job ends `CANCELLED` with no effect beyond its last
+  committed batch, and `cancelRequested` never strands a job that had already finished
+- [ ] **A12 passes** — progress never goes backwards, and a stale attempt cannot write it
+- [ ] Adding a job type touches no file in `src/worker/`
+
+---
+
+# PB · Object storage, `Product` domain, `import.csv`
+
+**Goal:** a 20 000-row CSV imports without timing out, resumes after a crash, and reports its bad
+rows.
+**Spec:** D26, D14, §7.1 · _Consumes: D26, D14._
+
+### Tasks
+
+- [ ] **B.1 · MinIO in compose** + `@aws-sdk/client-s3` (`forcePathStyle`), presigned `PUT` for
+  upload and short-expiry presigned `GET` for download.
+  ```
+  _The API never streams a file body. Moving to real S3 then changes config, not code._
+  ```
+- [ ] **B.2 ·** `Product` **model** — `UNIQUE (userId, sku)`.
+  ```
+  _This constraint is what makes a replayed batch harmless, so the import never needs to know
+  whether it has run before._
+  ```
+- [ ] **B.3 · Stream and batch** — `csv-parse` in streaming mode, per-row Zod, upsert ~500 rows per
+  transaction.
+  ```
+  _Never load the file into memory: the whole client problem is that the naive version dies on
+  size._
+  ```
+- [ ] **B.4 · Checkpoint and resume** (D26) — its own storage, not `result` and not `progress`;
+  `redrive()` leaves it alone; `?from=start` forces a restart.
+  ```
+  _A re-drive asks "did this happen?", not "do it again" — the same semantic already settled for_
+  `effectKey`_._
+  ```
+- [ ] **B.5 · Error report** — invalid rows to `error-report.csv` in storage, presigned link in the
+  job result; bad rows never fail the job, but `IMPORT_MOSTLY_INVALID` fails fast on a wrong file.
+  ```
+  _Distinguish "this data has problems" from "this is not the file you think it is"._
+  ```
+- [ ] **B.6 · Cursor pagination** on `/jobs` and `/products` (D14).
+  ```
+  _A 20k-product catalog is where offset paging starts to hurt._
+  ```
+
+### Done when
+
+- [ ] **A13 passes** — 20 000 rows import with flat memory
+- [ ] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
+  exact and contains no duplicates
+- [ ] **A15 passes** — the same file submitted twice returns the first job
+- [ ] The error report is downloadable and its row numbers match the source file
+
+---
+
+# PC · `image.process`
+
+**Goal:** product images become WebP variants, and a hostile `imageUrl` cannot reach anything
+private.
+**Spec:** §7.6, §7.7, D10 · _Consumes: D10._
+
+### Tasks
+
+- [ ] **C.1 · Outbound request guard** — http/https only, **private and link-local ranges blocked
+  after DNS resolution**, timeout, max body size, content-type check.
+  ```
+  _Blocking by hostname is not enough: a name that resolves to 169.254.169.254 is the attack.
+  Resolve first, check the address, then connect._
+  ```
+- [ ] **C.2 ·** `sharp` **variants** at deterministic keys `products/{userId}/{sku}/{size}.webp`.
+  ```
+  _A deterministic key makes a re-run overwrite with identical bytes, so idempotency needs no
+  ledger here._
+  ```
+- [ ] **C.3 · Transient vs permanent** — a timeout retries; a 404 or a non-image throws
+  `TerminalJobError` and dead-letters immediately.
+  ```
+  _This is_ `TerminalJobError`_'s first real caller; until now the branch existed and nothing
+  could reach it._
+  ```
+- [ ] **C.4 · Resolve D10** — measure BullMQ lock renewal while N image batches run.
+  ```
+  _`sharp` is async but runs on the libuv threadpool. Saturating 4 threads delays all async I/O
+  in the process, lock renewal included, so a batch can self-stall without ever blocking the
+  event loop. Measure before choosing concurrency or a sandboxed processor._
+  ```
+
+### Done when
+
+- [ ] **A16 passes** — `http://localhost`, `http://169.254.169.254` and a DNS name resolving to a
+  private address are all rejected
+- [ ] **A17 passes** — a permanent error consumes one attempt, not the whole budget
+- [ ] **A18 passes** — image batches at the chosen concurrency do not trigger stalled redeliveries
+
+---
+
+# PD · `ai.enrich`
+
+**Goal:** LLM output is treated as untrusted input, and provider rate limits slow the queue instead
+of failing jobs.
+**Spec:** D6a · _Consumes: D6a._
+
+### Tasks
+
+- [ ] **D.1 ·** `LlmProvider` **interface** + `FakeLlmProvider` — deterministic, no API key, and
+  able to simulate 429s and malformed JSON on demand.
+  ```
+  _The fake is not a stand-in for the real one; it is the only way to test the failure paths the
+  real one produces rarely and expensively._
+  ```
+- [ ] **D.2 · A separate** `relay-ai` **queue with a** `limiter` **(resolves D6a)** and low
+  concurrency.
+  ```
+  _A BullMQ limiter is per-queue, so the rate limit itself forces the split — not a starvation
+  measurement, which is what D6a was waiting for._
+  ```
+- [ ] **D.3 · Zod-validate every item** — one corrective retry, then
+  `enrichmentStatus = 'failed'`; a category outside the enum is rejected.
+  ```
+  _A hallucinated category is indistinguishable from a valid one until something checks. This is
+  the lesson of the phase._
+  ```
+- [ ] **D.4 · Honour 429s** — `worker.rateLimit(ms)` + `RateLimitError`, using `Retry-After`.
+  ```
+  _Backpressure, not failure: the job has not failed, the provider is busy._
+  ```
+- [ ] **D.5 ·** `enrichmentInputHash` **skip** + conditional update on write.
+  ```
+  _Re-running must cost nothing for unchanged products, and must never overwrite newer data._
+  ```
+- [ ] **D.6 · Track** `tokensIn`, `tokensOut`, `estimatedCostUsd` per job.
+
+### Done when
+
+- [ ] **A19 passes** — malformed or out-of-schema output never reaches the database
+- [ ] **A20 passes** — simulated 429s slow the queue; no job fails because of one
+- [ ] **A21 passes** — re-running enrichment on unchanged products issues zero provider calls
+
+---
+
+# PE · Pipeline fan-out
+
+**Goal:** one import fans out into enrichment and image batches and converges on a summary, with
+partial failure as a first-class outcome.
+**Spec:** D23, D24, D22 · _Consumes: D23, D24._
+
+### Tasks
+
+- [ ] **E.1 ·** `Pipeline` **model** with a `pendingChildren` counter and aggregate counts.
+- [ ] **E.2 · Children are our own rows** (D24), each with a **server-minted deterministic**
+  idempotency key `pipeline:<id>:<stage>:<batch>` (D23), enqueued through the outbox.
+  ```
+  _`FlowProducer` would make Redis a second source of truth for pipeline structure and its
+  children would bypass the outbox. Minting the key server-side also means
+  `UNIQUE (userId, idempotencyKey)` makes the fan-out itself idempotent, for free._
+  ```
+- [ ] **E.3 · The parent is enqueued by the transaction that takes** `pendingChildren` **to zero.**
+  ```
+  _Parent-runs-when-children-finish becomes a conditional UPDATE on a counter — the idiom the
+  whole engine already uses — and the parent's outbox row is written in that same transaction._
+  ```
+- [ ] **E.4 · Child-failure policy** — a failed batch does not fail the pipeline; the pipeline ends
+  `completed_with_errors` (on `Pipeline`, never on `Job` — D22) and the batch stays re-drivable.
+
+### Done when
+
+- [ ] **A22 passes** — a failed child leaves the pipeline `completed_with_errors`, not failed
+- [ ] **A23 passes** — replaying the fan-out cannot create a second row for any batch
+- [ ] **A24 passes** — a crash between the last child committing and the parent being enqueued is
+  recovered by the outbox relay
+
+---
+
+# PF · API keys and public docs
+
+**Goal:** another system can drive Relay without a browser session.
+**Spec:** §6 · _Consumes: nothing new._
+
+### Tasks
+
+- [ ] **F.1 ·** `ApiKey` **model** — `prefix` shown in the UI, SHA-256 `hash`, `scopes`,
+  `lastUsedAt`, `revokedAt`. The secret is displayed once and never stored.
+  ```
+  _Hash, not encrypt: nothing ever needs to read the key back, only to compare it._
+  ```
+- [ ] **F.2 ·** `ApiKeyGuard` **beside** `JwtAuthGuard` — either satisfies a job endpoint.
+- [ ] **F.3 · Swagger** for the public surface, documenting api-key auth.
+
+### Done when
+
+- [ ] **A25 passes** — a revoked key is refused, and revocation takes effect without a restart
+- [ ] **A26 passes** — the plaintext key appears in no row and no log line
+
+---
+
+# PH · Presentation
+
+- [ ] README: problem → architecture diagram → the reliability guarantees and the assertion that
+  proves each → screenshots → how to run
+- [ ] `docker compose up` starts API, worker, Postgres, Redis, MinIO
+- [ ] A 60-second demo script that includes killing a worker mid-run
+
+### Done when
+
+- [ ] A reader who knows nothing about the project can run it and reproduce A3 from the README
+
+---
+
+# PI · Billing
+
+**Goal:** a real Stripe subscription integration with plan limits enforced by the API.
+**Spec:** to be written as `docs/BILLING_SPEC.md` **at the start of this phase, not before** —
+subscription fields move between Stripe API versions and a spec written now would be stale.
+_Consumes: D27._
+
+Shape only, so the earlier phases leave room for it:
+
+- [ ] Webhook endpoint with signature verification over the **raw** body, `StripeEvent` dedupe by
+  `eventId`, and the work done on Relay's own queue
+- [ ] Local state rebuilt by **fetching the subscription from Stripe**, never from event payload
+  order
+- [ ] `EntitlementsService` as the single answer to "what plan, which limits, how much used"
+- [ ] Quota consumed through `SideEffect` with `effectKey = '<jobId>:quota:<batchIndex>'` (D27), so
+  a retried batch cannot consume twice
+- [ ] Count limits checked inside a transaction; a downgrade **disables** surplus resources and
+  never deletes them
+
+### Done when
+
+- [ ] The same webhook delivered twice changes state once; out-of-order events still converge
+- [ ] Two parallel imports near the limit never exceed it in total
+- [ ] Access is never granted without a verified webhook

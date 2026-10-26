@@ -79,9 +79,9 @@ reliability measurement (§7.6).
 
 Real payment or email side effects · real heavy processing (transcode, LLM calls) · job DAGs
 and workflow orchestration · scheduled/repeating jobs (BullMQ Job Schedulers) · multi-tenant
-billing · Kubernetes or autoscaling · distributed tracing across services · a polished frontend
-(a single static HTML page that opens the socket is sufficient to *demonstrate* realtime) ·
-GraphQL · read replicas.
+billing · Kubernetes or autoscaling · distributed tracing across services · any frontend
+(the realtime contract is verified by a scripted socket client; a dashboard is a separate
+deliverable and is not what §9 is specified against) · GraphQL · read replicas.
 
 ---
 
@@ -744,9 +744,49 @@ not apply here.
 - **Authenticated on connect**, not per message — a socket cannot carry an `Authorization` header
   per frame. The access token is passed in the handshake `auth` payload; an invalid or expired
   token means the connection is refused, not degraded.
+- Authentication is **socket.io middleware**, not `handleConnection`. Middleware rejects during the
+  handshake, so the client gets a `connect_error` and never holds a connected socket; refusing in
+  `handleConnection` accepts the connection and then drops it, which is "degraded", not "refused".
 - On successful connect the socket joins the room `user:<userId>`. **The server assigns the room
   from the verified token — never from anything the client sends.** Identity from the token,
   ownership from the DB; the moment either comes from client input the check collapses.
+
+### 9.2a Crossing the process boundary — D8
+
+Transitions happen in the worker; sockets live in the API. The worker publishes a **domain fact**
+to a Redis pub/sub channel and the API decides who should see it:
+
+```
+worker  --PUBLISH relay:job-updated-->  redis  --SUBSCRIBE-->  api  --to(user:<id>)-->  client
+```
+
+Not the socket.io Redis adapter: that exists so several *socket.io servers* can share rooms. The
+worker is not one and should not become one to emit — it would couple the worker to the transport.
+
+**Pub/sub is at-most-once and that is deliberate.** An event published while the API is restarting
+or a client is between reconnects is gone; nothing retries it. This is sound only because of A7:
+Postgres is the source of truth (D4) and the client's recovery is to re-read `GET /jobs/:id`.
+
+Events therefore **do not go through the outbox**, and the reason is the cost of losing one:
+
+| | lost enqueue | lost socket event |
+|---|---|---|
+| consequence | the work never happens | a UI is stale for a moment |
+| client can recover it? | no — nothing to re-read | yes — `GET /jobs/:id` |
+| mechanism it earns | durable outbox row inside the transaction | fire-and-forget publish |
+
+A row per status change would double write volume for data whose only consumer can re-read the
+truth. Matching the mechanism to the cost of losing the message is the point; the heavyweight one
+everywhere is as wrong as the cheap one everywhere.
+
+Two mechanics that are easy to get wrong:
+
+- **Publish after commit, never inside the transaction.** An event cannot be un-sent, so a publish
+  inside a transaction that then rolls back has broadcast a state that never existed. `redrive()`
+  runs its transition inside `$transaction`, so publishing lives at the call sites rather than
+  inside `JobTransitionService`, where "after commit" would be invisible.
+- **A subscribed ioredis connection refuses every other command.** The gateway subscribes on
+  `redis.duplicate()` and leaves the shared client alone.
 
 ### 9.2 Events
 
@@ -994,6 +1034,22 @@ cases.
 | **A8** | **No status disagreement.** Only applicable if D4 chose "both" | After drain, no job's Redis-side state contradicts its Postgres state. **If this test cannot be written, D4 must be "Postgres only"** | 5 |
 | **A9** | **Holds under load.** V virtual users for T minutes, one worker killed mid-run | A2 and A3 still hold. Record p95 submit latency, throughput, max queue depth, drain time — **name the numeric targets before running**, or the result is unfalsifiable | 10 |
 | **A10** | **No side effect inside a transaction.** Enforced by review, not code | Grep every `$transaction` block: it may write the ledger row, never perform the effect | ongoing |
+| **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change | PA |
+| **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic across the job's life | PA |
+| **A13** | **A large import does not grow with the file.** Import 20 000 rows | Peak RSS flat within a stated band; **name the band before running** or the result is unfalsifiable | PB |
+| **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
+| **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
+| **A16** | **A hostile image URL reaches nothing private.** `http://localhost`, `http://169.254.169.254`, and a public DNS name resolving to a private address | All three rejected **after resolution, before connect**; the product fails, the batch does not | PC |
+| **A17** | **A permanent error does not burn the budget.** A 404 image | `attempts = 1` at `DEAD_LETTERED`; no backoff was waited | PC |
+| **A18** | **Image batches do not self-stall.** N concurrent batches at the chosen concurrency | Zero `stalled` events; resolves D10 with a measurement rather than an assumption | PC |
+| **A19** | **LLM output is untrusted input.** Fake provider returns malformed JSON and an out-of-enum category | Nothing is written for those items; `enrichmentStatus = 'failed'` with a reason; the DB holds no value outside the taxonomy | PD |
+| **A20** | **Rate limits slow the queue, not the jobs.** Fake provider returns 429 with `Retry-After` | No job reaches `DEAD_LETTERED` because of a 429; the queue's throughput drops and recovers | PD |
+| **A21** | **Re-enrichment of unchanged products is free.** Run enrichment twice | Provider call count on the second run **= 0**; `estimatedCostUsd` unchanged | PD |
+| **A22** | **A failed child does not fail the pipeline.** Force one enrichment batch to fail | `Pipeline.status = 'completed_with_errors'`; sibling batches completed; the failed batch is re-drivable; no `Job` row carries `completed_with_errors` | PE |
+| **A23** | **The fan-out is idempotent.** Replay the fan-out for a pipeline | One `Job` row per `(stage, batch)`; the duplicate attempt is refused by `UNIQUE (userId, idempotencyKey)` | PE |
+| **A24** | **The parent cannot be lost.** Crash between the last child committing and the parent being enqueued | The relay publishes the parent's outbox row; the pipeline finalizes exactly once | PE |
+| **A25** | **Revocation is immediate.** Revoke a key, then use it | `401`, with no process restart | PF |
+| **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
 
 **A6 is written to fail against the phase-5 design.** The commit-then-enqueue gap is a knowingly
 accepted risk; A6 quantifies it rather than leaving it undocumented.
@@ -1042,13 +1098,100 @@ to settle it.
 |---|---|---|---|
 | D7 | Claim guard; crash reconciliation; authoritative attempt counter | Your first killed worker leaves a row stuck in `RUNNING` | 6 |
 | D6b | What a dead letter physically is | The first job that actually dies | 6 |
-| D8 | Who emits the WS event; how it crosses the process boundary | The worker emits and no browser receives it | 7 |
+| D8 | ~~Who emits the WS event; how it crosses the process boundary~~ | — | **DECIDED 2026-10-26** — the worker `PUBLISH`es a domain event to `relay:job-updated`; the API subscribes on a duplicated connection and fans out to `user:<userId>`. §9.3 |
 | D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
 | D10 | Worker concurrency tuning; sandboxed processors | Measured event-loop blocking in the worker | 10 |
 | D11 | A dead-letter re-drive API beyond `POST /jobs/:id/retry` | The first real dead letter that needs bulk handling | 8 |
 | D12 | Status cache in Redis | A **measured** slow `GET /jobs/:id`. Never before | — |
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
+
+### Forced earlier than planned by the real-job proposal
+
+Three decisions above were deferred to later phases. The proposal supplies their triggers sooner,
+so they move:
+
+| # | Was | Now | Why the trigger arrives early |
+|---|---|---|---|
+| D6a | phase 10 | **Phase D** | `ai.enrich` needs a BullMQ `limiter` and low concurrency of its own. A limiter is per-queue, so an LLM queue separate from `relay-jobs` is forced by the rate limit, not by a starvation measurement |
+| D10 | phase 10 | **Phase C** | `sharp` is async but runs on the libuv threadpool (4 threads by default). Saturating it delays *all* async I/O in that process, including BullMQ lock renewal — so image batches can self-stall without ever blocking the JS event loop. §7.6's warning applies to threadpool starvation, not only to CPU-bound loops |
+| D11 | phase 8 | **Phase A** | §3.4 asks for bulk retry by filter in the same phase as the handler registry |
+| D14 | — | **Phase B** | §5.3 asks for cursor pagination on `/jobs` and `/products`; a 20 000-product catalog is the list where offset paging starts to hurt |
+| D15 | v2 | **now** | "job types beyond `MOCK`/`CHARGE`" was deferred until a real use case appeared. This proposal *is* that use case, and D21–D27 below are what it turns out to require |
+
+### Decide now — before Phase B code · the real-job proposal · **all resolved 2026-10-26**
+
+| # | Question | Why it cannot wait | Decision |
+|---|---|---|---|
+| D21 | ~~Is `Job.type` a Postgres enum or a string owned by the handler registry?~~ | Phase A's registry is the thing that decides it, and either answer is a migration | **DECIDED** — string + registry; closed set kept in one `JOB_TYPES` tuple |
+| D22 | ~~What statuses does the proposal add, and where does `completed_with_errors` live?~~ | It changes the state machine M6 hardened | **DECIDED** — `CANCELLED` + `cancelRequested` on `Job`; `DEAD_LETTERED` keeps its name; `completed_with_errors` on `Pipeline` only |
+| D23 | ~~Who owns a job no HTTP request created?~~ | `Job.userId` is `NOT NULL` and `(userId, idempotencyKey)` is what A1 rests on | **DECIDED** — `userId` stays `NOT NULL`; children get server-minted deterministic keys; webhooks are not `Job` rows |
+| D24 | ~~Fan-out via BullMQ `FlowProducer`, or our own rows through the outbox?~~ | Phase B's import triggers the fan-out; the schema differs per answer | **DECIDED** — our own rows through the outbox; `pendingChildren` counter |
+| D25 | ~~Where does progress live and how often is it written?~~ | Phase A writes it; `GET /jobs/:id` has to answer it after a reconnect | **DECIDED** — `progress Json?` on `Job`, ownership-guarded |
+| D26 | ~~Does a re-drive resume from a checkpoint or restart from zero?~~ | `redrive()` currently clears `result` and resets `attempts` | **DECIDED** — resume from the checkpoint; `?from=start` to restart |
+| D27 | ~~A second ledger for quota, or reuse `SideEffect`?~~ | Phase B's checkpoint and Phase I's quota would otherwise invent two | **DECIDED** — reuse `SideEffect`, `effectKey = '<jobId>:quota:<batchIndex>' |
+
+**D21 — `Job.type` becomes a string, with the registry as the authority.**
+An enum makes every new job type a migration, which defeats §3.1's whole point that adding a type
+is adding a provider. `type` never decides authorization or correctness, and the registry lookup
+fails closed: an unknown type is a `400` at submit and a refusal in the worker. The contract stays
+closed at the edge by deriving the Zod union from a single `JOB_TYPES` tuple, so TypeScript still
+sees a literal union and a typo in a handler is still a compile error.
+
+**D22 — add `CANCELLED`; keep `DEAD_LETTERED`; `completed_with_errors` is not a job status.**
+Cancellation is two-phase, so it is *two* fields: `cancelRequested Boolean` while the job is still
+`RUNNING` and winding down, and `CANCELLED` as the terminal status it exits to. `CANCELLED` joins
+`TERMINAL`, which makes `claim()` refuse it with no change to `claim()` itself.
+`DEAD_LETTERED` is not renamed to `failed`: "failed" is ambiguous between *this attempt failed* and
+*we gave up*, and that ambiguity is exactly what the M6 machinery is written to distinguish. The
+dashboard may label it anything it likes.
+A job that imported 19 800 of 20 000 rows **succeeded** — the bad rows are data in `result`, not a
+status. `completed_with_errors` is an aggregate over children and belongs on `Pipeline`; putting it
+on `Job` would force every consumer of job status to handle a value the engine never produces.
+
+**D23 — `userId` stays `NOT NULL`. Two different problems were being conflated.**
+Fan-out children (`ai.enrich`, `image.process`, `pipeline.finalize`) *do* have an owner: the user
+whose import created them. They keep `userId` and get a **server-minted deterministic** idempotency
+key — `pipeline:<pipelineId>:enrich:<batchIndex>` — which means the `(userId, idempotencyKey)`
+constraint that protects A1 now also makes the fan-out itself idempotent, for free. Re-running a
+fan-out cannot duplicate a batch.
+`stripe.event` is the genuinely ownerless case, and the answer is that it is **not a `Job`**. It has
+its own table with its own dedupe (`StripeEvent.eventId`), and the queue job carries that row's id.
+Making `userId` nullable to accommodate one caller would weaken the constraint for every other job.
+
+**D24 — the fan-out is our own rows, enqueued through the outbox.**
+`FlowProducer` writes parent and children in one Redis call and tracks the dependency itself. That
+is a second source of truth for pipeline structure, which contradicts D4; those children bypass the
+outbox, so the commit-then-enqueue guarantee A6 exists to prove would not cover them; and their
+BullMQ ids would not follow the `${jobId}.${outboxId}` scheme §7.5a just established.
+Doing it ourselves is less code than it sounds: `Pipeline.pendingChildren` is decremented in the
+**same transaction** as each child's terminal transition, and when it reaches zero that transaction
+also writes the parent's outbox row. Parent-runs-when-children-finish becomes a conditional UPDATE
+on a counter — the idiom the whole project already uses — and the child-failure policy §3.5 asks
+about becomes ours to state rather than a BullMQ flag to look up.
+
+**D25 — `progress Json?` on `Job`, written per batch, guarded by the ownership token.**
+Not Redis-only: D4 makes Postgres authoritative, and `GET /jobs/:id` has to answer "how far along"
+on reconnect, which is A7's shape. Not a separate table: progress is one current value, not a
+history, and a row per update is write amplification nobody reads back.
+A progress write is **not** a status transition and must not go through a status set, but it does
+carry the same `attempts = <claimed attempt>` predicate, so a stale worker cannot overwrite the
+live one's progress. Note for the future lease-based reaper: progress writes bump `updatedAt`, so
+the lease clock must be `startedAt`, never `updatedAt`.
+
+**D26 — a re-drive resumes from the checkpoint; restarting is opt-in.**
+The checkpoint is neither `result` (which `redrive()` clears) nor `progress` (which is
+presentational), so it gets its own storage keyed by job, and `redrive()` does not clear it.
+Resuming is safe because the row-level upsert on `(userId, sku)` makes a replayed batch harmless,
+and restarting a 20 000-row import from zero is expensive. `POST /jobs/:id/retry?from=start` forces
+a restart. This is the same semantic already settled for `effectKey`: a re-drive asks *did this
+happen?*, not *do it again*.
+
+**D27 — quota consumption reuses `SideEffect`.**
+§10.5 independently arrived at "keyed by `jobId` + `batchIndex`", which is `effectKey`. One
+mechanism: `effectKey = '<jobId>:quota:<batchIndex>'`, amount in `detail`, and the `UsageCounter`
+aggregate updated in the same transaction as the ledger row. The only work is documenting the
+`effectKey` naming convention, which is currently an undocumented `'<jobId>:charge'`.
 | D14 | Cursor pagination | A list endpoint where offset pagination measurably hurts | — |
 | D15 | Job types beyond `MOCK` / `CHARGE` | A real use case | v2 |
 | D16 | Do replays bypass the rate limiter? | A client retrying with the same key gets `429` for a job already accepted | 8 |
@@ -1097,5 +1240,9 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-24 | §7.6 — a job past `maxStalledCount` is failed **without `process()` running**. The worker now finalises such jobs from the `failed` event gated on `finishedOn`; `deadLetter()` accepts `QUEUED` as well as `RUNNING` so an abandoned row can still reach a terminal state. |
 | 2026-10-24 | §7.2 — `redrive()` now writes its own `Outbox` row inside the transition transaction. The commit-then-enqueue gap A6 exists to prove was closed for `submit()` only. |
 | 2026-10-26 | §7.5a — the queue entry is now keyed by the outbox row, not the job. A job-scoped id let a re-drive silently deduplicate against a still-locked earlier delivery, enqueue nothing, and be marked published. |
+| 2026-10-26 | §14 — A11–A26 registered for phases PA–PF, each with its deciding query. `IMPLEMENTATION_PLAN.md` gains the PA–PI product track. |
+| 2026-10-26 | §9.1, §9.2a, D8 — **decided**: Redis pub/sub bridges worker → API; delivery is at-most-once and events bypass the outbox because a lost event is recoverable by re-reading the job. Socket auth moved to handshake middleware. A7 extended to assert the loss *and* the recovery. |
+| 2026-10-26 | §16 — D21–D27 **decided** for the real-job proposal. D15 ("job types beyond `MOCK`/`CHARGE`") is the decision it fires; D6a, D10, D11 and D14 move earlier because the proposal supplies their triggers sooner. |
+| 2026-10-26 | §1 scope, §9 — no frontend of any kind is in scope, including the static demo page. A7 is verified by a scripted socket client so it can run in CI; the dashboard is a separate deliverable. |
 | 2026-10-26 | §7.3 — the attempt number is the worker's **ownership token**. `succeed`, `requeueForRetry` and `deadLetter` all require `attempts = <the attempt that claimed>`, so a worker that lost a job while still running it cannot write over whoever holds it now. `succeed` also accepts `QUEUED`, because a refused `succeed` is unrecoverable: the work is done and no later delivery exists. |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

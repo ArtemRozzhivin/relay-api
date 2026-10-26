@@ -1,7 +1,7 @@
 import { Inject, Logger, Module, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Redis } from 'ioredis';
-import { ApiEnv } from '../config/env.schema.js';
+import { SharedEnv } from '../config/env.schema.js';
 
 export const REDIS_CLIENT = Symbol('REDIS_CLIENT');
 
@@ -9,7 +9,7 @@ export const REDIS_CLIENT = Symbol('REDIS_CLIENT');
   providers: [
     {
       provide: REDIS_CLIENT,
-      useFactory: (config: ConfigService<ApiEnv, true>) => {
+      useFactory: (config: ConfigService<SharedEnv, true>) => {
         const logger = new Logger('Redis');
 
         const client = new Redis(config.get('REDIS_URL', { infer: true }));
