@@ -412,36 +412,45 @@ Each step is motivated by the failure of the one before it.
 
 ### Tasks
 
-- [ ] **9.1 · Vitest config**, shared test module builder, DI-swap conventions.
+- [x] **9.1 · Vitest config**, shared test module builder, DI-swap conventions.
   ```
   `Test.createTestingModule().overrideProvider()` _is the payoff of DI._
   ```
-- [ ] **9.2 · e2e harness** — boot the real app, real Postgres and Redis, Supertest.
+- [x] **9.2 · e2e harness** — boot the real app, real Postgres and Redis, Supertest.
   ```
   _Mocked infrastructure cannot exercise a transaction or a queue._
   ```
-- [ ] **9.3 · Deterministic fixtures** + isolated DB state per test.
+- [x] **9.3 · Deterministic fixtures** + isolated DB state per test.
   ```
   _A shared dirty database makes failures unreproducible._
   ```
-- [ ] **9.4 · Automate A1–A7** — including process kill/restart — as suite cases.
+- [x] **9.4 · Automate A1–A7** — including process kill/restart — as suite cases.
   ```
   _Manual reliability checks decay the moment they stop being run._
   ```
-- [ ] **9.5 · GitHub Actions** — Postgres + Redis service containers, `migrate deploy`, lint → typecheck → test.
+- [x] **9.5 · GitHub Actions** — Postgres + Redis service containers, `migrate deploy`, lint → typecheck → test.
   ```
   _An unbiased "does it work from scratch" gate on every push._
   ```
-- [ ] **9.6 · Coverage reporting**, with the reliability paths held to a higher bar.
+- [x] **9.6 · Coverage reporting — reported, not gated.** Reframed while implementing: the
+  reliability paths run in child processes, where V8 coverage cannot see them, so a percentage
+  threshold could only be met by unit tests that mock Prisma and BullMQ. The gate for reliability
+  is the named assertions of §14; coverage runs with `all: true` so untested files read as 0%
+  rather than vanishing from the average. See TECH_SPEC §15.1.
   ```
-  _Not all uncovered lines cost the same._
+  _Not all uncovered lines cost the same — and a number that can be reached by mocking the thing
+  under test is worse than no number._
   ```
 
 ### Done when
 
-- [ ] `npm test` reproduces every reliability assertion without manual steps
-- [ ] CI is green from a clean checkout
-- [ ] A deliberately reintroduced double-charge bug fails CI
+- [x] `npm run test:all` reproduces every reliability assertion without manual steps — unit 14,
+  integration 9, assertions 12 across 9 files; the three scripts chain in one command
+- [ ] CI is green from a clean checkout — the workflow is written and YAML-valid but **cannot be
+  verified until it has run on a push**; this stays open deliberately
+- [x] A deliberately reintroduced double-charge bug fails CI — verified by re-scoping the ledger
+  key to the attempt number: A3 failed with 12 ledger rows for 6 jobs, and the source was restored
+  by the harness script's trap
 
 ---
 

@@ -18,9 +18,12 @@
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
-    "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "start:worker": "node dist/worker.js",
-    "start:worker:dev": "nest start --watch --entryFile worker"
+    "start:worker:dev": "nest start --watch --entryFile worker",
+    "typecheck": "tsc --noEmit -p tsconfig.build.json",
+    "test:assertions": "npm run build && vitest run --config ./vitest.config.assertions.ts",
+    "test:integration": "vitest run --config ./vitest.config.e2e.ts",
+    "test:all": "npm run test && npm run test:integration && npm run test:assertions"
   },
   "dependencies": {
     "@nestjs/bullmq": "^12.0.0",

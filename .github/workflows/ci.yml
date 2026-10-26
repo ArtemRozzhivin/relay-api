@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push should not race the first for port 3000 and the shared database.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    # Real Postgres and Redis. The reliability assertions are about transactions
+    # and queue redelivery, so there is nothing here that a mock could stand in
+    # for without the test ceasing to mean anything.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://relay:relay@localhost:5432/relay?schema=public
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: ci-access-secret-not-used-anywhere-else
+      JWT_REFRESH_SECRET: ci-refresh-secret-not-used-anywhere-else
+      LOG_LEVEL: warn
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx prisma generate
+
+      # `migrate deploy`, never `db push`: the CHECK constraints and partial
+      # indexes live in hand-written migrations, and push would skip them.
+      - run: npx prisma migrate deploy
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - run: npm run test:integration
+
+      # Boots real API and worker processes and kills them mid-flight. Slow by
+      # nature — this is the step that would catch a reintroduced double charge.
+      - run: npm run test:assertions
+        timeout-minutes: 25
+
+      - if: failure()
+        run: |
+          echo "::group::postgres"
+          docker logs "$(docker ps -aqf ancestor=postgres:17-alpine)" 2>&1 | tail -50
+          echo "::endgroup::"

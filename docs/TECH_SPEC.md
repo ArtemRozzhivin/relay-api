@@ -1065,12 +1065,63 @@ Specifying them now would produce prose that is wrong by the time it is used.
 | Phase | Objective | Exit criterion | Detail written |
 |---|---|---|---|
 | **8 · Observability & hardening** | Prometheus `/metrics` from both processes: queue depth, duration histogram, failure rate, dead-letter count. Rate limiting, `trust proxy`, helmet, CORS allowlist, body limits. Dead-letter inspection and re-drive | Queue depth observably rises and drains under load; one job's full story is retrievable from logs by `correlationId` alone | Start of phase 8 |
-| **9 · Test harness & CI** | The shared harness, fixtures and CI — **not** the tests themselves, which are written with the code throughout (§14). A1–A7 become automated cases including process kill/restart | `npm test` reproduces every reliability assertion with no manual steps; CI green from a clean checkout | Start of phase 9 |
+| **9 · Test harness & CI** | The shared harness, fixtures and CI — **not** the tests themselves, which are written with the code throughout (§14). A1–A7 become automated cases including process kill/restart | `npm run test:all` reproduces every reliability assertion with no manual steps; CI green from a clean checkout | **§15.1** |
 | **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a and D10 closed with measurements attached | Start of phase 10 |
 | **11 · Deploy** | One VPS: Docker running API + worker, Caddy for auto-HTTPS, `ufw`, managed Postgres, restart policies, migrations as a release step. Multi-instance socket.io (D13) becomes real here | HTTPS on a real domain; a reboot restores both processes unattended; a restore from backup has been rehearsed | Start of phase 11 |
 
 **Note for phase 8:** `@nestjs/throttler` 6.5.0 declares peers stopping at Nest 11. Re-verify its
 support at that point rather than pinning the assumption now.
+
+### 15.1 Test tiers — written 2026-10-26
+
+Three tiers, separated by what infrastructure each one needs:
+
+| tier | command | infrastructure | covers |
+|---|---|---|---|
+| unit | `npm test` | none | schemas, pure logic, services with DI swaps |
+| integration | `npm run test:integration` | Postgres, Redis, app in-process | the request contract: validation, auth, tenant scoping |
+| assertions | `npm run test:assertions` | API and worker as **OS processes** | A1–A7 |
+
+The third tier exists because A3, A3b and A5b `SIGKILL` and `SIGSTOP` a worker. The point of those
+assertions is that the process dies *without running any cleanup*, which nothing in-process can
+simulate. `test/harness/relay-harness.ts` owns the children; Postgres is reached through Prisma and
+Redis through ioredis, so assertions read typed rows instead of parsing `docker exec psql` output.
+
+**Tests wait for conditions, never for durations.** `waitUntil` replaced every `sleep`. A3 used to
+sleep and then report `INCONCLUSIVE` when no job happened to be mid-charge; it now waits until all
+six provably are, so the vacuous case is a precondition rather than an outcome to detect.
+
+Three traps found while building it, each of which had made a test lie:
+
+- **Processes must be reaped, not merely signalled.** `child.killed` records that *a* signal was
+  sent, not that the process died, so testing it suppressed the `SIGKILL` following a `SIGCONT`.
+  Survivors kept consuming jobs from the shared queue and the resulting failures looked like queue
+  bugs. Cleanup awaits the real `exit`, each harness binds its own port, and a `globalSetup`
+  **reports** strays rather than killing processes it did not start.
+- **`NODE_ENV=test` silences the logger** (§9.1 logging). Vitest sets it, spawned children inherit
+  it, so any assertion reading a worker's log saw nothing. The harness spawns with
+  `NODE_ENV=development`.
+- **Log output lags the database.** The pretty-print transport is a separate thread, so a count
+  read the instant a row changes can be short. Log assertions must be waited for — and where the
+  database already proves the claim, the log assertion was removed instead: `attempts = 3` *is*
+  the evidence of three deliveries.
+
+**Coverage carries no threshold, by design.** The reliability paths execute in child processes
+where V8 coverage cannot observe them, so a percentage gate could only be satisfied by unit tests
+that mock Prisma and BullMQ — and every bug these paths actually had (the stale `succeed()`
+predicate, the silent `queue.remove()`, the stall black hole) needs two real processes and a real
+database to reproduce. The gate for reliability is the named assertions of §14; coverage is
+reported for information.
+
+**The suite's teeth were verified, not assumed.** Re-scoping the ledger key to the attempt number —
+`${job.id}:charge:${job.attempts}`, the plausible "fix" for a key thought to be colliding — makes
+A3 fail with 12 ledger rows for 6 jobs. A4 still passes, correctly: it redelivers an already
+terminal job, so `claim()` refuses and the handler never runs. The two gate different layers.
+
+**Node version:** `engines` declares `>=24 <25` and CI runs 24, but local development is on 26.
+Only logging reads `NODE_ENV` and nothing reads the Node version, so this is latent rather than
+broken — but CI is the stricter of the two and the field should be widened or the local runtime
+aligned.
 
 ---
 
@@ -1240,6 +1291,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-24 | §7.6 — a job past `maxStalledCount` is failed **without `process()` running**. The worker now finalises such jobs from the `failed` event gated on `finishedOn`; `deadLetter()` accepts `QUEUED` as well as `RUNNING` so an abandoned row can still reach a terminal state. |
 | 2026-10-24 | §7.2 — `redrive()` now writes its own `Outbox` row inside the transition transaction. The commit-then-enqueue gap A6 exists to prove was closed for `submit()` only. |
 | 2026-10-26 | §7.5a — the queue entry is now keyed by the outbox row, not the job. A job-scoped id let a re-drive silently deduplicate against a still-locked earlier delivery, enqueue nothing, and be marked published. |
+| 2026-10-26 | §15.1 — the phase 9 test design: three tiers, condition-based waiting, no coverage threshold and why, plus the three harness defects that had made assertions pass without proving anything. |
 | 2026-10-26 | §14 — A11–A26 registered for phases PA–PF, each with its deciding query. `IMPLEMENTATION_PLAN.md` gains the PA–PI product track. |
 | 2026-10-26 | §9.1, §9.2a, D8 — **decided**: Redis pub/sub bridges worker → API; delivery is at-most-once and events bypass the outbox because a lost event is recoverable by re-reading the job. Socket auth moved to handshake middleware. A7 extended to assert the loss *and* the recovery. |
 | 2026-10-26 | §16 — D21–D27 **decided** for the real-job proposal. D15 ("job types beyond `MOCK`/`CHARGE`") is the decision it fires; D6a, D10, D11 and D14 move earlier because the proposal supplies their triggers sooner. |
