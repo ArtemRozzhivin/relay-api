@@ -9,7 +9,6 @@ import {
 } from '../common/errors/app-error.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
-import type { JobType } from '../generated/prisma/enums.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { JOBS_QUEUE, messageId, type JobMessage } from './job-queue.js';
 import type { ListJobsQuery, SubmitJobInput } from './jobs.schema.js';
@@ -81,12 +80,20 @@ export class JobsService {
     }
 
     if (this.config.get('RELAY_FAULT_AFTER_COMMIT', { infer: true })) {
-      throw new Error('Injected fault: committed the job row, never enqueued it');
+      throw new Error(
+        'Injected fault: committed the job row, never enqueued it',
+      );
     }
 
     const { job, outboxId } = committed;
 
-    await this.enqueue(job.id, outboxId, job.type, job.maxAttempts, correlationId);
+    await this.enqueue(
+      job.id,
+      outboxId,
+      job.type,
+      job.maxAttempts,
+      correlationId,
+    );
     await this.markPublished(outboxId);
     await this.events.jobUpdated(job);
 
@@ -96,7 +103,7 @@ export class JobsService {
   private async enqueue(
     jobId: string,
     outboxId: bigint,
-    type: JobType,
+    type: string,
     maxAttempts: number,
     correlationId: string,
   ) {
@@ -154,7 +161,13 @@ export class JobsService {
 
     const { job, outboxId } = requeued;
 
-    await this.enqueue(job.id, outboxId, job.type, job.maxAttempts, correlationId);
+    await this.enqueue(
+      job.id,
+      outboxId,
+      job.type,
+      job.maxAttempts,
+      correlationId,
+    );
     await this.markPublished(outboxId);
     await this.events.jobUpdated(job);
 

@@ -560,19 +560,25 @@ checked under load. M10 must precede M11, so the box is sized against measured n
 
 ### Tasks
 
-- [ ] **A.1 ·** `Job.type` **becomes a string** (D21) — one `JOB_TYPES` tuple feeds both the Zod
-  union and the TS literal union; migration drops the `JobType` enum.
+- [x] **A.1 ·** `Job.type` **becomes a string** (D21) — `JOB_TYPES` is derived from the submit
+  union, so the Zod enum and the TS literal union cannot drift; the migration drops the
+  `JobType` enum.
   ```
   _An enum makes every new type a migration, and Postgres enum labels can never be removed._
   ```
-- [ ] **A.2 ·** `JobHandler` **interface** — `type`, `payloadSchema`, `queue`, `handle(ctx, payload)`;
-  the registry resolves by type via DI and the processor stops knowing any type by name.
+- [x] **A.2 ·** `JobHandler` **abstract base class** — `type`, `payloadSchema`, `execute(ctx,
+  payload)`; the registry resolves by type via DI and the processor names no type. A base class
+  rather than a bare interface because the payload re-parse belongs to every handler. No
+  per-handler `queue`: one queue still carries every type (§8.1).
   ```
-  _Adding a job type becomes adding one provider. Validate the payload at submit AND in the
-  worker: the worker's copy is what protects it from a row written by an older deploy._
+  _Adding a job type becomes adding one provider — and `Record<JobType, …>` in the module keeps
+  "becomes" from meaning "forgets". Validate the payload at submit AND in the worker; the
+  worker's copy is what protects it from a row written by another deploy, in either direction._
   ```
-- [ ] **A.3 ·** `JobContext` — `reportProgress`, `log`, `isCancelRequested`, job id, attempt,
-  idempotency key.
+- [ ] **A.3 ·** `JobContext` — `reportProgress`, `log`, `isCancelRequested`, on top of the job id
+  and attempt it already carries. **Not** the idempotency key: it is unique per tenant while
+  `SideEffect.effectKey` is unique globally, so a handler keying an effect on it would let one
+  tenant suppress another's.
   ```
   _Handlers get a capability object, not the Prisma client; what a handler may do is a
   deliberate list._

@@ -158,7 +158,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 |---|---|---|
 | `id` | `uuid` | PK. This is the id returned to the client and the only thing put on the queue (§8.3) |
 | `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE` |
-| `type` | `JobType` enum | `MOCK` \| `CHARGE` |
+| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
 | `payload` | `jsonb` | Validated per-type at the edge (§6.4) |
 | `status` | `JobStatus` enum | See §5 |
 | `attempts` | `int` | Default `0`. Incremented by the worker when it *claims* the job |
@@ -380,16 +380,24 @@ Nest 12's first-party `StandardSchemaValidationPipe` with Zod schemas, registere
 `nestjs-zod` is **not** used (§13.2).
 
 - Body, params, and query validated at the edge; services assume clean input.
-- `.strict()` on every object schema — mass-assignment protection. A client cannot smuggle
-  `status`, `attempts`, or `userId` into a submit body.
+- `.strict()` on every object schema **at the edge** — mass-assignment protection. A client
+  cannot smuggle `status`, `attempts`, or `userId` into a submit body, and a mistyped payload
+  field is a `400` instead of a silently applied default.
 - `payload` is validated by a **discriminated union on `type`**, so a `CHARGE` payload missing
   `amountCents` is a `400` at the edge, not a terminal failure discovered in a worker four
   seconds later.
 - Path `:id` is validated as a UUID — a malformed id is a clean `400`, not a `500` from a
   Postgres cast error.
+- **The worker re-parses the stored payload** before running it, against the same per-type
+  schema but **without `.strict()`**. The row it reads may have been written by a newer deploy,
+  so an unknown field is dropped and ignored. Rejecting it would dead-letter every job in
+  flight during a rollout — and because that failure is terminal, BullMQ would never hand those
+  jobs to the new worker that does understand the field. Unknown-key strictness is part of the
+  client contract, not of execution.
 
 Three checks, three homes: shape → pipe (`400`); business rules → service
-(`404`/`403`/`409`); integrity → database.
+(`404`/`403`/`409`); integrity → database. The worker's re-parse is a fourth, answering a
+different threat: not a bad client, but a schema that moved underneath a row already queued.
 
 ---
 
@@ -843,26 +851,38 @@ a feature's clothes.
 ### 10.1 Two root modules
 
 ```
-ApiModule  (bootstrap: NestFactory.create)
-├── ConfigModule.forRoot({ isGlobal: true, validate: zodEnv })
+AppModule  (bootstrap: NestFactory.create)
+├── ConfigModule.forRoot({ isGlobal: true, validationSchema: apiEnvSchema })
+├── LoggerModule.forRootAsync        (nestjs-pino)
+├── BullModule.forRootAsync          (connection only — no queue registered at the root)
 ├── PrismaModule            (global; exports PrismaService)
 ├── RedisModule             (global; exports the ioredis client)
-├── AuthModule              → AuthController, AuthService, TokenService, JwtStrategy
-├── JobsModule              → JobsController, JobsService, JobsRepository
+├── AuthModule              → AuthController, AuthService, TokenService, PasswordService,
+│                             APP_GUARD: JwtAuthGuard
+├── JobsModule              → JobsController, JobsService, OutboxRelayService
+│    ├── imports JobCoreModule
 │    └── imports BullModule.registerQueue({ name: 'relay-jobs' })   // PRODUCER ONLY
 ├── EventsModule            → EventsGateway (+ the bridge subscriber, D8)
 └── HealthModule            → Terminus: Postgres + Redis
 
 WorkerModule  (bootstrap: NestFactory.createApplicationContext)
-├── ConfigModule / PrismaModule / RedisModule    (same modules, reused)
-├── ProcessingModule        → JobsProcessor (WorkerHost), the handler registry
-│    └── imports BullModule.registerQueue({ name: 'relay-jobs' })   // CONSUMER
-└── HealthModule            (optional: a tiny HTTP listener for container health)
+├── ConfigModule / LoggerModule / PrismaModule   (same modules, worker env schema)
+├── JobCoreModule
+├── BullModule.registerQueue({ name: 'relay-jobs' })                 // CONSUMER
+└── JobsProcessor           (WorkerHost)
+
+JobCoreModule  (imported by BOTH roots: the domain, with no queue and no transport)
+├── JobTransitionService    (every guarded status transition, §7.3)
+├── JobHandlerRegistry      (resolves Job.type → handler; refuses to construct if a
+│                            submittable type has none, so a gap fails at boot)
+├── JobEventsPublisher      (publishes to the D8 bridge)
+└── one handler provider per `JOB_TYPES` entry
 ```
 
-**`ApiModule` must never transitively import `ProcessingModule`.** Shared code (Prisma, Redis,
-config, the domain services the processor calls) lives in modules both roots import — never in a
-module that also declares the processor. This is §3's rule made structural.
+**`AppModule` must never transitively import `WorkerModule`.** Shared code (Prisma, Redis,
+config, the domain services the processor calls) lives in `JobCoreModule`, which both roots
+import and which declares no processor and registers no queue. This is §3's rule made
+structural.
 
 ### 10.2 Global registrations
 
@@ -1297,4 +1317,5 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-26 | §16 — D21–D27 **decided** for the real-job proposal. D15 ("job types beyond `MOCK`/`CHARGE`") is the decision it fires; D6a, D10, D11 and D14 move earlier because the proposal supplies their triggers sooner. |
 | 2026-10-26 | §1 scope, §9 — no frontend of any kind is in scope, including the static demo page. A7 is verified by a scripted socket client so it can run in CI; the dashboard is a separate deliverable. |
 | 2026-10-26 | §7.3 — the attempt number is the worker's **ownership token**. `succeed`, `requeueForRetry` and `deadLetter` all require `attempts = <the attempt that claimed>`, so a worker that lost a job while still running it cannot write over whoever holds it now. `succeed` also accepts `QUEUED`, because a refused `succeed` is unrecoverable: the work is done and no later delivery exists. |
+| 2026-10-27 | §4.3, §6.4, §10.1 — brought in line with the code: `Job.type` is `text` (D21, its migration drops the enum); validation is strict at the edge and lenient in the worker's re-parse, because an additive payload change must not dead-letter queued jobs; the module tree names the modules that exist, with `JobCoreModule` as the shared domain both roots import. |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

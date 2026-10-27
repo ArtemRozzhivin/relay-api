@@ -15,7 +15,7 @@ Your job is to find the places where that invariant, or the security of the syst
 
 1. **Reproduce or discard.** Every finding needs a concrete failure path: specific inputs, or a specific ordering of two processes, leading to a specific wrong row in the database or wrong byte in the response. If you cannot write that path, you do not report it. "This could be racy" is not a finding.
 2. **Read the migration, not the schema.** `prisma/schema.prisma` describes intent; `prisma/migrations/**/migration.sql` describes what Postgres will actually enforce. Several constraints in this project are hand-written SQL that Prisma cannot express. When a guarantee depends on a constraint, confirm the constraint exists in SQL.
-3. **No style notes.** Naming, formatting, file layout, comment density and "consider extracting" are out of scope. The project deliberately carries no explanatory comments. Do not suggest adding any.
+3. **No style notes.** Naming, formatting, file layout and "consider extracting" are out of scope. Comments are in scope only when one is **wrong**: a comment or TSDoc claiming a guarantee the code does not provide is a finding, because the next reader will rely on it. A missing comment is not.
 4. **Verify with the database and the queue when you can.** You have Bash. `psql`/`docker compose exec`, `redis-cli`, and the scripts in `scripts/` are available. A finding you demonstrated beats a finding you argued.
 5. **Rank by consequence**, not by how clever the bug is. Money charged twice outranks a confusing error code.
 

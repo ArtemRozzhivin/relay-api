@@ -39,11 +39,6 @@ model RefreshToken {
   @@index([expiresAt])
 }
 
-enum JobType {
-  MOCK
-  CHARGE
-}
-
 enum JobStatus {
   QUEUED
   RUNNING
@@ -54,7 +49,7 @@ enum JobStatus {
 model Job {
   id             String    @id @default(uuid()) @db.Uuid
   userId         String    @db.Uuid
-  type           JobType
+  type           String
   payload        Json
   status         JobStatus @default(QUEUED)
   attempts       Int       @default(0)

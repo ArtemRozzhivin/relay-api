@@ -42,7 +42,10 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     );
 
     try {
-      const result = await this.handlers.run(claimed);
+      const result = await this.handlers.run(claimed, {
+        jobId: claimed.id,
+        attempt,
+      });
 
       const succeeded = await this.transitions.succeed(jobId, attempt, result);
 
@@ -59,7 +62,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       const reason = cause instanceof Error ? cause.message : String(cause);
 
       const isTerminal =
-        cause instanceof TerminalJobError || cause instanceof UnrecoverableError;
+        cause instanceof TerminalJobError ||
+        cause instanceof UnrecoverableError;
       const isExhausted = attempt >= claimed.maxAttempts;
 
       if (isTerminal || isExhausted) {
