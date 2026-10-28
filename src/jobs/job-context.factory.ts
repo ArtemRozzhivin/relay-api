@@ -1,12 +1,20 @@
 import { Injectable, Logger } from '@nestjs/common';
 import type { Prisma } from '../generated/prisma/client.js';
 import { JobTransitionService } from './job-transition.service.js';
+import { JobEventsPublisher } from './job-events.publisher.js';
 import type { JobContext } from './job-context.js';
 import { readProgress, type JobProgress } from './job-progress.js';
 
 // Below any real count, so a handler's first report of `processed: 0` — the one
 // that publishes the total before any work lands — is not mistaken for a repeat.
 const NOTHING_REPORTED = -1;
+
+// At most one write and one event per job per window. A handler chooses how
+// often it reports, and reporting per row is both cheaper than the work and
+// useless to a client: a bar repaints 60 times a second at best and is read ten
+// times. 500ms keeps a bar visibly alive at 2Hz while collapsing a tight loop
+// into almost nothing. The final report is exempt, which is what flush() is for.
+const REPORT_WINDOW_MS = 500;
 
 interface RunningJob {
   jobId: string;
@@ -19,8 +27,9 @@ interface RunningJob {
 
 /**
  * The context as its owner sees it. The processor must {@link flush} before it
- * transitions the job, because a handler may report without awaiting and a
- * queued write would otherwise land on a row that is no longer `RUNNING`.
+ * transitions the job: a handler may report without awaiting, and the throttle
+ * holds the newest report back by design, so the last one would otherwise land
+ * on a row that is no longer `RUNNING`.
  */
 export interface ManagedJobContext extends JobContext {
   flush(): Promise<void>;
@@ -31,6 +40,12 @@ class RunningJobContext implements ManagedJobContext {
   // but cannot order two writes from the live one, so a handler reporting batch
   // 4 after batch 5 would otherwise land them in either order.
   private pending: Promise<void> = Promise.resolve();
+
+  // The newest report the window is holding back. Later reports replace it
+  // rather than queueing: nobody wants the bar to replay a backlog.
+  private held?: JobProgress;
+
+  private window?: NodeJS.Timeout;
 
   constructor(
     readonly jobId: string,
@@ -47,6 +62,7 @@ class RunningJobContext implements ManagedJobContext {
     // against a value that is not a number. Cleared once that write is queued.
     private reclaim: boolean,
     private readonly transitions: JobTransitionService,
+    private readonly events: JobEventsPublisher,
     private readonly logger: Logger,
   ) {}
 
@@ -56,10 +72,12 @@ class RunningJobContext implements ManagedJobContext {
       this.carried = { ...this.carried, ...progress };
 
       const merged = { ...this.carried, processed: progress.processed };
-      const reclaim = this.reclaim;
 
-      this.reclaim = false;
-      this.pending = this.pending.then(() => this.write(merged, reclaim));
+      if (this.window) {
+        this.held = merged;
+      } else {
+        this.send(merged);
+      }
     }
 
     return this.pending;
@@ -70,7 +88,46 @@ class RunningJobContext implements ManagedJobContext {
   }
 
   flush() {
+    this.closeWindow();
+
+    if (this.held) {
+      const last = this.held;
+
+      this.held = undefined;
+      this.send(last);
+      // Sending opened a window the owner will never close, and a timer left
+      // behind would hold the process open past shutdown.
+      this.closeWindow();
+    }
+
     return this.pending;
+  }
+
+  private send(progress: JobProgress) {
+    const reclaim = this.reclaim;
+
+    this.reclaim = false;
+    this.pending = this.pending.then(() => this.write(progress, reclaim));
+
+    this.window = setTimeout(() => {
+      this.window = undefined;
+
+      // Whatever arrived during the window goes now, which both honours the
+      // "always the last one" half of the contract and opens the next window.
+      if (this.held) {
+        const next = this.held;
+
+        this.held = undefined;
+        this.send(next);
+      }
+    }, REPORT_WINDOW_MS);
+  }
+
+  private closeWindow() {
+    if (this.window) {
+      clearTimeout(this.window);
+      this.window = undefined;
+    }
   }
 
   private get prefix() {
@@ -98,7 +155,14 @@ class RunningJobContext implements ManagedJobContext {
         this.logger.warn(
           `${this.prefix} progress write refused at ${progress.processed}`,
         );
+
+        return;
       }
+
+      // Built from the row the write returned, never from what the handler
+      // reported: an event that describes a state the database does not hold
+      // cannot be un-sent (§9.2a).
+      await this.events.jobUpdated(written);
     } catch (error) {
       this.logger.warn(
         `${this.prefix} could not write progress: ${
@@ -115,7 +179,10 @@ export class JobContextFactory {
   // from the processor's in a single stream.
   private readonly logger = new Logger('JobHandler');
 
-  constructor(private readonly transitions: JobTransitionService) {}
+  constructor(
+    private readonly transitions: JobTransitionService,
+    private readonly events: JobEventsPublisher,
+  ) {}
 
   create({
     jobId,
@@ -133,6 +200,7 @@ export class JobContextFactory {
       stored,
       progress !== null && stored.processed === undefined,
       this.transitions,
+      this.events,
       this.logger,
     );
   }

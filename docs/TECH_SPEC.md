@@ -814,10 +814,23 @@ Two mechanics that are easy to get wrong:
 
 | Event | Payload |
 |---|---|
-| `job.updated` | `{ id, status, attempts, result?, error?, updatedAt }` |
+| `job.updated` | `{ id, status, attempts, result?, error?, progress?, updatedAt }` |
 
-One event, fired on every status transition. Separate `job.succeeded` / `job.failed` events are
-not worth the client-side branching when `status` already carries it.
+One event, fired on every status transition **and on a progress report**. Separate
+`job.succeeded` / `job.failed` events are not worth the client-side branching when `status`
+already carries it, and the same argument covers progress: a client's handler replaces its copy of
+the job either way, so a second event type would only add a branch.
+
+**Progress emits are throttled to one per job per 500 ms, and the last one always sends.** A
+handler chooses how often it reports, and reporting per row would otherwise mean one publish, one
+socket frame and one repaint per row — for a bar that repaints 60 times a second at best. Reports
+arriving inside a window replace each other rather than queueing, because nobody wants a bar to
+replay a backlog. The same window governs the **database write**, since the two are one decision
+and splitting them would give a client two different staleness windows to reason about.
+
+The event is built from the row the guarded write returned, never from what the handler reported,
+so a progress event cannot describe a state the database does not hold (§9.2a). A refused write
+emits nothing.
 
 ### 9.3 Delivery guarantee — stated bluntly
 
@@ -1082,6 +1095,7 @@ cases.
 | **A10** | **No side effect inside a transaction.** Enforced by review, not code | Grep every `$transaction` block: it may write the ledger row, never perform the effect | ongoing |
 | **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change | PA |
 | **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic for the life of one submission. An operator re-drive clears it and the count starts again (D25) | PA |
+| **A12b** | **Progress is rate-limited, and the last value still lands.** Report 60 times across 3s, and 100 times inside one millisecond | Events carrying `progress` are **> 1 and < 20**, not ~60; and the stored value equals the final report in both cases. The second case lands entirely inside one window, so only the processor's flush gets it out | PA |
 | **A13** | **A large import does not grow with the file.** Import 20 000 rows | Peak RSS flat within a stated band; **name the band before running** or the result is unfalsifiable | PB |
 | **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
@@ -1376,4 +1390,5 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-27 | §4.3, §6.4, §10.1 — brought in line with the code: `Job.type` is `text` (D21, its migration drops the enum); validation is strict at the edge and lenient in the worker's re-parse, because an additive payload change must not dead-letter queued jobs; the module tree names the modules that exist, with `JobCoreModule` as the shared domain both roots import. |
 | 2026-10-27 | §4.3, D25 — `Job.progress` added, written under two predicates rather than one: the attempt token stops a stale worker, and a `processed <` comparison on the jsonb path stops a retry from counting from one over a higher stored value. A progress write never fails a job. |
 | 2026-10-28 | §2, §6.3 — the `MOCK` row described a handler that no longer exists, and `steps` was an undocumented field on the submit body; payload ranges and defaults are now listed per type. §13.4 gains the two commands a schema change requires, since `src/generated/` is gitignored. §14's A12 row said "across the job's life" while a re-drive clears progress. D25 records three things the implementation settled: `<=` not `<`, the worker carrying `total`/`message` forward over a replacing write, and how a stored value this version cannot read is reclaimed. |
+| 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

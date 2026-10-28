@@ -8,6 +8,7 @@ export interface JobUpdatedPayload {
   attempts: number;
   result?: unknown;
   error?: unknown;
+  progress?: unknown;
   updatedAt: string;
 }
 
@@ -26,6 +27,7 @@ export const toJobUpdatedEvent = (job: Job): JobUpdatedEvent => ({
     attempts: job.attempts,
     ...(job.result === null ? {} : { result: job.result }),
     ...(job.error === null ? {} : { error: job.error }),
+    ...(job.progress === null ? {} : { progress: job.progress }),
     updatedAt: job.updatedAt.toISOString(),
   },
 });

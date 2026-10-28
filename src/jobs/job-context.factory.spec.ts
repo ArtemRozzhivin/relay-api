@@ -1,11 +1,22 @@
 import { Logger } from '@nestjs/common';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Job } from '../generated/prisma/client.js';
-import { JobContextFactory } from './job-context.factory.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Job, Prisma } from '../generated/prisma/client.js';
+import {
+  JobContextFactory,
+  type ManagedJobContext,
+} from './job-context.factory.js';
+import type { JobEventsPublisher } from './job-events.publisher.js';
 import type { JobTransitionService } from './job-transition.service.js';
 import type { JobProgress } from './job-progress.js';
 
-const running = {
+const WINDOW_MS = 500;
+
+const running: {
+  jobId: string;
+  attempt: number;
+  correlationId: string;
+  progress: Prisma.JsonValue | null;
+} = {
   jobId: 'a-job',
   attempt: 2,
   correlationId: 'req-1',
@@ -19,19 +30,49 @@ type Write = (
   options?: { reclaim?: boolean },
 ) => Promise<Job | null>;
 
-const factoryWriting = (reportProgress: Write) =>
-  new JobContextFactory({ reportProgress } as unknown as JobTransitionService);
+interface Harness {
+  context: ManagedJobContext;
+  writes: JobProgress[];
+  emitted: Job[];
+  counts: () => number[];
+}
 
-const recorder = () => {
+const build = (write: Write, job: Partial<typeof running> = {}): Harness => {
   const writes: JobProgress[] = [];
+  const emitted: Job[] = [];
 
-  const write: Write = async (_jobId, _attempt, progress) => {
-    writes.push(progress);
+  const transitions = {
+    reportProgress: (...args: Parameters<Write>) => {
+      writes.push(args[2]);
 
-    return {} as Job;
+      return write(...args);
+    },
+  } as unknown as JobTransitionService;
+
+  const events = {
+    jobUpdated: async (job: Job) => {
+      emitted.push(job);
+    },
+  } as unknown as JobEventsPublisher;
+
+  return {
+    context: new JobContextFactory(transitions, events).create({
+      ...running,
+      ...job,
+    }),
+    writes,
+    emitted,
+    counts: () => writes.map((progress) => progress.processed),
   };
+};
 
-  return { writes, write };
+const accepts: Write = async (_jobId, _attempt, progress) =>
+  ({ id: 'a-job', progress }) as unknown as Job;
+
+/** Reports and then forces the report through, bypassing the window. */
+const report = async (harness: Harness, progress: JobProgress) => {
+  void harness.context.reportProgress(progress);
+  await harness.context.flush();
 };
 
 describe('JobContextFactory', () => {
@@ -41,183 +82,258 @@ describe('JobContextFactory', () => {
     vi.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
   });
 
-  it('carries the attempt that claimed the job into every write', async () => {
-    const seen: number[] = [];
-
-    const context = factoryWriting(async (_jobId, attempt) => {
-      seen.push(attempt);
-
-      return {} as Job;
-    }).create(running);
-
-    await context.reportProgress({ processed: 1 });
-
-    expect(seen).toEqual([2]);
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
-  it('drops a report that would move progress backwards', async () => {
-    const { writes, write } = recorder();
-    const context = factoryWriting(write).create(running);
+  describe('the guarded write', () => {
+    it('carries the attempt that claimed the job', async () => {
+      const seen: number[] = [];
+      const harness = build(async (_jobId, attempt) => {
+        seen.push(attempt);
 
-    for (const processed of [5, 3, 6]) {
-      await context.reportProgress({ processed });
-    }
+        return accepts(_jobId, attempt, { processed: 0 });
+      });
 
-    expect(writes.map((progress) => progress.processed)).toEqual([5, 6]);
-  });
+      await report(harness, { processed: 1 });
 
-  it('accepts an equal count, so a message can be revised without advancing', async () => {
-    const { writes, write } = recorder();
-    const context = factoryWriting(write).create(running);
-
-    await context.reportProgress({ processed: 4, message: 'connecting' });
-    await context.reportProgress({ processed: 4, message: 'downloading' });
-
-    expect(writes).toEqual([
-      { processed: 4, message: 'connecting' },
-      { processed: 4, message: 'downloading' },
-    ]);
-  });
-
-  it('remembers a total the first report published', async () => {
-    const { writes, write } = recorder();
-    const context = factoryWriting(write).create(running);
-
-    // The write replaces the whole column, so a report that omits `total` would
-    // erase it — the pattern JobProgress.total's own doc invites.
-    await context.reportProgress({ processed: 1, total: 10 });
-    await context.reportProgress({ processed: 2 });
-
-    expect(writes).toEqual([
-      { processed: 1, total: 10 },
-      { processed: 2, total: 10 },
-    ]);
-  });
-
-  it('starts from the total and count the claimed row already holds', async () => {
-    const { writes, write } = recorder();
-    const context = factoryWriting(write).create({
-      ...running,
-      progress: { processed: 8, total: 10, message: 'resuming' },
+      expect(seen).toEqual([2]);
     });
 
-    for (const processed of [1, 2, 9]) {
-      await context.reportProgress({ processed });
-    }
+    it('drops a report that would move progress backwards', async () => {
+      const harness = build(accepts);
 
-    expect(writes).toEqual([{ processed: 9, total: 10, message: 'resuming' }]);
-  });
+      for (const processed of [5, 3, 6]) {
+        await report(harness, { processed });
+      }
 
-  it('reclaims a column whose stored shape it cannot read, once', async () => {
-    const reclaims: boolean[] = [];
+      expect(harness.counts()).toEqual([5, 6]);
+    });
 
-    const context = factoryWriting(
-      async (_jobId, _attempt, _progress, options) => {
-        reclaims.push(options?.reclaim === true);
+    it('accepts an equal count, so a message can be revised without advancing', async () => {
+      const harness = build(accepts);
 
-        return {} as Job;
-      },
-    ).create({ ...running, progress: { phase: 'extract' } });
+      await report(harness, { processed: 4, message: 'connecting' });
+      await report(harness, { processed: 4, message: 'downloading' });
 
-    await context.reportProgress({ processed: 1 });
-    await context.reportProgress({ processed: 2 });
+      expect(harness.writes).toEqual([
+        { processed: 4, message: 'connecting' },
+        { processed: 4, message: 'downloading' },
+      ]);
+    });
 
-    // Only the first write may skip the monotonic predicate: by the second, the
-    // column holds a value this version wrote.
-    expect(reclaims).toEqual([true, false]);
-  });
+    it('remembers a total the first report published', async () => {
+      const harness = build(accepts);
 
-  it('does not reclaim a column that was simply never written', async () => {
-    const reclaims: boolean[] = [];
+      // The write replaces the whole column, so a report that omits `total`
+      // would erase it — the pattern JobProgress.total's own doc invites.
+      await report(harness, { processed: 1, total: 10 });
+      await report(harness, { processed: 2 });
 
-    const context = factoryWriting(
-      async (_jobId, _attempt, _progress, options) => {
-        reclaims.push(options?.reclaim === true);
+      expect(harness.writes).toEqual([
+        { processed: 1, total: 10 },
+        { processed: 2, total: 10 },
+      ]);
+    });
 
-        return {} as Job;
-      },
-    ).create(running);
+    it('starts from the total and count the claimed row already holds', async () => {
+      const harness = build(accepts, {
+        progress: { processed: 8, total: 10, message: 'resuming' },
+      });
 
-    await context.reportProgress({ processed: 1 });
+      for (const processed of [1, 2, 9]) {
+        await report(harness, { processed });
+      }
 
-    expect(reclaims).toEqual([false]);
-  });
+      expect(harness.writes).toEqual([
+        { processed: 9, total: 10, message: 'resuming' },
+      ]);
+    });
 
-  it('writes in call order when a handler does not await', async () => {
-    const written: number[] = [];
+    it('reclaims a column whose stored shape it cannot read, once', async () => {
+      const reclaims: boolean[] = [];
+      const harness = build(
+        async (jobId, attempt, progress, options) => {
+          reclaims.push(options?.reclaim === true);
 
-    // The later report resolves first, which is what an unordered pair of
-    // writes would look like: both match the ownership predicate, so only the
-    // chaining inside the context keeps them in order.
-    const context = factoryWriting(async (_jobId, _attempt, progress) => {
-      await new Promise((resolve) =>
-        setTimeout(resolve, progress.processed === 1 ? 20 : 0),
+          return accepts(jobId, attempt, progress);
+        },
+        { progress: { phase: 'extract' } },
       );
-      written.push(progress.processed);
 
-      return {} as Job;
-    }).create(running);
+      await report(harness, { processed: 1 });
+      await report(harness, { processed: 2 });
 
-    void context.reportProgress({ processed: 1 });
+      // Only the first write may skip the monotonic predicate: by the second,
+      // the column holds a value this version wrote.
+      expect(reclaims).toEqual([true, false]);
+    });
 
-    await context.reportProgress({ processed: 2 });
+    it('does not reclaim a column that was simply never written', async () => {
+      const reclaims: boolean[] = [];
+      const harness = build(async (jobId, attempt, progress, options) => {
+        reclaims.push(options?.reclaim === true);
 
-    expect(written).toEqual([1, 2]);
+        return accepts(jobId, attempt, progress);
+      });
+
+      await report(harness, { processed: 1 });
+
+      expect(reclaims).toEqual([false]);
+    });
   });
 
-  it('flush waits for reports the handler never awaited', async () => {
-    const { writes, write } = recorder();
-    const context = factoryWriting(async (jobId, attempt, progress) => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+  describe('the 500ms window', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
 
-      return write(jobId, attempt, progress);
-    }).create(running);
+    it('sends the first report at once, so a bar starts moving', async () => {
+      const harness = build(accepts);
 
-    void context.reportProgress({ processed: 1 });
-    void context.reportProgress({ processed: 2 });
+      void harness.context.reportProgress({ processed: 1 });
+      await vi.advanceTimersByTimeAsync(0);
 
-    expect(writes).toHaveLength(0);
+      expect(harness.counts()).toEqual([1]);
+    });
 
-    await context.flush();
+    it('replaces a held report rather than queueing it', async () => {
+      const harness = build(accepts);
 
-    expect(writes.map((progress) => progress.processed)).toEqual([1, 2]);
+      for (const processed of [1, 2, 3, 4]) {
+        void harness.context.reportProgress({ processed });
+      }
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.counts()).toEqual([1]);
+
+      // Only the newest of the three held reports is sent — a client has no use
+      // for a replayed backlog.
+      await vi.advanceTimersByTimeAsync(WINDOW_MS);
+      expect(harness.counts()).toEqual([1, 4]);
+    });
+
+    it('collapses a tight loop to one write per window', async () => {
+      const harness = build(accepts);
+
+      for (let processed = 1; processed <= 100; processed += 1) {
+        void harness.context.reportProgress({ processed, total: 100 });
+      }
+
+      await vi.advanceTimersByTimeAsync(0);
+
+      // 100 reports in one tick: one write, not a hundred.
+      expect(harness.counts()).toEqual([1]);
+
+      await harness.context.flush();
+
+      // And the last value is exact, which is the half that must never be lost.
+      expect(harness.counts()).toEqual([1, 100]);
+    });
+
+    it('sends the held report when the window closes, then opens the next', async () => {
+      const harness = build(accepts);
+
+      void harness.context.reportProgress({ processed: 1 });
+      void harness.context.reportProgress({ processed: 2 });
+
+      await vi.advanceTimersByTimeAsync(WINDOW_MS);
+      expect(harness.counts()).toEqual([1, 2]);
+
+      void harness.context.reportProgress({ processed: 3 });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Held, not sent: closing a window opens the next one, or a tight loop
+      // would send twice in a millisecond.
+      expect(harness.counts()).toEqual([1, 2]);
+
+      await vi.advanceTimersByTimeAsync(WINDOW_MS);
+      expect(harness.counts()).toEqual([1, 2, 3]);
+    });
+
+    it('leaves no timer behind once flushed', async () => {
+      const harness = build(accepts);
+
+      void harness.context.reportProgress({ processed: 1 });
+      void harness.context.reportProgress({ processed: 2 });
+      await harness.context.flush();
+
+      // A timer outliving the job would hold the worker open past shutdown.
+      expect(vi.getTimerCount()).toBe(0);
+      expect(harness.counts()).toEqual([1, 2]);
+    });
+
+    it('keeps writes in order even when one is slow', async () => {
+      let release = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+
+      const harness = build(async (jobId, attempt, progress) => {
+        if (progress.processed === 1) {
+          await gate;
+        }
+
+        return accepts(jobId, attempt, progress);
+      });
+
+      void harness.context.reportProgress({ processed: 1 });
+      void harness.context.reportProgress({ processed: 2 });
+
+      // The window closes while the first write is still in flight, so the
+      // second is queued behind it on the chain rather than racing it.
+      await vi.advanceTimersByTimeAsync(WINDOW_MS);
+      release();
+      await harness.context.flush();
+
+      expect(harness.counts()).toEqual([1, 2]);
+    });
   });
 
-  it('tags a handler log line with the job, attempt and request', () => {
-    factoryWriting(async () => ({}) as Job)
-      .create(running)
-      .log('row 12 skipped');
+  describe('the event', () => {
+    it('is built from the row the write returned, not from the report', async () => {
+      const harness = build(
+        async () =>
+          ({ id: 'a-job', progress: { processed: 7 } }) as unknown as Job,
+      );
 
-    expect(Logger.prototype.log).toHaveBeenCalledWith(
-      'Job a-job attempt 2 [correlationId=req-1] row 12 skipped',
-    );
+      await report(harness, { processed: 7, message: 'ignored' });
+
+      expect(harness.emitted).toEqual([
+        { id: 'a-job', progress: { processed: 7 } },
+      ]);
+    });
+
+    it('is not sent when the write was refused', async () => {
+      const harness = build(async () => null);
+
+      await report(harness, { processed: 1 });
+
+      expect(harness.emitted).toEqual([]);
+      expect(Logger.prototype.warn).toHaveBeenCalledWith(
+        expect.stringContaining('progress write refused at 1'),
+      );
+    });
   });
 
-  it('does not fail the job when the write is refused', async () => {
-    const context = factoryWriting(async () => null).create(running);
+  describe('failure', () => {
+    it('does not fail the job when the write is refused', async () => {
+      const harness = build(async () => null);
 
-    await expect(
-      context.reportProgress({ processed: 1 }),
-    ).resolves.toBeUndefined();
-    expect(Logger.prototype.warn).toHaveBeenCalledWith(
-      expect.stringContaining('progress write refused at 1'),
-    );
-  });
+      await expect(report(harness, { processed: 1 })).resolves.toBeUndefined();
+    });
 
-  it('does not fail the job when the write throws', async () => {
-    const context = factoryWriting(async () => {
-      throw new Error('connection terminated');
-    }).create(running);
+    it('does not fail the job when the write throws', async () => {
+      const harness = build(async () => {
+        throw new Error('connection terminated');
+      });
 
-    await expect(
-      context.reportProgress({ processed: 1 }),
-    ).resolves.toBeUndefined();
+      await expect(report(harness, { processed: 1 })).resolves.toBeUndefined();
 
-    // A later report must still be attempted: one failed write is not a reason
-    // to stop reporting for the rest of a long job.
-    await expect(
-      context.reportProgress({ processed: 2 }),
-    ).resolves.toBeUndefined();
-    expect(Logger.prototype.warn).toHaveBeenCalledTimes(2);
+      // A later report must still be attempted: one failed write is not a
+      // reason to stop reporting for the rest of a long job.
+      await expect(report(harness, { processed: 2 })).resolves.toBeUndefined();
+      expect(Logger.prototype.warn).toHaveBeenCalledTimes(2);
+    });
   });
 });
