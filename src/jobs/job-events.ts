@@ -9,6 +9,7 @@ export interface JobUpdatedPayload {
   result?: unknown;
   error?: unknown;
   progress?: unknown;
+  cancelRequested?: true;
   updatedAt: string;
 }
 
@@ -28,6 +29,7 @@ export const toJobUpdatedEvent = (job: Job): JobUpdatedEvent => ({
     ...(job.result === null ? {} : { result: job.result }),
     ...(job.error === null ? {} : { error: job.error }),
     ...(job.progress === null ? {} : { progress: job.progress }),
+    ...(job.cancelRequested ? { cancelRequested: true as const } : {}),
     updatedAt: job.updatedAt.toISOString(),
   },
 });

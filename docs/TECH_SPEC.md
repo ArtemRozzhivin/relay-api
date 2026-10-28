@@ -166,7 +166,8 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `idempotencyKey` | `text` | See D1 |
 | `result` | `jsonb?` | Set on `SUCCEEDED` |
 | `error` | `jsonb?` | `{ code, message, retryable, attempt }` — set on every failed attempt, last one wins |
-| `progress` | `jsonb?` | `{ processed, total?, message? }` (D25). Written outside any status transition, under the attempt token **and** a `processed <` predicate, so it can only move forward. Cleared by a re-drive |
+| `progress` | `jsonb?` | `{ processed, total?, message? }` (D25). Written outside any status transition, under the attempt token **and** a `processed <=` predicate, so it can never move backwards. Cleared by a re-drive |
+| `cancelRequested` | `boolean` | Default `false`. The owner's request; `CANCELLED` is the worker's answer (D22). Set only while the job is unfinished, so a cancel of a finished job leaves no trace. Cleared by a re-drive |
 | `correlationId` | `text` | The submitting request's id. Carried onto the queue so worker logs join API logs (§12.1) |
 | `createdAt` | `timestamptz(6)` | |
 | `updatedAt` | `timestamptz(6)` | |
@@ -268,8 +269,9 @@ stays small because published rows fall out of the index.
 | `RUNNING` | no | A worker has claimed it and is executing. |
 | `SUCCEEDED` | **yes** | Effect done, `result` written. |
 | `DEAD_LETTERED` | **yes** | `attempts` reached `maxAttempts`, or a terminal error. `error` populated. Requires an explicit re-drive to move again. |
+| `CANCELLED` | **yes** | Its owner asked it to stop, and it stopped without leaving a step half done. Reached from `QUEUED` by the API, or from `RUNNING` only by the worker (§5.2). |
 
-Four states, one of which is the dead letter. `RETRYING` is deliberately absent — a job waiting
+Five states, one of which is the dead letter and one the acknowledged cancellation. `RETRYING` is deliberately absent — a job waiting
 for its next attempt is `QUEUED` with `attempts > 0`, which is the same fact with one less state
 to guard. Revisit if the status stream turns out to be unreadable without it (§16, D3b).
 
@@ -283,7 +285,12 @@ to guard. Revisit if the status stream turns out to be unreadable without it (§
 | `RUNNING` | `SUCCEEDED` | Worker | `WHERE id = ? AND status = 'RUNNING'` |
 | `RUNNING` | `QUEUED` | Worker | `WHERE id = ? AND status = 'RUNNING' AND attempts < maxAttempts` |
 | `RUNNING` | `DEAD_LETTERED` | Worker | `WHERE id = ? AND status = 'RUNNING'` and (attempts exhausted OR terminal error) |
-| `DEAD_LETTERED` | `QUEUED` | API (re-drive) | `WHERE id = ? AND status = 'DEAD_LETTERED'`, resets `attempts = 0` |
+| `DEAD_LETTERED` | `QUEUED` | API (re-drive) | `WHERE id = ? AND status = 'DEAD_LETTERED'`, resets `attempts = 0` and `cancelRequested = false` |
+| `QUEUED` | `CANCELLED` | API (cancel) | `WHERE id = ? AND status = 'QUEUED' AND cancelRequested` — nobody is running it, so the API may finish it |
+| `QUEUED`, `RUNNING` | `CANCELLED` | Worker, **before** claiming | `WHERE id = ? AND status IN ('QUEUED','RUNNING') AND cancelRequested` — a retry or a redelivery that arrives after the request runs no handler |
+| `RUNNING` | `CANCELLED` | Worker, after the handler stopped | `WHERE id = ? AND status = 'RUNNING' AND attempts = ? AND cancelRequested` — the handler threw `JobCancelledError` at a boundary |
+
+**There is no edge from `RUNNING` to `CANCELLED` for the API.** A running handler may be mid-effect, and a row that said `CANCELLED` about a charge that went through anyway would be a lie. The API sets `cancelRequested` and the worker decides.
 
 **`SUCCEEDED` has no outgoing edge.** That is not a formality — it is the assertion that catches
 a redelivered job whose success was committed but whose queue ack was lost. The guard makes the
@@ -338,6 +345,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. Phase 6. See D6b |
+| `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
 
@@ -814,7 +822,7 @@ Two mechanics that are easy to get wrong:
 
 | Event | Payload |
 |---|---|
-| `job.updated` | `{ id, status, attempts, result?, error?, progress?, updatedAt }` |
+| `job.updated` | `{ id, status, attempts, result?, error?, progress?, cancelRequested?, updatedAt }` |
 
 One event, fired on every status transition **and on a progress report**. Separate
 `job.succeeded` / `job.failed` events are not worth the client-side branching when `status`
@@ -1093,7 +1101,7 @@ cases.
 | **A8** | **No status disagreement.** Only applicable if D4 chose "both" | After drain, no job's Redis-side state contradicts its Postgres state. **If this test cannot be written, D4 must be "Postgres only"** | 5 |
 | **A9** | **Holds under load.** V virtual users for T minutes, one worker killed mid-run | A2 and A3 still hold. Record p95 submit latency, throughput, max queue depth, drain time — **name the numeric targets before running**, or the result is unfalsifiable | 10 |
 | **A10** | **No side effect inside a transaction.** Enforced by review, not code | Grep every `$transaction` block: it may write the ledger row, never perform the effect | ongoing |
-| **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change | PA |
+| **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change. *In PA the per-step effect is the progress report; the ledger-count form needs batched effects and is asserted with the CSV import (PB)* | PA |
 | **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic for the life of one submission. An operator re-drive clears it and the count starts again (D25) | PA |
 | **A12b** | **Progress is rate-limited, and the last value still lands.** Report 60 times across 3s, and 100 times inside one millisecond | Events carrying `progress` are **> 1 and < 20**, not ~60; and the stored value equals the final report in both cases. The second case lands entirely inside one window, so only the processor's flush gets it out | PA |
 | **A13** | **A large import does not grow with the file.** Import 20 000 rows | Peak RSS flat within a stated band; **name the band before running** or the result is unfalsifiable | PB |
@@ -1252,13 +1260,35 @@ sees a literal union and a typo in a handler is still a compile error.
 **D22 — add `CANCELLED`; keep `DEAD_LETTERED`; `completed_with_errors` is not a job status.**
 Cancellation is two-phase, so it is *two* fields: `cancelRequested Boolean` while the job is still
 `RUNNING` and winding down, and `CANCELLED` as the terminal status it exits to. `CANCELLED` joins
-`TERMINAL`, which makes `claim()` refuse it with no change to `claim()` itself.
+`TERMINAL`, and `claim()` refuses it with no change to `claim()` itself — strictly because `claim()`
+matches `status IN ('QUEUED','RUNNING')`, so any status outside that set is refused.
 `DEAD_LETTERED` is not renamed to `failed`: "failed" is ambiguous between *this attempt failed* and
 *we gave up*, and that ambiguity is exactly what the M6 machinery is written to distinguish. The
 dashboard may label it anything it likes.
 A job that imported 19 800 of 20 000 rows **succeeded** — the bad rows are data in `result`, not a
 status. `completed_with_errors` is an aggregate over children and belongs on `Pipeline`; putting it
 on `Job` would force every consumer of job status to handle a value the engine never produces.
+
+What the implementation settled:
+
+- **The API sets the flag with one statement covering `QUEUED` and `RUNNING`.** Checking "queued?"
+  then "running?" as two statements loses requests: a retry moves the job from `RUNNING` back to
+  `QUEUED` between them, and both checks miss. With one flag as the single source of truth, the API
+  then finishes a `QUEUED` job itself, and every other path respects the flag.
+- **A cancel never strands a job.** The worker checks the flag *before* claiming, so a retry
+  scheduled after the request, or a redelivery after a crash, becomes `CANCELLED` without running
+  the handler again.
+- **The handler acknowledges by throwing `JobCancelledError`**, never by returning — an early
+  return would be recorded as `SUCCEEDED` with half the work done. A handler with a single atomic
+  effect (CHARGE) never checks and simply runs to completion, which is the honest answer to a
+  cancellation it has no safe point to honour.
+- **A cancel that came too late is a `409`, not a `202`.** The replay analogy (§6.3) holds only
+  for a job already `CANCELLED`: there the earlier request really did succeed, and a client
+  retrying it must not see an error. A job that *succeeded* or was *dead-lettered* finished in
+  spite of the request, and a `202` would make the caller read the body to learn its cancel had
+  no effect — for a charge, that the money moved.
+- **The capability is `shouldStop()`, not `isCancelRequested()`.** It is also true when the
+  attempt has lost the job, so a handler has one question to ask at a boundary rather than two.
 
 **D23 — `userId` stays `NOT NULL`. Two different problems were being conflated.**
 Fan-out children (`ai.enrich`, `image.process`, `pipeline.finalize`) *do* have an owner: the user
@@ -1391,4 +1421,5 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-27 | §4.3, D25 — `Job.progress` added, written under two predicates rather than one: the attempt token stops a stale worker, and a `processed <` comparison on the jsonb path stops a retry from counting from one over a higher stored value. A progress write never fails a job. |
 | 2026-10-28 | §2, §6.3 — the `MOCK` row described a handler that no longer exists, and `steps` was an undocumented field on the submit body; payload ranges and defaults are now listed per type. §13.4 gains the two commands a schema change requires, since `src/generated/` is gitignored. §14's A12 row said "across the job's life" while a re-drive clears progress. D25 records three things the implementation settled: `<=` not `<`, the worker carrying `total`/`message` forward over a replacing write, and how a stored value this version cannot read is reclaimed. |
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
+| 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

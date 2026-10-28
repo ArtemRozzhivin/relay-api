@@ -4,6 +4,7 @@ import { UnrecoverableError, type Job as QueueJob } from 'bullmq';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
 import { JobContextFactory } from '../jobs/job-context.factory.js';
+import { JobCancelledError } from '../jobs/job-handler.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { TerminalJobError } from '../common/errors/app-error.js';
@@ -26,6 +27,21 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
   async process(message: QueueJob<JobMessage>) {
     const { jobId, correlationId } = message.data;
+
+    // Before the claim, not after: a retry scheduled after the cancel request,
+    // or a redelivery after the worker running it died, would otherwise run the
+    // handler again — and whatever it does before its first boundary is work
+    // its owner asked not to happen.
+    const cancelled = await this.transitions.cancelBeforeClaim(jobId);
+
+    if (cancelled) {
+      await this.events.jobUpdated(cancelled);
+      this.logger.log(
+        `Job ${jobId} cancelled before it ran [correlationId=${correlationId}]`,
+      );
+
+      return;
+    }
 
     const claimed = await this.transitions.claim(jobId);
 
@@ -74,6 +90,28 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       // Same reason as the success path, and it matters more here: a retry keeps
       // the progress of the attempt that failed.
       await context.flush();
+
+      if (cause instanceof JobCancelledError) {
+        const stopped = await this.transitions.cancel(jobId, attempt);
+
+        if (stopped) {
+          await this.events.jobUpdated(stopped);
+          this.logger.log(
+            `Job ${jobId} cancelled at a safe point on attempt ${attempt}`,
+          );
+        } else {
+          // shouldStop() is also true for an attempt that lost the job; the
+          // attempt that holds it now is the one entitled to finish it.
+          this.logger.warn(
+            `Job ${jobId} stopped on attempt ${attempt}, which no longer owns it`,
+          );
+        }
+
+        // Returned, not thrown: stopping when asked is the job doing what it
+        // was told, so the queue records the delivery as complete rather than
+        // failed and schedules nothing.
+        return;
+      }
 
       const reason = cause instanceof Error ? cause.message : String(cause);
 

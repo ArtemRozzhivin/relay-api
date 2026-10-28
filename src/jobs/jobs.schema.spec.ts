@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   JOB_TYPES,
+  listJobsSchema,
   mockPayloadSchema,
   submitJobSchema,
 } from './jobs.schema.js';
@@ -42,5 +43,20 @@ describe('payload schemas', () => {
       data: { durationMs: 10, failureRate: 0 },
     });
     expect(parsed.success && 'currency' in parsed.data).toBe(false);
+  });
+});
+
+describe('listJobsSchema', () => {
+  // Derived from the generated enum, so a status added to the state machine is
+  // filterable without anyone remembering to add it here.
+  it.each(['QUEUED', 'RUNNING', 'SUCCEEDED', 'DEAD_LETTERED', 'CANCELLED'])(
+    'accepts %s as a status filter',
+    (status) => {
+      expect(listJobsSchema.safeParse({ status }).success).toBe(true);
+    },
+  );
+
+  it('rejects a status the state machine does not have', () => {
+    expect(listJobsSchema.safeParse({ status: 'FAILED' }).success).toBe(false);
   });
 });

@@ -37,7 +37,11 @@ interface Harness {
   counts: () => number[];
 }
 
-const build = (write: Write, job: Partial<typeof running> = {}): Harness => {
+const build = (
+  write: Write,
+  job: Partial<typeof running> = {},
+  isWanted: () => Promise<boolean> = async () => true,
+): Harness => {
   const writes: JobProgress[] = [];
   const emitted: Job[] = [];
 
@@ -47,6 +51,7 @@ const build = (write: Write, job: Partial<typeof running> = {}): Harness => {
 
       return write(...args);
     },
+    isWanted,
   } as unknown as JobTransitionService;
 
   const events = {
@@ -312,6 +317,33 @@ describe('JobContextFactory', () => {
       expect(harness.emitted).toEqual([]);
       expect(Logger.prototype.warn).toHaveBeenCalledWith(
         expect.stringContaining('progress write refused at 1'),
+      );
+    });
+  });
+
+  describe('shouldStop', () => {
+    it('is false while the job still wants this attempt', async () => {
+      const harness = build(accepts, {}, async () => true);
+
+      expect(await harness.context.shouldStop()).toBe(false);
+    });
+
+    it('is true once it does not', async () => {
+      const harness = build(accepts, {}, async () => false);
+
+      expect(await harness.context.shouldStop()).toBe(true);
+    });
+
+    // Unlike a progress report, this decides whether to keep doing work, so an
+    // unanswerable question fails the attempt instead of being guessed either
+    // way.
+    it('lets a failure to answer fail the attempt', async () => {
+      const harness = build(accepts, {}, async () => {
+        throw new Error('connection terminated');
+      });
+
+      await expect(harness.context.shouldStop()).rejects.toThrow(
+        'connection terminated',
       );
     });
   });

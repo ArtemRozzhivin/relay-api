@@ -5,6 +5,7 @@ import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
 import { AppModule } from '../../src/app.module.js';
+import { PrismaService } from '../../src/prisma/prisma.service.js';
 
 // The in-process tier: the real app, the real database, no worker. It covers the
 // request contract — validation, authentication, tenant scoping — which the
@@ -175,5 +176,114 @@ describe('the job API contract', () => {
     expect(body.data.items).not.toContainEqual(
       expect.objectContaining({ id: other.body.data.id }),
     );
+  });
+  // No worker runs in this tier, so a submitted job stays QUEUED — which is the
+  // case the API is allowed to finish by itself.
+  it('cancels a job nobody has started', async () => {
+    const token = await register('cancel-queued');
+    const { body: created } = await submit(token);
+
+    const { status, body } = await request(server)
+      .post(`/jobs/${created.data.id}/cancel`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(status).toBe(202);
+    expect(body.data).toMatchObject({
+      status: 'CANCELLED',
+      cancelRequested: true,
+      attempts: 0,
+    });
+  });
+
+  // The one finish that answers 202: the caller's request was honoured, so a
+  // client retrying a cancel whose response it lost must not see an error.
+  it('answers a repeated cancel with the job, not an error', async () => {
+    const token = await register('cancel-twice');
+    const { body: created } = await submit(token);
+    const cancel = () =>
+      request(server)
+        .post(`/jobs/${created.data.id}/cancel`)
+        .set('Authorization', `Bearer ${token}`);
+
+    await cancel().expect(202);
+
+    const { status, body } = await cancel();
+
+    expect(status).toBe(202);
+    expect(body.data.status).toBe('CANCELLED');
+  });
+
+  // A finish that happened in spite of the request is not an "accepted": the
+  // cancel changed nothing, and the code should say so without the caller
+  // having to read the body.
+  it.each(['SUCCEEDED', 'DEAD_LETTERED'] as const)(
+    'refuses to cancel a job that already %s',
+    async (status) => {
+      const token = await register(`cancel-${status.toLowerCase()}`);
+      const { body: created } = await submit(token);
+
+      // No worker runs in this tier, so the finish is written directly — what
+      // is under test is the endpoint's answer, not how the job got there.
+      await app.get(PrismaService).job.update({
+        where: { id: created.data.id },
+        data: { status, finishedAt: new Date() },
+      });
+
+      const { status: code, body } = await request(server)
+        .post(`/jobs/${created.data.id}/cancel`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(code).toBe(409);
+      expect(body.error.code).toBe('JOB_ALREADY_FINISHED');
+
+      const { body: after } = await request(server)
+        .get(`/jobs/${created.data.id}`)
+        .set('Authorization', `Bearer ${token}`);
+
+      // A refusal, and a no-op: not even the flag was set.
+      expect(after.data).toMatchObject({ status, cancelRequested: false });
+    },
+  );
+
+  it('refuses a cancel of a job the caller does not own', async () => {
+    const [owner, stranger] = await Promise.all([
+      register('cancel-owner'),
+      register('cancel-stranger'),
+    ]);
+    const { body: created } = await submit(owner);
+
+    await request(server)
+      .post(`/jobs/${created.data.id}/cancel`)
+      .set('Authorization', `Bearer ${stranger}`)
+      .expect(404);
+
+    const { body } = await request(server)
+      .get(`/jobs/${created.data.id}`)
+      .set('Authorization', `Bearer ${owner}`);
+
+    // Not just hidden: the stranger's request changed nothing.
+    expect(body.data).toMatchObject({
+      status: 'QUEUED',
+      cancelRequested: false,
+    });
+  });
+
+  it('can list cancelled jobs by status', async () => {
+    const token = await register('cancel-list');
+    const { body: created } = await submit(token);
+
+    await request(server)
+      .post(`/jobs/${created.data.id}/cancel`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(202);
+
+    const { body } = await request(server)
+      .get('/jobs?status=CANCELLED')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(body.data.items.map((job: { id: string }) => job.id)).toEqual([
+      created.data.id,
+    ]);
   });
 });

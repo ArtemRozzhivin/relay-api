@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { TerminalJobError } from '../common/errors/app-error.js';
+import { JobCancelledError } from './job-handler.js';
 import { MockJobHandler } from './handlers/mock.handler.js';
 import { recordingContext } from './job-context.fixture.js';
 
@@ -64,6 +65,32 @@ describe('JobHandler', () => {
     await expect(
       new MockJobHandler().run(context, { durationMs: 10, steps: 3 }),
     ).resolves.toEqual({ sleptMs: 10 });
+  });
+
+  it('stops between steps once asked, having finished every step it reported', async () => {
+    // The check sits before steps 2, 3, 4…; answering true on the second check
+    // means steps 1 and 2 ran and step 3 never started.
+    const { context, reports } = recordingContext({ stopAfterChecks: 1 });
+
+    await expect(
+      new MockJobHandler().run(context, { durationMs: 0, steps: 5 }),
+    ).rejects.toBeInstanceOf(JobCancelledError);
+
+    expect(reports).toEqual([
+      { processed: 1, total: 5 },
+      { processed: 2, total: 5 },
+    ]);
+  });
+
+  it('never asks before its first step', async () => {
+    const { context, checks } = recordingContext({ stopAfterChecks: 0 });
+
+    // A one-step job has no boundary to stop at, and the processor's pre-claim
+    // check has just answered for the start — so it runs to completion.
+    await expect(
+      new MockJobHandler().run(context, { durationMs: 0, steps: 1 }),
+    ).resolves.toEqual({ sleptMs: 0 });
+    expect(checks()).toBe(0);
   });
 
   it('tags its log line through the context', async () => {

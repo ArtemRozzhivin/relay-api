@@ -6,9 +6,15 @@ import type { JobProgress } from './job-progress.js';
  * Lives beside the code rather than in `test/` because the unit tier imports it
  * from `src/`.
  */
-export const recordingContext = () => {
+export const recordingContext = ({
+  stopAfterChecks = Infinity,
+}: {
+  /** How many `shouldStop()` calls answer false before one answers true. */
+  stopAfterChecks?: number;
+} = {}) => {
   const reports: JobProgress[] = [];
   const lines: string[] = [];
+  let checks = 0;
 
   const context: JobContext = {
     jobId: 'a-job',
@@ -16,10 +22,15 @@ export const recordingContext = () => {
     reportProgress: async (progress) => {
       reports.push(progress);
     },
+    shouldStop: async () => {
+      checks += 1;
+
+      return checks > stopAfterChecks;
+    },
     log: (message) => {
       lines.push(message);
     },
   };
 
-  return { context, reports, lines };
+  return { context, reports, lines, checks: () => checks };
 };

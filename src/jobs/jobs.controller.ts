@@ -53,6 +53,15 @@ export class JobsController {
     return this.jobs.redrive(user.id, id, String(request.id));
   }
 
+  @Post(':id/cancel')
+  @HttpCode(202)
+  cancel(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', { schema: jobIdSchema }) id: string,
+  ) {
+    return this.jobs.cancel(user.id, id);
+  }
+
   @Get(':id')
   findOne(
     @CurrentUser() user: AuthenticatedUser,

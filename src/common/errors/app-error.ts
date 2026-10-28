@@ -74,3 +74,12 @@ export class JobNotDeadLetteredError extends AppError {
     super('Only a dead-lettered job can be re-driven');
   }
 }
+
+export class JobAlreadyFinishedError extends AppError {
+  readonly kind = 'CONFLICT' as const;
+  readonly code = 'JOB_ALREADY_FINISHED';
+
+  constructor() {
+    super('Only an unfinished job can be cancelled');
+  }
+}

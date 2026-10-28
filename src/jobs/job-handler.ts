@@ -7,6 +7,22 @@ import type { JobType } from './jobs.schema.js';
 export const JOB_HANDLERS = Symbol('JOB_HANDLERS');
 
 /**
+ * Thrown by a handler that stopped because {@link JobContext.shouldStop} said
+ * so. Control flow for the processor, never an HTTP error.
+ *
+ * A throw rather than a return: a handler that returned early would be recorded
+ * as `SUCCEEDED` with half its work done, and nothing downstream could tell.
+ */
+export class JobCancelledError extends Error {
+  constructor() {
+    super(
+      'Stopped at a safe point because the job no longer wants this attempt',
+    );
+    this.name = 'JobCancelledError';
+  }
+}
+
+/**
  * The shape the registry holds: handlers of unrelated payload types in one map.
  * Extend {@link JobHandler} instead of implementing this — a direct
  * implementation runs with whatever is in the payload column.
@@ -28,7 +44,13 @@ export interface RunnableJobHandler {
  * - Its return value is stored as `Job.result` and returned to the job's owner,
  *   so it must be JSON-serialisable and must hold nothing the owner may not see.
  * - Throwing `Error` means retry. Throwing `TerminalJobError` means dead-letter
- *   now, without spending the remaining attempts.
+ *   now, without spending the remaining attempts. Throwing `JobCancelledError`
+ *   means "I was asked to stop, and stopped somewhere safe".
+ * - A handler that does its work in batches should call `context.shouldStop()`
+ *   between them — never in the middle of one, so a stopped job leaves no
+ *   batch half applied. A handler with a single atomic effect need not call it
+ *   at all; it simply runs to completion, which is the honest answer to a
+ *   cancellation it has no safe point to honour.
  */
 export abstract class JobHandler<P> implements RunnableJobHandler {
   abstract readonly type: JobType;

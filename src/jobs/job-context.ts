@@ -41,6 +41,22 @@ export interface JobContext {
    */
   reportProgress(progress: JobProgress): Promise<void>;
 
+  /**
+   * Whether this attempt should stop at the boundary it has reached. True when
+   * the job's owner asked for it to be cancelled, **or** when this attempt no
+   * longer owns the job — both mean nothing more it does will count, and one
+   * question covers both so a handler has a single thing to check.
+   *
+   * Reads the database, so call it between batches rather than per item. When
+   * it is true, stop and throw `JobCancelledError`; never return, which would
+   * record a partial run as a success.
+   *
+   * @throws when the database cannot be reached. Unlike a progress report this
+   * is a decision about whether to keep doing work, so a failure to answer it
+   * fails the attempt rather than being guessed.
+   */
+  shouldStop(): Promise<boolean>;
+
   /** Writes one line tagged with the job, the attempt and the request that submitted it. */
   log(message: string): void;
 }

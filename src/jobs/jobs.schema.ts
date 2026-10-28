@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { JobStatus } from '../generated/prisma/enums.js';
 
 // The payload schemas tolerate unknown keys: the worker re-parses the stored
 // payload (§6.4), and a job written by a newer deploy can reach an older worker.
@@ -53,9 +54,9 @@ export const JOB_TYPES: readonly JobType[] = submitJobSchema.options.map(
 
 export const listJobsSchema = z
   .object({
-    status: z
-      .enum(['QUEUED', 'RUNNING', 'SUCCEEDED', 'DEAD_LETTERED'])
-      .optional(),
+    // From the generated enum rather than a literal list: adding CANCELLED
+    // would otherwise have left jobs in that state unfilterable.
+    status: z.enum(JobStatus).optional(),
     type: z.enum(JOB_TYPES).optional(),
     limit: z.coerce.number().int().min(1).max(100).default(20),
     offset: z.coerce.number().int().min(0).default(0),

@@ -83,6 +83,10 @@ class RunningJobContext implements ManagedJobContext {
     return this.pending;
   }
 
+  async shouldStop() {
+    return !(await this.transitions.isWanted(this.jobId, this.attempt));
+  }
+
   log(message: string) {
     this.logger.log(`${this.prefix} ${message}`);
   }

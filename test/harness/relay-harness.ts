@@ -5,7 +5,11 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { Redis } from 'ioredis';
 import { Queue } from 'bullmq';
 import { PrismaClient } from '../../src/generated/prisma/client.js';
-import type { Job, JobStatus, Prisma } from '../../src/generated/prisma/client.js';
+import type {
+  Job,
+  JobStatus,
+  Prisma,
+} from '../../src/generated/prisma/client.js';
 import { JOBS_QUEUE, messageId } from '../../src/jobs/job-queue.js';
 
 const QUEUE_PREFIX = 'bull:relay-jobs';
@@ -271,7 +275,10 @@ export class RelayHarness {
         expected
           ? true
           : undefined,
-      { timeoutMs, label: `${expected} jobs matching ${JSON.stringify(where)}` },
+      {
+        timeoutMs,
+        label: `${expected} jobs matching ${JSON.stringify(where)}`,
+      },
     );
   }
 
@@ -362,6 +369,13 @@ export class RelayHarness {
     });
   }
 
+  cancel(account: Account, jobId: string) {
+    return this.request(`/jobs/${jobId}/cancel`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${account.token}` },
+    });
+  }
+
   // ─── state ───────────────────────────────────────────────────────────────
 
   job(jobId: string): Promise<Job | null> {
@@ -419,7 +433,9 @@ export class RelayHarness {
   // A4 needs a delivery of a job that is already terminal. A fresh queue entry
   // for the same job id is what a duplicate delivery looks like to the worker.
   async redeliver(jobId: string) {
-    const job = await this.prisma.job.findUniqueOrThrow({ where: { id: jobId } });
+    const job = await this.prisma.job.findUniqueOrThrow({
+      where: { id: jobId },
+    });
 
     this.jobQueue ??= new Queue(JOBS_QUEUE, {
       connection: { url: process.env.REDIS_URL },

@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { JobHandler } from '../job-handler.js';
+import { JobCancelledError, JobHandler } from '../job-handler.js';
 import type { JobContext } from '../job-context.js';
 import { mockPayloadSchema, type PayloadOf } from '../jobs.schema.js';
 
@@ -32,6 +32,14 @@ export class MockJobHandler extends JobHandler<PayloadOf<'MOCK'>> {
     );
 
     for (let step = 1; step <= payload.steps; step += 1) {
+      // A step is the unit of work, so the check sits between steps: a stopped
+      // job has finished every step it reported and started none it did not.
+      // Not before the first, which the processor's pre-claim check has just
+      // answered — and most MOCK jobs have only one step.
+      if (step > 1 && (await context.shouldStop())) {
+        throw new JobCancelledError();
+      }
+
       await sleep(perStep + (step <= longSteps ? 1 : 0));
 
       if (step === failAtStep) {
