@@ -345,6 +345,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. Phase 6. See D6b |
+| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0. `dryRun: true` counts and changes nothing. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
@@ -1094,6 +1095,7 @@ cases.
 | **A3** | **Crash mid-job — the headline test.** Submit N; `SIGKILL` the worker while jobs are `RUNNING`; restart | Terminal jobs **= N** *and* `SELECT count(*) FROM "SideEffect"` **= N** — not N + in-flight. **Fails if §7.1's effect guard was skipped** | 6 |
 | **A3b** | **A stale worker must not write over the live one.** Freeze a worker mid-handler, let the stalled checker hand its jobs to a second worker, then thaw the first | Every job terminal and `SELECT count(*) FROM "Job" WHERE status NOT IN ('SUCCEEDED','DEAD_LETTERED')` **= 0**. **Inconclusive unless the log shows refused stale writes** — otherwise the interleaving never happened | 6 |
 | **A5b** | **A job the queue abandons still terminates.** Stall a job past `maxStalledCount` so `process()` is never called again | `status = 'DEAD_LETTERED'` with `error->>'code' = 'DELIVERY_ABANDONED'`, exactly 2 deliveries against a budget of 5, and a re-drive that is *observed to be delivered* — a `202` alone is not evidence (§7.5a) | 6 |
+| **A5c** | **A filtered bulk re-drive revives exactly the matching dead letters.** Dead-letter jobs under two error codes; re-drive one code with `limit` below the match count | Calls return `{ redriven, remaining }` until `remaining = 0`; every match ends `SUCCEEDED` with `attempts = 1`, its outbox row published **by the relay** (`Outbox.attempts = 1`); every non-match is untouched and has no outbox row | PA |
 | **A4** | **Redelivery of a succeeded job is a no-op.** Force redelivery of a `SUCCEEDED` job | `SUCCEEDED → RUNNING` never occurs; `SideEffect` count unchanged; the guarded update returns count `0` | 6 |
 | **A5** | **A poison job dead-letters exactly once.** Submit a job that always fails | `attempts = maxAttempts`; exactly one `DEAD_LETTERED` row; `error` populated; it never returns to `QUEUED` without an explicit re-drive | 6 |
 | **A6** | **The enqueue gap is real.** With a fault injected between commit and enqueue | A `QUEUED` job exists with no queue entry — i.e. **prove the hole exists in the v1 design**. After the outbox lands, the same test must show the job eventually runs | 6 |
@@ -1221,7 +1223,7 @@ to settle it.
 | D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
 | D10 | Worker concurrency tuning; sandboxed processors | Measured event-loop blocking in the worker | 10 |
-| D11 | A dead-letter re-drive API beyond `POST /jobs/:id/retry` | The first real dead letter that needs bulk handling | 8 |
+| D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox |
 | D12 | Status cache in Redis | A **measured** slow `GET /jobs/:id`. Never before | — |
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
 
@@ -1363,6 +1365,25 @@ happen?*, not *do it again*.
 mechanism: `effectKey = '<jobId>:quota:<batchIndex>'`, amount in `detail`, and the `UsageCounter`
 aggregate updated in the same transaction as the ledger row. The only work is documenting the
 `effectKey` naming convention, which is currently an undocumented `'<jobId>:charge'`.
+
+**D11 — a bulk re-drive is a filter, a bounded transaction, and the outbox.**
+`POST /jobs/retry` takes a filter — type, error code, and a window over **when the job was
+dead-lettered** (`finishedAt`, half-open, timezone required) — and re-drives one batch of the
+caller's matching dead letters per call. Each batch is one transaction that moves the rows to
+`QUEUED` **and writes their outbox rows**; the relay publishes them. It does not enqueue
+directly, as the single re-drive does: a request enqueueing thousands of jobs would take
+seconds, and a crash halfway would leave the rest for the relay anyway. Using the relay from
+the start makes the whole operation crash-safe from the moment it commits, and its steady pace
+(100 per second, §7.5) turns thousands of re-driven jobs into a ramp instead of one burst
+against a downstream that has only just recovered.
+Bounded per call (`limit`, max 1000) so no transaction holds thousands of row locks until it
+commits; the response's `remaining` tells the caller to call again. A repeated call continues
+with the next batch rather than repeating the first, and can never re-drive a job twice: the
+update re-checks `status = 'DEAD_LETTERED'` instead of trusting the ids it selected.
+At least one filter is required — an empty body is what a client bug sends — and `dryRun`
+counts without writing. A filter matching nothing answers `202 { redriven: 0, remaining: 0 }`:
+the caller asked for a set, and an empty set is a complete answer, unlike a cancel naming one
+job that had already finished.
 | D14 | Cursor pagination | A list endpoint where offset pagination measurably hurts | — |
 | D15 | Job types beyond `MOCK` / `CHARGE` | A real use case | v2 |
 | D16 | Do replays bypass the rate limiter? | A client retrying with the same key gets `429` for a job already accepted | 8 |
@@ -1422,4 +1443,5 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §2, §6.3 — the `MOCK` row described a handler that no longer exists, and `steps` was an undocumented field on the submit body; payload ranges and defaults are now listed per type. §13.4 gains the two commands a schema change requires, since `src/generated/` is gitignored. §14's A12 row said "across the job's life" while a re-drive clears progress. D25 records three things the implementation settled: `<=` not `<`, the worker carrying `total`/`message` forward over a replacing write, and how a stored value this version cannot read is reclaimed. |
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
+| 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

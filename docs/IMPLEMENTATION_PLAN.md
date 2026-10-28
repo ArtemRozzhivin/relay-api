@@ -24,7 +24,7 @@ in a runnable, demonstrable state.
 
 ### Product phases — the real-job proposal (2026-10-24)
 
-- [ ] **PA** · Handler registry, progress, cancellation
+- [x] **PA** · Handler registry, progress, cancellation
 - [ ] **PB** · Object storage, `Product` domain, `import.csv`
 - [ ] **PC** · `image.process`
 - [ ] **PD** · `ai.enrich`
@@ -388,7 +388,9 @@ Each step is motivated by the failure of the one before it.
   ```
   _Cheap defence in depth;_ `*` _CORS is a dev convenience only._
   ```
-- [ ] **8.6 · Dead-letter inspection and bulk re-drive** → resolve **D11**.
+- [ ] **8.6 · Dead-letter inspection and bulk re-drive** → resolve **D11**. The re-drive half
+  landed in A.7; what remains is inspection — listing dead letters by error code and window, so
+  an operator can see a batch before acting on it, beyond `dryRun`'s count.
   ```
   _A dead letter nobody can act on is just a slow data leak._
   ```
@@ -485,6 +487,13 @@ Each step is motivated by the failure of the one before it.
 - [ ] **10.6 · Resolve D6a** (queue split) and **D10** (concurrency, sandboxed processors) from measurements.
   ```
   _Both triggers are defined as measurements, not opinions._
+  ```
+- [ ] **10.7 · A partial index on** `Outbox` `WHERE "publishedAt" IS NULL`. The relay asks for the
+  oldest unpublished rows; with no index on `publishedAt` it walks every published row first, and
+  the table is never pruned, so each tick costs more for the life of the system.
+  ```
+  _Found while building A.7, whose bulk re-drive grows the outbox fastest. Free today, linear
+  forever._
   ```
 
 ### Done when
@@ -608,7 +617,9 @@ checked under load. M10 must precede M11, so the box is sized against measured n
   _You cannot safely kill code mid-flight. Cancellation is a request plus an acknowledgement,
   which is why it is two fields and not one status._
   ```
-- [ ] **A.7 · Bulk re-drive by filter** (D11) — type, error code, time range.
+- [x] **A.7 · Bulk re-drive by filter** (D11) — type, error code, time range. One bounded batch
+  per call, published through the outbox rather than enqueued directly, with `dryRun` and a
+  required filter.
   ```
   _One dead letter is a row; four thousand is an operation._
   ```
@@ -620,7 +631,8 @@ checked under load. M10 must precede M11, so the box is sized against measured n
   with progress as the per-step effect; the ledger-count form is re-asserted in PB, where batches
   have real effects_
 - [x] **A12 passes** — progress never goes backwards, and a stale attempt cannot write it
-- [ ] Adding a job type touches no file in `src/worker/`
+- [x] Adding a job type touches no file in `src/worker/` — the processor names no type and imports
+  no handler; a type is a submit-union option and one `HANDLERS` entry, both in `src/jobs/`
 
 ---
 

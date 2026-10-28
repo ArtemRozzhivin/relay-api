@@ -10,10 +10,52 @@ import {
 } from '../common/errors/app-error.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
-import { Prisma } from '../generated/prisma/client.js';
+import { Prisma, type Job } from '../generated/prisma/client.js';
 import { JOBS_QUEUE, messageId, type JobMessage } from './job-queue.js';
-import type { ListJobsQuery, SubmitJobInput } from './jobs.schema.js';
+import type {
+  BulkRedriveInput,
+  ListJobsQuery,
+  SubmitJobInput,
+} from './jobs.schema.js';
 import type { ApiEnv } from '../config/env.schema.js';
+
+// One shape for every message the outbox carries — submit, re-drive and bulk
+// re-drive alike — so the relay and the direct path publish the same thing
+// however a job reached the queue.
+const outboxEntry = (job: Job, correlationId: string) => ({
+  jobId: job.id,
+  queue: JOBS_QUEUE,
+  jobName: job.type,
+  payload: { jobId: job.id, correlationId, maxAttempts: job.maxAttempts },
+});
+
+// The caller's dead letters matching a bulk re-drive filter. Every filter is
+// optional on its own; the schema requires at least one.
+const deadLettersMatching = (
+  userId: string,
+  filter: BulkRedriveInput,
+): Prisma.JobWhereInput => {
+  const { type, errorCode, deadLetteredFrom, deadLetteredTo } = filter;
+
+  return {
+    userId,
+    status: 'DEAD_LETTERED',
+    ...(type === undefined ? {} : { type }),
+    ...(errorCode === undefined
+      ? {}
+      : { error: { path: ['code'], equals: errorCode } }),
+    ...(deadLetteredFrom === undefined && deadLetteredTo === undefined
+      ? {}
+      : {
+          finishedAt: {
+            ...(deadLetteredFrom === undefined
+              ? {}
+              : { gte: deadLetteredFrom }),
+            ...(deadLetteredTo === undefined ? {} : { lt: deadLetteredTo }),
+          },
+        }),
+  };
+};
 
 interface SubmitArgs {
   userId: string;
@@ -51,16 +93,7 @@ export class JobsService {
         });
 
         const outbox = await tx.outbox.create({
-          data: {
-            jobId: job.id,
-            queue: JOBS_QUEUE,
-            jobName: job.type,
-            payload: {
-              jobId: job.id,
-              correlationId,
-              maxAttempts: job.maxAttempts,
-            },
-          },
+          data: outboxEntry(job, correlationId),
         });
 
         return { job, outboxId: outbox.id };
@@ -141,16 +174,7 @@ export class JobsService {
       }
 
       const outbox = await tx.outbox.create({
-        data: {
-          jobId: job.id,
-          queue: JOBS_QUEUE,
-          jobName: job.type,
-          payload: {
-            jobId: job.id,
-            correlationId,
-            maxAttempts: job.maxAttempts,
-          },
-        },
+        data: outboxEntry(job, correlationId),
       });
 
       return { job, outboxId: outbox.id };
@@ -173,6 +197,71 @@ export class JobsService {
     await this.events.jobUpdated(job);
 
     return job;
+  }
+
+  /**
+   * Re-drives the caller's dead letters that match a filter, one bounded batch
+   * per call.
+   *
+   * Nothing is enqueued here. Each job's outbox row is written in the same
+   * transaction as its status change, and the relay publishes it — so a crash
+   * after the commit loses nothing, and the relay's steady pace turns thousands
+   * of re-driven jobs into a ramp rather than one burst against a downstream
+   * that has only just recovered.
+   *
+   * Not idempotent per call, by design: a repeated call continues with the next
+   * batch. It can never re-drive a job twice, because the update re-checks the
+   * status.
+   *
+   * @returns how many this call re-drove, and how many still match — call
+   * again until `remaining` is 0. With `dryRun`, nothing changes and
+   * `remaining` is how many a real call would work through.
+   */
+  async redriveMatching(
+    userId: string,
+    filter: BulkRedriveInput,
+    correlationId: string,
+  ) {
+    const where = deadLettersMatching(userId, filter);
+
+    if (filter.dryRun) {
+      return { redriven: 0, remaining: await this.prisma.job.count({ where }) };
+    }
+
+    const redriven = await this.prisma.$transaction(async (tx) => {
+      // Oldest first, so repeated calls work through a backlog in the order
+      // it died.
+      const batch = await tx.job.findMany({
+        where,
+        orderBy: { finishedAt: 'asc' },
+        take: filter.limit,
+        select: { id: true },
+      });
+
+      if (batch.length === 0) {
+        return [];
+      }
+
+      const jobs = await this.transitions.redriveMany(
+        batch.map(({ id }) => id),
+        tx,
+      );
+
+      await tx.outbox.createMany({
+        data: jobs.map((job) => outboxEntry(job, correlationId)),
+      });
+
+      return jobs;
+    });
+
+    // After the commit, never inside it (§9.2a). Concurrently, because these
+    // are different jobs and the order between them carries no meaning.
+    await Promise.all(redriven.map((job) => this.events.jobUpdated(job)));
+
+    return {
+      redriven: redriven.length,
+      remaining: await this.prisma.job.count({ where }),
+    };
   }
 
   /**

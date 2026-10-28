@@ -17,6 +17,25 @@ const TERMINAL: readonly JobStatus[] = [
 
 const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
 
+// What a re-drive resets, shared by the single and bulk forms so they cannot
+// drift: a job re-driven one way must look exactly like one re-driven the other.
+const REDRIVE_RESET = {
+  status: 'QUEUED',
+  attempts: 0,
+  error: Prisma.DbNull,
+  result: Prisma.DbNull,
+  // Cleared because the work starts over: leaving it would show a client 19 500
+  // of 20 000 on a job that has done nothing yet. D26 protects the *checkpoint*
+  // from a re-drive, not this, which is presentational.
+  progress: Prisma.DbNull,
+  // An operator re-driving a job is asking for it to run again, so a
+  // cancellation requested during its previous life must not stop it at the
+  // first boundary.
+  cancelRequested: false,
+  startedAt: null,
+  finishedAt: null,
+} satisfies Prisma.JobUpdateManyMutationInput;
+
 interface MoveOptions {
   client?: Prisma.TransactionClient;
   where?: Prisma.JobWhereInput;
@@ -229,26 +248,23 @@ export class JobTransitionService {
   }
 
   redrive(jobId: string, client?: Prisma.TransactionClient) {
-    return this.move(
-      jobId,
-      ['DEAD_LETTERED'],
-      {
-        status: 'QUEUED',
-        attempts: 0,
-        error: Prisma.DbNull,
-        result: Prisma.DbNull,
-        // Cleared because the work starts over: leaving it would show a client
-        // 19 500 of 20 000 on a job that has done nothing yet. D26 protects the
-        // *checkpoint* from a re-drive, not this, which is presentational.
-        progress: Prisma.DbNull,
-        // An operator re-driving a job is asking for it to run again, so a
-        // cancellation requested during its previous life must not stop it at
-        // the first boundary.
-        cancelRequested: false,
-        startedAt: null,
-        finishedAt: null,
-      },
-      { client },
-    );
+    return this.move(jobId, ['DEAD_LETTERED'], REDRIVE_RESET, { client });
+  }
+
+  /**
+   * The set form of {@link redrive}, for a bulk re-drive. Takes a transaction
+   * rather than offering one, because the caller must write each job's outbox
+   * row in the same commit.
+   *
+   * The status predicate is checked again here rather than trusted from the
+   * caller's SELECT: a job someone else re-drove in between is skipped, not
+   * re-driven twice — so two overlapping bulk calls cannot enqueue one job
+   * twice.
+   */
+  redriveMany(jobIds: string[], client: Prisma.TransactionClient) {
+    return client.job.updateManyAndReturn({
+      where: { id: { in: jobIds }, status: 'DEAD_LETTERED' },
+      data: REDRIVE_RESET,
+    });
   }
 }

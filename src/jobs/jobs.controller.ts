@@ -14,9 +14,11 @@ import { IdempotencyKey } from './idempotency-key.decorator.js';
 import { CurrentUser } from '../auth/decorators/current-user.decorator.js';
 import type { AuthenticatedUser } from '../auth/auth.types.js';
 import {
+  bulkRedriveSchema,
   jobIdSchema,
   listJobsSchema,
   submitJobSchema,
+  type BulkRedriveInput,
   type ListJobsQuery,
   type SubmitJobInput,
 } from './jobs.schema.js';
@@ -41,6 +43,16 @@ export class JobsController {
     });
 
     return { ...job, replayed };
+  }
+
+  @Post('retry')
+  @HttpCode(202)
+  redriveMatching(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body({ schema: bulkRedriveSchema }) filter: BulkRedriveInput,
+    @Req() request: Request,
+  ) {
+    return this.jobs.redriveMatching(user.id, filter, String(request.id));
   }
 
   @Post(':id/retry')

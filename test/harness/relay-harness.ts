@@ -369,6 +369,14 @@ export class RelayHarness {
     });
   }
 
+  redriveMatching(account: Account, filter: Record<string, unknown>) {
+    return this.request('/jobs/retry', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${account.token}` },
+      body: JSON.stringify(filter),
+    });
+  }
+
   cancel(account: Account, jobId: string) {
     return this.request(`/jobs/${jobId}/cancel`, {
       method: 'POST',

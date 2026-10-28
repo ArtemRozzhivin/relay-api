@@ -8,6 +8,7 @@ import { JobCancelledError } from '../jobs/job-handler.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { TerminalJobError } from '../common/errors/app-error.js';
+import type { DeadLetterCode } from '../jobs/job-error-codes.js';
 
 @Processor(JOBS_QUEUE, {
   concurrency: Number(process.env.WORKER_CONCURRENCY ?? 5),
@@ -122,7 +123,9 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
       if (isTerminal || isExhausted) {
         const dead = await this.transitions.deadLetter(jobId, attempt, {
-          code: isTerminal ? 'TERMINAL_FAILURE' : 'ATTEMPTS_EXHAUSTED',
+          code: (isTerminal
+            ? 'TERMINAL_FAILURE'
+            : 'ATTEMPTS_EXHAUSTED') satisfies DeadLetterCode,
           message: reason,
           attempt,
         });
@@ -189,7 +192,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   private async finalise(jobId: string, error: Error) {
     try {
       const abandoned = await this.transitions.abandon(jobId, {
-        code: 'DELIVERY_ABANDONED',
+        code: 'DELIVERY_ABANDONED' satisfies DeadLetterCode,
         message: error.message,
       });
 

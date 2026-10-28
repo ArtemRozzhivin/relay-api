@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { JobStatus } from '../generated/prisma/enums.js';
+import { DEAD_LETTER_CODES } from './job-error-codes.js';
 
 // The payload schemas tolerate unknown keys: the worker re-parses the stored
 // payload (§6.4), and a job written by a newer deploy can reach an older worker.
@@ -62,6 +63,50 @@ export const listJobsSchema = z
     offset: z.coerce.number().int().min(0).default(0),
   })
   .strict();
+
+// A timezone is required, not assumed: "re-drive what died between 02:00 and
+// 03:00" is off by hours if the server and the operator disagree on which 02:00.
+// z.coerce.date() would also accept "1" and read it as the year 2001.
+const instant = z.iso
+  .datetime({ offset: true })
+  .transform((value) => new Date(value));
+
+export const bulkRedriveSchema = z
+  .object({
+    type: z.enum(JOB_TYPES).optional(),
+    errorCode: z.enum(DEAD_LETTER_CODES).optional(),
+    // When the job was dead-lettered — its `finishedAt` — not when it was
+    // submitted: an outage is a window in which jobs died. Half-open, so two
+    // adjacent windows never re-drive the same job twice.
+    deadLetteredFrom: instant.optional(),
+    deadLetteredTo: instant.optional(),
+    // Bounded per call, so no single transaction holds thousands of row locks
+    // until it commits. The response says how many still match.
+    limit: z.number().int().min(1).max(1000).default(500),
+    dryRun: z.boolean().default(false),
+  })
+  .strict()
+  .refine(
+    (filter) =>
+      filter.type !== undefined ||
+      filter.errorCode !== undefined ||
+      filter.deadLetteredFrom !== undefined ||
+      filter.deadLetteredTo !== undefined,
+    {
+      // An empty body is what a client bug sends, and it would mean "every
+      // dead letter you have". Meaning that takes saying so, with a window.
+      message: 'At least one filter is required',
+    },
+  )
+  .refine(
+    (filter) =>
+      filter.deadLetteredFrom === undefined ||
+      filter.deadLetteredTo === undefined ||
+      filter.deadLetteredFrom < filter.deadLetteredTo,
+    { message: 'deadLetteredFrom must be before deadLetteredTo' },
+  );
+
+export type BulkRedriveInput = z.infer<typeof bulkRedriveSchema>;
 
 export const jobIdSchema = z.uuid();
 
