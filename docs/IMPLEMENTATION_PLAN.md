@@ -14,7 +14,7 @@ in a runnable, demonstrable state.
 - [x] **M2** · Authentication
 - [x] **M3** · Cross-cutting concerns
 - [x] **M4** · Jobs API
-- [ ] **M5** · Queue and worker
+- [x] **M5** · Queue and worker
 - [x] **M6** · Reliability
 - [x] **M7** · Realtime
 - [ ] **M8** · Observability and hardening
@@ -32,6 +32,7 @@ in a runnable, demonstrable state.
 - [ ] **PF** · API keys and public docs
 - [ ] **PH** · Presentation — README, diagram, demo
 - [ ] **PI** · Billing
+
 - **PG** · Dashboard — owner's track, not planned here
 
 M1–M11 are the engine; PA–PI are the product built on it. They are lettered, not numbered,
@@ -339,7 +340,7 @@ Each step is motivated by the failure of the one before it.
   _Emitting pre-commit can broadcast a state the DB rolls back._
   ```
 - [x] **7.4 · A socket client script** that asserts A7: connect, submit, drop the socket
-  mid-processing, reconnect, reconcile against `GET /jobs/:id`.
+      mid-processing, reconnect, reconcile against `GET /jobs/:id`.
   ```
   _No UI. A7 needs a client that can be scripted and run in CI, not one that needs a human
   with a browser; the dashboard is built separately and is not this assertion's vehicle._
@@ -362,7 +363,8 @@ Each step is motivated by the failure of the one before it.
 ### Tasks
 
 - [ ] **8.0 · A config-driven socket.io adapter** — the gateway's CORS is `{ origin: true }`,
-  which reflects any origin. Tighten it to `CORS_ORIGINS` once a browser client exists.
+      which reflects any origin. Tighten it to `CORS_ORIGINS` once a browser client exists.
+
   ```
   _Harmless while the only client is a scripted one; wrong the moment a dashboard is served from
   another origin._
@@ -433,10 +435,10 @@ Each step is motivated by the failure of the one before it.
   _An unbiased "does it work from scratch" gate on every push._
   ```
 - [x] **9.6 · Coverage reporting — reported, not gated.** Reframed while implementing: the
-  reliability paths run in child processes, where V8 coverage cannot see them, so a percentage
-  threshold could only be met by unit tests that mock Prisma and BullMQ. The gate for reliability
-  is the named assertions of §14; coverage runs with `all: true` so untested files read as 0%
-  rather than vanishing from the average. See TECH_SPEC §15.1.
+      reliability paths run in child processes, where V8 coverage cannot see them, so a percentage
+      threshold could only be met by unit tests that mock Prisma and BullMQ. The gate for reliability
+      is the named assertions of §14; coverage runs with `all: true` so untested files read as 0%
+      rather than vanishing from the average. See TECH_SPEC §15.1.
   ```
   _Not all uncovered lines cost the same — and a number that can be reached by mocking the thing
   under test is worse than no number._
@@ -444,13 +446,14 @@ Each step is motivated by the failure of the one before it.
 
 ### Done when
 
-- [x] `npm run test:all` reproduces every reliability assertion without manual steps — unit 14,
-  integration 9, assertions 12 across 9 files; the three scripts chain in one command
+- [x] `npm run test:all` reproduces every reliability assertion without manual steps — the three
+      scripts chain in one command. Counts are not recorded here: every phase adds tests, so a number
+      in this line is stale by the next commit.
 - [ ] CI is green from a clean checkout — the workflow is written and YAML-valid but **cannot be
-  verified until it has run on a push**; this stays open deliberately
+      verified until it has run on a push**; this stays open deliberately
 - [x] A deliberately reintroduced double-charge bug fails CI — verified by re-scoping the ledger
-  key to the attempt number: A3 failed with 12 ledger rows for 6 jobs, and the source was restored
-  by the harness script's trap
+      key to the attempt number: A3 failed with 12 ledger rows for 6 jobs, and the source was restored
+      by the harness script's trap
 
 ---
 
@@ -561,40 +564,41 @@ checked under load. M10 must precede M11, so the box is sized against measured n
 ### Tasks
 
 - [x] **A.1 ·** `Job.type` **becomes a string** (D21) — `JOB_TYPES` is derived from the submit
-  union, so the Zod enum and the TS literal union cannot drift; the migration drops the
-  `JobType` enum.
+      union, so the Zod enum and the TS literal union cannot drift; the migration drops the
+      `JobType` enum.
   ```
   _An enum makes every new type a migration, and Postgres enum labels can never be removed._
   ```
 - [x] **A.2 ·** `JobHandler` **abstract base class** — `type`, `payloadSchema`, `execute(ctx,
-  payload)`; the registry resolves by type via DI and the processor names no type. A base class
-  rather than a bare interface because the payload re-parse belongs to every handler. No
-  per-handler `queue`: one queue still carries every type (§8.1).
+payload)`; the registry resolves by type via DI and the processor names no type. A base class rather than a bare interface because the payload re-parse belongs to every handler. No per-handler` queue`: one queue still carries every type (§8.1).
   ```
   _Adding a job type becomes adding one provider — and `Record<JobType, …>` in the module keeps
   "becomes" from meaning "forgets". Validate the payload at submit AND in the worker; the
   worker's copy is what protects it from a row written by another deploy, in either direction._
   ```
-- [ ] **A.3 ·** `JobContext` — `reportProgress`, `log`, `isCancelRequested`, on top of the job id
-  and attempt it already carries. **Not** the idempotency key: it is unique per tenant while
-  `SideEffect.effectKey` is unique globally, so a handler keying an effect on it would let one
-  tenant suppress another's.
+- [x] **A.3 ·** `JobContext` — `reportProgress` and `log`, on top of the job id and attempt it
+      already carries. **Not** the idempotency key: it is unique per tenant while
+      `SideEffect.effectKey` is unique globally, so a handler keying an effect on it would let one
+      tenant suppress another's. `isCancelRequested` moves to A.6, with the column that backs it — a
+      capability that always answers `false` is a lie written into a type handlers are told to trust.
   ```
   _Handlers get a capability object, not the Prisma client; what a handler may do is a
   deliberate list._
   ```
-- [ ] **A.4 ·** `progress Json?` **on** `Job`, written per batch with the `attempts` ownership
-  predicate (D25).
+- [x] **A.4 ·** `progress Json?` **on** `Job`, written per batch with the `attempts` ownership
+      predicate (D25) **and** a `processed <` predicate on the jsonb path, because a retry is the live
+      attempt and counts from one again.
   ```
-  _Progress is not a status transition, but a stale worker must still not overwrite it._
+  _Progress is not a status transition, but a stale worker must still not overwrite it — and
+  neither must the job's own second attempt._
   ```
 - [ ] **A.5 · Throttle the emits** — at most one per job per 500 ms, and always the final one.
   ```
   _A 20k-row import at one event per row floods the socket and the client repaints uselessly._
   ```
-- [ ] **A.6 ·** `CANCELLED` **+** `cancelRequested` (D22) and `POST /jobs/:id/cancel` — remove from
-  the queue if it has not started, otherwise set the flag and let the handler exit at a batch
-  boundary.
+- [ ] **A.6 ·** `CANCELLED` **+** `cancelRequested` (D22), `POST /jobs/:id/cancel` and
+      `JobContext.isCancelRequested` — remove from the queue if it has not started, otherwise set the
+      flag and let the handler exit at a batch boundary.
   ```
   _You cannot safely kill code mid-flight. Cancellation is a request plus an acknowledgement,
   which is why it is two fields and not one status._
@@ -607,8 +611,8 @@ checked under load. M10 must precede M11, so the box is sized against measured n
 ### Done when
 
 - [ ] **A11 passes** — a cancelled mid-flight job ends `CANCELLED` with no effect beyond its last
-  committed batch, and `cancelRequested` never strands a job that had already finished
-- [ ] **A12 passes** — progress never goes backwards, and a stale attempt cannot write it
+      committed batch, and `cancelRequested` never strands a job that had already finished
+- [x] **A12 passes** — progress never goes backwards, and a stale attempt cannot write it
 - [ ] Adding a job type touches no file in `src/worker/`
 
 ---
@@ -622,7 +626,7 @@ rows.
 ### Tasks
 
 - [ ] **B.1 · MinIO in compose** + `@aws-sdk/client-s3` (`forcePathStyle`), presigned `PUT` for
-  upload and short-expiry presigned `GET` for download.
+      upload and short-expiry presigned `GET` for download.
   ```
   _The API never streams a file body. Moving to real S3 then changes config, not code._
   ```
@@ -632,19 +636,19 @@ rows.
   whether it has run before._
   ```
 - [ ] **B.3 · Stream and batch** — `csv-parse` in streaming mode, per-row Zod, upsert ~500 rows per
-  transaction.
+      transaction.
   ```
   _Never load the file into memory: the whole client problem is that the naive version dies on
   size._
   ```
 - [ ] **B.4 · Checkpoint and resume** (D26) — its own storage, not `result` and not `progress`;
-  `redrive()` leaves it alone; `?from=start` forces a restart.
+      `redrive()` leaves it alone; `?from=start` forces a restart.
   ```
   _A re-drive asks "did this happen?", not "do it again" — the same semantic already settled for_
   `effectKey`_._
   ```
 - [ ] **B.5 · Error report** — invalid rows to `error-report.csv` in storage, presigned link in the
-  job result; bad rows never fail the job, but `IMPORT_MOSTLY_INVALID` fails fast on a wrong file.
+      job result; bad rows never fail the job, but `IMPORT_MOSTLY_INVALID` fails fast on a wrong file.
   ```
   _Distinguish "this data has problems" from "this is not the file you think it is"._
   ```
@@ -657,7 +661,7 @@ rows.
 
 - [ ] **A13 passes** — 20 000 rows import with flat memory
 - [ ] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
-  exact and contains no duplicates
+      exact and contains no duplicates
 - [ ] **A15 passes** — the same file submitted twice returns the first job
 - [ ] The error report is downloadable and its row numbers match the source file
 
@@ -672,7 +676,7 @@ private.
 ### Tasks
 
 - [ ] **C.1 · Outbound request guard** — http/https only, **private and link-local ranges blocked
-  after DNS resolution**, timeout, max body size, content-type check.
+      after DNS resolution**, timeout, max body size, content-type check.
   ```
   _Blocking by hostname is not enough: a name that resolves to 169.254.169.254 is the attack.
   Resolve first, check the address, then connect._
@@ -683,7 +687,7 @@ private.
   ledger here._
   ```
 - [ ] **C.3 · Transient vs permanent** — a timeout retries; a 404 or a non-image throws
-  `TerminalJobError` and dead-letters immediately.
+      `TerminalJobError` and dead-letters immediately.
   ```
   _This is_ `TerminalJobError`_'s first real caller; until now the branch existed and nothing
   could reach it._
@@ -698,7 +702,7 @@ private.
 ### Done when
 
 - [ ] **A16 passes** — `http://localhost`, `http://169.254.169.254` and a DNS name resolving to a
-  private address are all rejected
+      private address are all rejected
 - [ ] **A17 passes** — a permanent error consumes one attempt, not the whole budget
 - [ ] **A18 passes** — image batches at the chosen concurrency do not trigger stalled redeliveries
 
@@ -713,19 +717,19 @@ of failing jobs.
 ### Tasks
 
 - [ ] **D.1 ·** `LlmProvider` **interface** + `FakeLlmProvider` — deterministic, no API key, and
-  able to simulate 429s and malformed JSON on demand.
+      able to simulate 429s and malformed JSON on demand.
   ```
   _The fake is not a stand-in for the real one; it is the only way to test the failure paths the
   real one produces rarely and expensively._
   ```
 - [ ] **D.2 · A separate** `relay-ai` **queue with a** `limiter` **(resolves D6a)** and low
-  concurrency.
+      concurrency.
   ```
   _A BullMQ limiter is per-queue, so the rate limit itself forces the split — not a starvation
   measurement, which is what D6a was waiting for._
   ```
 - [ ] **D.3 · Zod-validate every item** — one corrective retry, then
-  `enrichmentStatus = 'failed'`; a category outside the enum is rejected.
+      `enrichmentStatus = 'failed'`; a category outside the enum is rejected.
   ```
   _A hallucinated category is indistinguishable from a valid one until something checks. This is
   the lesson of the phase._
@@ -758,7 +762,7 @@ partial failure as a first-class outcome.
 
 - [ ] **E.1 ·** `Pipeline` **model** with a `pendingChildren` counter and aggregate counts.
 - [ ] **E.2 · Children are our own rows** (D24), each with a **server-minted deterministic**
-  idempotency key `pipeline:<id>:<stage>:<batch>` (D23), enqueued through the outbox.
+      idempotency key `pipeline:<id>:<stage>:<batch>` (D23), enqueued through the outbox.
   ```
   _`FlowProducer` would make Redis a second source of truth for pipeline structure and its
   children would bypass the outbox. Minting the key server-side also means
@@ -770,14 +774,14 @@ partial failure as a first-class outcome.
   whole engine already uses — and the parent's outbox row is written in that same transaction._
   ```
 - [ ] **E.4 · Child-failure policy** — a failed batch does not fail the pipeline; the pipeline ends
-  `completed_with_errors` (on `Pipeline`, never on `Job` — D22) and the batch stays re-drivable.
+      `completed_with_errors` (on `Pipeline`, never on `Job` — D22) and the batch stays re-drivable.
 
 ### Done when
 
 - [ ] **A22 passes** — a failed child leaves the pipeline `completed_with_errors`, not failed
 - [ ] **A23 passes** — replaying the fan-out cannot create a second row for any batch
 - [ ] **A24 passes** — a crash between the last child committing and the parent being enqueued is
-  recovered by the outbox relay
+      recovered by the outbox relay
 
 ---
 
@@ -789,7 +793,7 @@ partial failure as a first-class outcome.
 ### Tasks
 
 - [ ] **F.1 ·** `ApiKey` **model** — `prefix` shown in the UI, SHA-256 `hash`, `scopes`,
-  `lastUsedAt`, `revokedAt`. The secret is displayed once and never stored.
+      `lastUsedAt`, `revokedAt`. The secret is displayed once and never stored.
   ```
   _Hash, not encrypt: nothing ever needs to read the key back, only to compare it._
   ```
@@ -806,7 +810,7 @@ partial failure as a first-class outcome.
 # PH · Presentation
 
 - [ ] README: problem → architecture diagram → the reliability guarantees and the assertion that
-  proves each → screenshots → how to run
+      proves each → screenshots → how to run
 - [ ] `docker compose up` starts API, worker, Postgres, Redis, MinIO
 - [ ] A 60-second demo script that includes killing a worker mid-run
 
@@ -826,14 +830,14 @@ _Consumes: D27._
 Shape only, so the earlier phases leave room for it:
 
 - [ ] Webhook endpoint with signature verification over the **raw** body, `StripeEvent` dedupe by
-  `eventId`, and the work done on Relay's own queue
+      `eventId`, and the work done on Relay's own queue
 - [ ] Local state rebuilt by **fetching the subscription from Stripe**, never from event payload
-  order
+      order
 - [ ] `EntitlementsService` as the single answer to "what plan, which limits, how much used"
 - [ ] Quota consumed through `SideEffect` with `effectKey = '<jobId>:quota:<batchIndex>'` (D27), so
-  a retried batch cannot consume twice
+      a retried batch cannot consume twice
 - [ ] Count limits checked inside a transaction; a downgrade **disables** surplus resources and
-  never deletes them
+      never deletes them
 
 ### Done when
 

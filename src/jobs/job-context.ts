@@ -1,3 +1,5 @@
+import type { JobProgress } from './job-progress.js';
+
 /**
  * What a handler is allowed to know and do. Handlers receive this rather than
  * the Prisma client, so the surface they can touch is a deliberate list.
@@ -17,4 +19,20 @@ export interface JobContext {
    * overwrite the attempt that replaced it (D25).
    */
   readonly attempt: number;
+
+  /**
+   * Records how far along the job is, for a client to read from
+   * `GET /jobs/:id`.
+   *
+   * Never rejects and never fails a job: progress is presentational, and a
+   * handler is free to report without awaiting — the processor flushes queued
+   * writes before it finishes the job. A report that goes *backwards*, or that
+   * arrives once this attempt has lost the job, is dropped; an equal count is
+   * accepted, so `message` can be revised without advancing. `total` and
+   * `message` are remembered, so a later report may omit them.
+   */
+  reportProgress(progress: JobProgress): Promise<void>;
+
+  /** Writes one line tagged with the job, the attempt and the request that submitted it. */
+  log(message: string): void;
 }

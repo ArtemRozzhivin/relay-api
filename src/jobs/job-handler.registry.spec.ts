@@ -4,6 +4,7 @@ import type { Job } from '../generated/prisma/client.js';
 import type { RunnableJobHandler } from './job-handler.js';
 import { JobHandlerRegistry } from './job-handler.registry.js';
 import { JOB_TYPES, type JobType } from './jobs.schema.js';
+import { recordingContext } from './job-context.fixture.js';
 
 const stub = (type: JobType): RunnableJobHandler => ({
   type,
@@ -37,7 +38,7 @@ describe('JobHandlerRegistry', () => {
     );
 
     await expect(
-      registry.run(jobOfType('RETIRED'), { jobId: 'a-job', attempt: 1 }),
+      registry.run(jobOfType('RETIRED'), recordingContext().context),
     ).rejects.toBeInstanceOf(TerminalJobError);
   });
 });

@@ -2,6 +2,7 @@ import { Module, type Type } from '@nestjs/common';
 import { RedisModule } from '../redis/redis.module.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobHandlerRegistry } from './job-handler.registry.js';
+import { JobContextFactory } from './job-context.factory.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
 import { JOB_HANDLERS, type RunnableJobHandler } from './job-handler.js';
 import { MockJobHandler } from './handlers/mock.handler.js';
@@ -24,6 +25,7 @@ const handlerProviders = Object.values(HANDLERS);
   providers: [
     JobTransitionService,
     JobHandlerRegistry,
+    JobContextFactory,
     JobEventsPublisher,
     ...handlerProviders,
     {
@@ -32,6 +34,11 @@ const handlerProviders = Object.values(HANDLERS);
       inject: handlerProviders,
     },
   ],
-  exports: [JobTransitionService, JobHandlerRegistry, JobEventsPublisher],
+  exports: [
+    JobTransitionService,
+    JobHandlerRegistry,
+    JobContextFactory,
+    JobEventsPublisher,
+  ],
 })
 export class JobCoreModule {}

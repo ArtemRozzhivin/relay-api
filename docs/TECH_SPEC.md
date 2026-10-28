@@ -68,7 +68,7 @@ Only two, both deliberately fake — the *machinery* is the subject, not the wor
 
 | Type | Behaviour | Why it exists |
 |---|---|---|
-| `MOCK` | `await sleep(payload.durationMs)`, then fail with probability `payload.failureRate` | Drives the queue, retries, backoff, and the dead-letter path deterministically |
+| `MOCK` | Sleeps `durationMs` spread over `steps` intervals, reporting progress after each. With probability `failureRate` it throws just past the halfway step, so a failed attempt leaves progress behind | Drives the queue, retries, backoff, the dead-letter path and progress deterministically |
 | `CHARGE` | Writes one row to the side-effect ledger, logs "charged". No gateway, no network | The job whose double-execution is observably wrong — the subject of A1/A3 |
 
 `MOCK` must `await`, never spin. A CPU-blocking processor starves the event loop, fails to renew
@@ -166,6 +166,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `idempotencyKey` | `text` | See D1 |
 | `result` | `jsonb?` | Set on `SUCCEEDED` |
 | `error` | `jsonb?` | `{ code, message, retryable, attempt }` — set on every failed attempt, last one wins |
+| `progress` | `jsonb?` | `{ processed, total?, message? }` (D25). Written outside any status transition, under the attempt token **and** a `processed <` predicate, so it can only move forward. Cleared by a re-drive |
 | `correlationId` | `text` | The submitting request's id. Carried onto the queue so worker logs join API logs (§12.1) |
 | `createdAt` | `timestamptz(6)` | |
 | `updatedAt` | `timestamptz(6)` | |
@@ -373,6 +374,19 @@ that is not on the row, that stops being true and a stored-response table become
 
 `202`, not `200` or `201`: the work has been *accepted*, not *done*. The client polls
 `GET /jobs/:id` or listens on the socket.
+
+**Payload per type.** The union in §6.4 is the authority; unknown keys are a `400`.
+
+| Type | Field | Range | Default |
+|---|---|---|---|
+| `MOCK` | `durationMs` | `0`–`60000` | `10` |
+| | `failureRate` | `0`–`1` | `0` |
+| | `steps` | `1`–`100` | `1` |
+| `CHARGE` | `amountCents` | positive int | required |
+| | `reference` | 1–200 chars | required |
+| | `delayMs` | `0`–`60000` | `0` |
+
+`maxAttempts` is on the body itself, not the payload: `1`–`20`, default `5`.
 
 ### 6.4 Validation
 
@@ -1028,6 +1042,18 @@ Recent releases changed the following. Documentation predating them is misleadin
 `docker compose`: `postgres:17`, `redis:7`, with healthchecks so `depends_on` waits for actual
 readiness rather than container start. App and worker are the same image with different commands.
 
+**After pulling a change that touches `prisma/`:**
+
+```
+npm run db:migrate          # prisma migrate deploy — applies committed migrations
+npm run db:generate:client  # src/generated/ is gitignored, so the client is rebuilt locally
+```
+
+Neither is optional and neither is automatic. Skipping the first fails at runtime with
+`column "…" does not exist`; skipping the second fails to typecheck, because the generated client
+has no such field. `db:migrate:dev` is the authoring command — it writes a new migration from a
+schema edit — and is never what you want for someone else's change.
+
 ---
 
 ## 14. Verification plan
@@ -1055,7 +1081,7 @@ cases.
 | **A9** | **Holds under load.** V virtual users for T minutes, one worker killed mid-run | A2 and A3 still hold. Record p95 submit latency, throughput, max queue depth, drain time — **name the numeric targets before running**, or the result is unfalsifiable | 10 |
 | **A10** | **No side effect inside a transaction.** Enforced by review, not code | Grep every `$transaction` block: it may write the ledger row, never perform the effect | ongoing |
 | **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change | PA |
-| **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic across the job's life | PA |
+| **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic for the life of one submission. An operator re-drive clears it and the count starts again (D25) | PA |
 | **A13** | **A large import does not grow with the file.** Import 20 000 rows | Peak RSS flat within a stated band; **name the band before running** or the result is unfalsifiable | PB |
 | **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
@@ -1099,8 +1125,8 @@ Three tiers, separated by what infrastructure each one needs:
 | tier | command | infrastructure | covers |
 |---|---|---|---|
 | unit | `npm test` | none | schemas, pure logic, services with DI swaps |
-| integration | `npm run test:integration` | Postgres, Redis, app in-process | the request contract: validation, auth, tenant scoping |
-| assertions | `npm run test:assertions` | API and worker as **OS processes** | A1–A7 |
+| integration | `npm run test:integration` | Postgres, Redis, app in-process | the request contract: validation, auth, tenant scoping — and the database-level guards a Prisma filter can silently get wrong |
+| assertions | `npm run test:assertions` | API and worker as **OS processes** | A1–A7, A12, and the later assertions as their phases land |
 
 The third tier exists because A3, A3b and A5b `SIGKILL` and `SIGSTOP` a worker. The point of those
 assertions is that the process dies *without running any cleanup*, which nothing in-process can
@@ -1250,6 +1276,36 @@ carry the same `attempts = <claimed attempt>` predicate, so a stale worker canno
 live one's progress. Note for the future lease-based reaper: progress writes bump `updatedAt`, so
 the lease clock must be `startedAt`, never `updatedAt`.
 
+The attempt token alone does not make the count monotonic, which A12 also requires: a **retry** is
+the live attempt and counts from one again, so without a second predicate it would walk a client's
+bar backwards from wherever the failed attempt left it. The write therefore also requires
+`progress -> 'processed'` to be below the incoming count, and the status to be `RUNNING` so a write
+cannot land on a finished job. The worker keeps an in-memory high-water mark too, seeded from the
+claimed row, but only to avoid issuing writes the database would refuse — the predicate is the
+guarantee.
+
+A refused write is logged and otherwise ignored. It never fails a job: progress is presentational,
+and a handler may report without awaiting, where a rejection would become an unhandled rejection
+and take the worker down with it. Because a handler may not await, the processor **flushes** the
+context's queued writes before it transitions the job — otherwise the last report of a
+fire-and-forget handler lands on a row that is no longer `RUNNING` and the job finishes showing
+its second-to-last batch.
+
+Three details the implementation settled:
+
+- **The predicate is `<=`, not `<`.** An equal count is not backwards, and a handler needs to
+  revise `message` at a count it has already reached ("validating", "connecting") without
+  inventing a fake advance.
+- **The write replaces the column, so the worker carries `total` and `message` forward.**
+  `JobProgress.total` invites reporting the total once, up front; with a replacing write the next
+  batch that omits it would erase the denominator. The context remembers both, seeded from the
+  claimed row, so a retry neither re-reports nor erases what an earlier attempt published.
+- **A stored value this version cannot read has to be reclaimable.** For a row holding, say,
+  `{"phase":"extract"}`, `progress -> 'processed' <= n` is NULL rather than false, so it matches
+  no rows and the column would stay frozen for the job's whole life. There is no Prisma filter for
+  "this jsonb path is SQL NULL", so the worker — which has already read the value — tells the
+  write to drop the monotonic clause once. The ownership clause is never dropped.
+
 **D26 — a re-drive resumes from the checkpoint; restarting is opt-in.**
 The checkpoint is neither `result` (which `redrive()` clears) nor `progress` (which is
 presentational), so it gets its own storage keyed by job, and `redrive()` does not clear it.
@@ -1318,4 +1374,6 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-26 | §1 scope, §9 — no frontend of any kind is in scope, including the static demo page. A7 is verified by a scripted socket client so it can run in CI; the dashboard is a separate deliverable. |
 | 2026-10-26 | §7.3 — the attempt number is the worker's **ownership token**. `succeed`, `requeueForRetry` and `deadLetter` all require `attempts = <the attempt that claimed>`, so a worker that lost a job while still running it cannot write over whoever holds it now. `succeed` also accepts `QUEUED`, because a refused `succeed` is unrecoverable: the work is done and no later delivery exists. |
 | 2026-10-27 | §4.3, §6.4, §10.1 — brought in line with the code: `Job.type` is `text` (D21, its migration drops the enum); validation is strict at the edge and lenient in the worker's re-parse, because an additive payload change must not dead-letter queued jobs; the module tree names the modules that exist, with `JobCoreModule` as the shared domain both roots import. |
+| 2026-10-27 | §4.3, D25 — `Job.progress` added, written under two predicates rather than one: the attempt token stops a stale worker, and a `processed <` comparison on the jsonb path stops a retry from counting from one over a higher stored value. A progress write never fails a job. |
+| 2026-10-28 | §2, §6.3 — the `MOCK` row described a handler that no longer exists, and `steps` was an undocumented field on the submit body; payload ranges and defaults are now listed per type. §13.4 gains the two commands a schema change requires, since `src/generated/` is gitignored. §14's A12 row said "across the job's life" while a re-drive clears progress. D25 records three things the implementation settled: `<=` not `<`, the worker carrying `total`/`message` forward over a replacing write, and how a stored value this version cannot read is reclaimed. |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

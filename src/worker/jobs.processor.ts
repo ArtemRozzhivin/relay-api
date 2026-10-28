@@ -3,6 +3,7 @@ import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { UnrecoverableError, type Job as QueueJob } from 'bullmq';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
+import { JobContextFactory } from '../jobs/job-context.factory.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { TerminalJobError } from '../common/errors/app-error.js';
@@ -17,6 +18,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   constructor(
     private readonly transitions: JobTransitionService,
     private readonly handlers: JobHandlerRegistry,
+    private readonly contexts: JobContextFactory,
     private readonly events: JobEventsPublisher,
   ) {
     super();
@@ -41,11 +43,21 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       `Running job ${jobId} (${claimed.type}) attempt ${attempt}/${claimed.maxAttempts} [correlationId=${correlationId}]`,
     );
 
+    const context = this.contexts.create({
+      jobId,
+      attempt,
+      correlationId,
+      progress: claimed.progress,
+    });
+
     try {
-      const result = await this.handlers.run(claimed, {
-        jobId: claimed.id,
-        attempt,
-      });
+      const result = await this.handlers.run(claimed, context);
+
+      // Before the transition, not after: a handler may report without
+      // awaiting, and a queued write that lands on a row this method has
+      // already finished would be refused and lost — the job would finish
+      // showing its second-to-last batch.
+      await context.flush();
 
       const succeeded = await this.transitions.succeed(jobId, attempt, result);
 
@@ -59,6 +71,10 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
       return result;
     } catch (cause) {
+      // Same reason as the success path, and it matters more here: a retry keeps
+      // the progress of the attempt that failed.
+      await context.flush();
+
       const reason = cause instanceof Error ? cause.message : String(cause);
 
       const isTerminal =

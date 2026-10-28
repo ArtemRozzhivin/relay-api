@@ -8,6 +8,9 @@ import { z } from 'zod';
 export const mockPayloadSchema = z.object({
   durationMs: z.coerce.number().int().min(0).max(60_000).default(10),
   failureRate: z.coerce.number().min(0).max(1).default(0),
+  // Splits the sleep into reporting intervals: a mock job is the only job that
+  // can exercise progress until the CSV import exists (PB).
+  steps: z.coerce.number().int().min(1).max(100).default(1),
 });
 
 export const chargePayloadSchema = z.object({

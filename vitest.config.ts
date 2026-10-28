@@ -26,6 +26,7 @@ export default defineConfig({
         'src/worker.ts',
         'src/**/*.module.ts',
         'src/**/*.spec.ts',
+        'src/**/*.fixture.ts',
       ],
       reporter: ['text-summary', 'html'],
     },
