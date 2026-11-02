@@ -1,8 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
+import { JOBS_QUEUE } from '../../src/jobs/job-queue.js';
 
-// A5 — retries are bounded, the terminal state records why, and re-drive is
-// guarded by the transition rather than by an if.
+// A5 — retries are bounded, an error no retry can fix skips them, the terminal
+// state records why, and re-drive is guarded by the transition rather than by
+// an if.
 describe('A5 · a poison job dead-letters exactly once', () => {
   let harness: RelayHarness;
   let account: Account;
@@ -31,6 +34,51 @@ describe('A5 · a poison job dead-letters exactly once', () => {
     expect(dead.attempts).toBe(3);
     expect((dead.error as { code: string }).code).toBe('ATTEMPTS_EXHAUSTED');
     expect(dead.finishedAt).not.toBeNull();
+  });
+
+  it('dead-letters a job that can never succeed on its first attempt', async () => {
+    // Written directly because the API rejects a malformed payload at submit:
+    // this is a job queued before a deploy tightened its schema. Queued through
+    // an outbox row so the relay gives it its real budget of five — were BullMQ
+    // allowed only one attempt, `attempts = 1` would hold whether or not the
+    // worker classified the error.
+    const jobId = randomUUID();
+    const maxAttempts = 5;
+
+    await harness.prisma.job.create({
+      data: {
+        id: jobId,
+        userId: account.id,
+        type: 'MOCK',
+        payload: { durationMs: 'soon' },
+        maxAttempts,
+        idempotencyKey: `a5-${jobId}`,
+        correlationId: 'a5',
+        outbox: {
+          create: {
+            queue: JOBS_QUEUE,
+            jobName: 'MOCK',
+            payload: { jobId, correlationId: 'a5', maxAttempts },
+          },
+        },
+      },
+    });
+
+    // Every terminal status, so a job that ends any other way fails here
+    // rather than timing out.
+    const dead = await harness.waitForJobStatus(jobId, [
+      'DEAD_LETTERED',
+      'SUCCEEDED',
+      'CANCELLED',
+    ]);
+
+    expect(dead.status).toBe('DEAD_LETTERED');
+    expect(dead.attempts).toBe(1);
+    expect(dead.error).toMatchObject({
+      code: 'TERMINAL_FAILURE',
+      attempt: 1,
+      message: expect.stringContaining('does not match the schema'),
+    });
   });
 
   it('re-drives a dead job and refuses to re-drive a healthy one', async () => {
