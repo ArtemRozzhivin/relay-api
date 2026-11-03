@@ -105,8 +105,11 @@ describe('A12b · progress is rate-limited but never loses its last value', () =
       'DEAD_LETTERED',
     ]);
 
-    // 100 reports inside a millisecond: all but the first are held, and only
-    // the processor's flush gets the last one out before the job finishes.
+    // 100 reports as fast as the handler can make them — about 200 ms, since
+    // each step reads the row for shouldStop() — so all but the first land
+    // inside one window and only the processor's flush gets the last one out.
+    // On a machine slow enough to take past 500 ms, the window's timer would
+    // send it instead and this case would stop proving the flush.
     expect(terminal.status).toBe('SUCCEEDED');
     expect(readProgress(terminal.progress)).toEqual({
       processed: STEPS,

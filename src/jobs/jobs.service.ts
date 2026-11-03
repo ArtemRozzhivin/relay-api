@@ -210,11 +210,13 @@ export class JobsService {
    * that has only just recovered.
    *
    * Not idempotent per call, by design: a repeated call continues with the next
-   * batch. It can never re-drive a job twice, because the update re-checks the
-   * status.
+   * batch. It can never re-drive the same dead letter twice, because the update
+   * re-checks the status — but a re-driven job that dies again is a new dead
+   * letter, and with no `deadLetteredTo` it matches again.
    *
    * @returns how many this call re-drove, and how many still match — call
-   * again until `remaining` is 0. With `dryRun`, nothing changes and
+   * again until `remaining` is 0, with `deadLetteredTo` set to when the loop
+   * started so it works through a fixed set. With `dryRun`, nothing changes and
    * `remaining` is how many a real call would work through.
    */
   async redriveMatching(

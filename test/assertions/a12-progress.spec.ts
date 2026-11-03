@@ -33,8 +33,8 @@ describe('A12 · progress is monotonic and cannot be written by a stale attempt'
       jobIds.push(body.data.id);
     }
 
-    // Every distinct count ever observed per job. A write only lands when it is
-    // strictly greater than the stored one, so this series must be ascending —
+    // Every distinct count ever observed per job. A write only lands at or above
+    // the stored count, so this series of distinct values must be ascending —
     // sampling can miss a value but can never legitimately see a decrease.
     const series = new Map<string, number[]>();
     let sampling = true;

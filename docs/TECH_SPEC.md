@@ -222,7 +222,7 @@ Closes the commit-then-enqueue gap (D5). Written in the same transaction as the 
 | `payload` | `jsonb` | The queue message (§8.3) |
 | `createdAt` | `timestamptz(6)` | |
 | `publishedAt` | `timestamptz(6)?` | `NULL` = pending |
-| `attempts` | `int` | Relay publish attempts |
+| `attempts` | `int` | Publishes by the relay. The direct path marks a row published without touching it, so `0` on a published row means the fast path delivered it, and A6 relies on that |
 
 **DB** partial index `(createdAt) WHERE publishedAt IS NULL` — the relay's only query, and it
 stays small because published rows fall out of the index.
@@ -345,7 +345,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. Phase 6. See D6b |
-| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0. `dryRun: true` counts and changes nothing. See D11 |
+| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
@@ -510,7 +510,8 @@ effectKey = `${jobId}:${kind}`          // e.g. "3f2a…:charge"
 `jobId` is stable (the row already exists before the job is ever enqueued), so every redelivery
 of that job derives the same key. **Not** the attempt number — that changes per delivery and
 would make each retry look like a new effect. **Not** a timestamp. **Not** the BullMQ job id
-unless §8.2's `jobId` and `Job.id` are kept identical, which this spec assumes.
+either: since §7.5a that is `${jobId}.${outboxId}`, new for every re-drive, so a key built on it
+would let a re-driven job repeat an effect that already landed.
 
 A job with multiple side effects gets one ledger row per effect (`:charge`, `:notify`), each
 inserted in the same transaction as its own effect. A multi-step job that is not
@@ -718,7 +719,7 @@ not apply here.
 
 > **DECISION — D7 · What does the worker do on claim, and what happens when it dies?**
 >
-> **Status: DEFERRED — phase 6.** Trigger: a killed worker leaves a row stuck in `RUNNING`.
+> **Status: RESOLVED in phase 6.** Trigger was: a killed worker leaves a row stuck in `RUNNING`.
 > Phase 5 ships `WHERE status = 'QUEUED'`, which is sufficient there because phase 5 introduces
 > neither crashes nor retries. The correct guard is chosen in phase 6 against observed
 > behaviour, when stall semantics can actually be exercised.
@@ -745,12 +746,18 @@ not apply here.
 > dead-letter) and treat the other as observability. Two policies on two counters is a bug that
 > only appears under failure, which is the worst time to find it.
 >
-> **Resolution:** open — see Status above.
+> **DECIDED (phase 6) — claim (b), BullMQ redelivery, and `Job.attempts`.** `claim()` matches
+> `status IN ('QUEUED','RUNNING')`: an allow-list refused `CANCELLED` the day it was added, where
+> (c)'s deny-list would have let a worker claim and run a cancelled job. A dead worker's row is
+> reconciled by BullMQ's stalled redelivery, whose `claim()` takes the `RUNNING` row over; a job
+> past `maxStalledCount` is finalised from the `failed` event (§7.6). `Job.attempts` is
+> authoritative for policy and is the ownership token (§7.3); `attemptsMade` counts only
+> failures, so it never reaches the budget first, and is observability.
 
 > **DECISION — D6b · What is the dead-letter path, physically?**
 >
-> **Status: DEFERRED — phase 6.** Trigger: the first job that actually dies. The spec leans (a);
-> confirm it then.
+> **Status: RESOLVED in phase 6.** Trigger was: the first job that actually dies. The spec leaned
+> (a), and the code confirmed it.
 >
 > - **(a) A terminal `Job.status = 'DEAD_LETTERED'` + `error`.** Queryable, durable, survives a
 >   Redis flush. This spec assumes it.
@@ -763,7 +770,10 @@ not apply here.
 > (same row, same `id`), so `effectKey` is unchanged and a re-drive of a job whose effect already
 > landed is correctly a no-op. Confirm this is what §7.4 gives you.
 >
-> **Resolution:** open — see Status above.
+> **DECIDED (phase 6) — (a).** `status = 'DEAD_LETTERED'` with `error = { code, message, attempt? }`
+> (no `attempt` when the queue abandoned it, since no attempt owned it), `code` one of `DEAD_LETTER_CODES` (`TERMINAL_FAILURE`, `ATTEMPTS_EXHAUSTED`, `DELIVERY_ABANDONED`). A
+> re-drive reuses the row, its `id` and so its `effectKey`: a re-driven job whose effect already
+> landed dedupes rather than repeating it.
 
 ---
 
@@ -851,11 +861,18 @@ connect and on reconnect, re-fetch the jobs you care about.* Assertion A7 tests 
 realtime channel that clients are allowed to treat as authoritative is a correctness bug wearing
 a feature's clothes.
 
+**Events can arrive out of order.** Two processes write a job's row — the API on a cancel, the
+worker on everything else — and each publishes after its own commit, so a later state's event can
+overtake an earlier one. Every event carries `updatedAt`: a client keeps whichever copy is newer
+and drops an event older than the one it holds. `updatedAt` is stamped by the writing process's
+clock, so between two machines it orders events only as well as their clocks agree, and
+`GET /jobs/:id` settles any doubt.
+
 **Emit after commit, never inside the transaction** (§7.8, rule 3).
 
 > **DECISION — D8 · Who emits, and how does the event cross the process boundary?**
 >
-> **Status: DEFERRED — phase 7.** Trigger: the first cross-process emission attempt. The
+> **Status: RESOLVED in phase 7.** Trigger was: the first cross-process emission attempt. The
 > mechanism depends on how the gateway is deployed, which is not fixed until phase 7.
 >
 > The transitions happen in the **worker**. The sockets live in the **API**. `server.emit()` from
@@ -878,7 +895,7 @@ a feature's clothes.
 > either `transports: ['websocket']` on the client or sticky routing at the proxy. Redis alone is
 > not sufficient — the polling handshake will break across instances.
 >
-> **Resolution:** open — see Status above.
+> **DECIDED 2026-10-26 — (a), a Redis pub/sub bridge,** at-most-once by design (§9.2a, §9.3).
 
 ---
 
@@ -1105,7 +1122,7 @@ cases.
 | **A10** | **No side effect inside a transaction.** Enforced by review, not code — the `relay-reviewer` agent's checklist | Grep every `$transaction` block: it may write the ledger row, never perform the effect | ongoing |
 | **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change. *In PA the per-step effect is the progress report; the ledger-count form needs batched effects and is asserted with the CSV import (PB)* | PA |
 | **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic for the life of one submission. An operator re-drive clears it and the count starts again (D25) | PA |
-| **A12b** | **Progress is rate-limited, and the last value still lands.** Report 60 times across 3s, and 100 times inside one millisecond | Events carrying `progress` are **> 1 and < 20**, not ~60; and the stored value equals the final report in both cases. The second case lands entirely inside one window, so only the processor's flush gets it out | PA |
+| **A12b** | **Progress is rate-limited, and the last value still lands.** Report 60 times across 3s, and 100 times as fast as the handler can (about 200 ms, inside one 500 ms window) | Events carrying `progress` are **> 1 and < 20**, not ~60; and the stored value equals the final report in both cases. The second case lands entirely inside one window, so only the processor's flush gets it out | PA |
 | **A13** | **A large import does not grow with the file.** Import 20 000 rows | Peak RSS flat within a stated band; **name the band before running** or the result is unfalsifiable | PB |
 | **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
@@ -1217,8 +1234,8 @@ to settle it.
 
 | # | Question | Trigger that forces the call | Phase |
 |---|---|---|---|
-| D7 | Claim guard; crash reconciliation; authoritative attempt counter | Your first killed worker leaves a row stuck in `RUNNING` | 6 |
-| D6b | What a dead letter physically is | The first job that actually dies | 6 |
+| D7 | ~~Claim guard; crash reconciliation; authoritative attempt counter~~ | — | **DECIDED (phase 6)** — claim `QUEUED`/`RUNNING`; BullMQ redelivery reconciles; `Job.attempts` is authoritative. §7.6 |
+| D6b | ~~What a dead letter physically is~~ | — | **DECIDED (phase 6)** — `DEAD_LETTERED` + `error` on the `Job` row. §4.6 |
 | D8 | ~~Who emits the WS event; how it crosses the process boundary~~ | — | **DECIDED 2026-10-26** — the worker `PUBLISH`es a domain event to `relay:job-updated`; the API subscribes on a duplicated connection and fans out to `user:<userId>`. §9.3 |
 | D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
@@ -1313,7 +1330,7 @@ also writes the parent's outbox row. Parent-runs-when-children-finish becomes a 
 on a counter — the idiom the whole project already uses — and the child-failure policy §3.5 asks
 about becomes ours to state rather than a BullMQ flag to look up.
 
-**D25 — `progress Json?` on `Job`, written per batch, guarded by the ownership token.**
+**D25 — `progress Json?` on `Job`, throttled to one write per 500 ms, guarded by the ownership token.**
 Not Redis-only: D4 makes Postgres authoritative, and `GET /jobs/:id` has to answer "how far along"
 on reconnect, which is A7's shape. Not a separate table: progress is one current value, not a
 history, and a row per update is write amplification nobody reads back.
@@ -1325,7 +1342,8 @@ the lease clock must be `startedAt`, never `updatedAt`.
 The attempt token alone does not make the count monotonic, which A12 also requires: a **retry** is
 the live attempt and counts from one again, so without a second predicate it would walk a client's
 bar backwards from wherever the failed attempt left it. The write therefore also requires
-`progress -> 'processed'` to be below the incoming count, and the status to be `RUNNING` so a write
+`progress -> 'processed'` to be at or below the incoming count (at, so a handler can revise its
+`message` without advancing), and the status to be `RUNNING` so a write
 cannot land on a finished job. The worker keeps an in-memory high-water mark too, seeded from the
 claimed row, but only to avoid issuing writes the database would refuse — the predicate is the
 guarantee.
@@ -1378,8 +1396,12 @@ the start makes the whole operation crash-safe from the moment it commits, and i
 against a downstream that has only just recovered.
 Bounded per call (`limit`, max 1000) so no transaction holds thousands of row locks until it
 commits; the response's `remaining` tells the caller to call again. A repeated call continues
-with the next batch rather than repeating the first, and can never re-drive a job twice: the
-update re-checks `status = 'DEAD_LETTERED'` instead of trusting the ids it selected.
+with the next batch rather than repeating the first, and can never re-drive the same dead letter
+twice: the update re-checks `status = 'DEAD_LETTERED'` instead of trusting the ids it selected. A
+re-driven job that dies *again* is a new dead letter with a new `finishedAt`, so with no
+`deadLetteredTo` it matches again, and a loop run while the downstream is still failing may never
+reach `remaining = 0`. Pass `deadLetteredTo` — the time the loop started — to work through a
+fixed set.
 At least one filter is required — an empty body is what a client bug sends — and `dryRun`
 counts without writing. A filter matching nothing answers `202 { redriven: 0, remaining: 0 }`:
 the caller asked for a set, and an empty set is a complete answer, unlike a cancel naming one
@@ -1444,4 +1466,5 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-03 | D6b, D7, D8 marked decided, as the code already had them. Corrected to match the code: §7.4 (the BullMQ id is per outbox row), §9.3 (events can arrive out of order; keep the newer `updatedAt`), D11 and §6.2 (a looping bulk re-drive needs `deadLetteredTo`), D25 (`<=`, not `<`; one write per window), A12b (the fast case takes about 200 ms, not one), §4.5 (`Outbox.attempts` counts the relay's publishes only). |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

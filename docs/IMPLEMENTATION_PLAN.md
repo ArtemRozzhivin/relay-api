@@ -488,12 +488,12 @@ Each step is motivated by the failure of the one before it.
   ```
   _Both triggers are defined as measurements, not opinions._
   ```
-- [ ] **10.7 · A partial index on** `Outbox` `WHERE "publishedAt" IS NULL`. The relay asks for the
-  oldest unpublished rows; with no index on `publishedAt` it walks every published row first, and
-  the table is never pruned, so each tick costs more for the life of the system.
+- [ ] **10.7 · Prune published `Outbox` rows.** The relay's query stays fast — the partial index
+  `Outbox_pending_idx` holds only unpublished rows — but published rows are never deleted, so the
+  table itself grows for the life of the system.
   ```
-  _Found while building A.7, whose bulk re-drive grows the outbox fastest. Free today, linear
-  forever._
+  _Found while building A.7, whose bulk re-drive grows the outbox fastest. Storage, not speed:
+  the relay never reads a published row._
   ```
 
 ### Done when

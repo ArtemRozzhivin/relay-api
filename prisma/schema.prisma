@@ -93,6 +93,8 @@ model Outbox {
   queue       String
   jobName     String
   payload     Json
+  /// Publishes by the relay only: the direct path marks a row published without
+  /// touching it, so 0 on a published row means the fast path delivered it.
   attempts    Int       @default(0)
   createdAt   DateTime  @default(now()) @db.Timestamptz(6)
   publishedAt DateTime? @db.Timestamptz(6)
