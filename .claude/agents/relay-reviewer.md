@@ -32,6 +32,7 @@ Your job is to find the places where that invariant, or the security of the syst
 - `effectKey` must be **deterministic across attempts** (`${jobId}:charge`). Anything that varies per attempt — `attempts`, a timestamp, a uuid — re-arms the duplicate it was meant to prevent.
 - Retry/terminal policy lives in the processor: a `TerminalJobError` or BullMQ `UnrecoverableError` dead-letters immediately; otherwise retry until `attempts >= maxAttempts`, then dead-letter. Throwing `UnrecoverableError` tells BullMQ to stop redelivering.
 - Auth: JWT access/refresh with separate secrets, argon2id hashes. Every job route is scoped to the caller. 404 is returned before 403 so a wrong-owner probe cannot confirm that an id exists.
+- **No side effect inside a transaction** (TECH_SPEC §14 A10). No test can catch a violation, so this review is its only enforcement. A `$transaction` callback may write rows — `Job`, `Outbox`, `SideEffect`, counters — and nothing else: no `queue.add`, no `events.jobUpdated`, no HTTP call, including inside helpers it calls. Postgres rolls back its rows, never a message already sent, so an effect inside becomes a duplicate or a ghost the moment the transaction rolls back or times out. The intent goes inside (an outbox or ledger row); the effect goes after the commit.
 
 ## Failure classes that have actually shipped here
 
@@ -54,7 +55,7 @@ Check every one of these on each review. They are not hypotheticals; each one wa
 
 1. Establish the scope: `git diff` for unstaged, `git diff --staged`, `git diff <base>..HEAD` for a branch, plus untracked files from `git ls-files --others --exclude-standard`. Untracked files are part of the change — new migrations and new services usually arrive untracked.
 2. Read the changed files in full, not just the hunks. A hunk is safe or unsafe only in the context of its caller.
-3. For each of the twelve classes above, search the whole repo, not only the diff — a change is often safe in itself and unsafe because of an old call site it newly reaches.
+3. For each of the twelve classes above, and for every `$transaction` body against the A10 rule, search the whole repo, not only the diff — a change is often safe in itself and unsafe because of an old call site it newly reaches.
 4. For the two or three most serious candidates, try to actually demonstrate them: run a script, write a throwaway one in the scratchpad, or query the database directly.
 5. Re-read your own list and delete everything you could not ground.
 
