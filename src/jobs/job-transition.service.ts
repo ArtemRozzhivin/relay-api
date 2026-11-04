@@ -124,6 +124,22 @@ export class JobTransitionService {
     );
   }
 
+  // The sweep found a RUNNING row whose queue entry is finished or gone (§7.6).
+  // `startedAt` pins the delivery it inspected: claim() rewrites it, so a job
+  // claimed again since the sweep read it is not finished on stale evidence.
+  abandonStranded(
+    jobId: string,
+    startedAt: Date | null,
+    error: Prisma.InputJsonValue,
+  ) {
+    return this.move(
+      jobId,
+      ['RUNNING'],
+      { status: 'DEAD_LETTERED', error, finishedAt: new Date() },
+      { where: { startedAt } },
+    );
+  }
+
   // Not a status transition, and deliberately not routed through one: a job's
   // status must not change because it counted. It carries the same ownership
   // token all the same — a worker the queue has given up on must not overwrite

@@ -577,6 +577,16 @@ Worth stating precisely, because the mental model most people have is wrong:
   `POST /jobs/:id/retry` would refuse it because the row is not `DEAD_LETTERED`. The worker must
   therefore finalise from the `failed` **event**, gated on `job.finishedOn`: `failed` fires on
   every failed attempt, but `finishedOn` is set only once the queue has stopped redelivering.
+- **That event is heard once — the one at-most-once step in the system.** It fires in memory, in
+  one worker; if that worker dies before `abandon()` lands, or Postgres refuses the write, nothing
+  ever fires it again, and the row stays `RUNNING` past both a re-drive and a cancel. So every
+  worker also runs a **sweep** (`RELAY_SWEEP_INTERVAL_MS`, default 60 s): a `RUNNING` row whose
+  latest queue entry is missing, or finished more than 30 s ago, is dead-lettered
+  `DELIVERY_ABANDONED`. It asks the queue, not a clock — a long job is legitimately `RUNNING` for
+  hours — and leaves waiting, delayed and active entries alone. The 30 s keeps the event the normal
+  path and the sweep its backstop rather than a racer. The write is pinned to the `startedAt` the
+  sweep read, so a job claimed again in between is never finished on stale evidence. It also
+  finishes a processor that returned without finishing its row, whose entry ends `completed`.
 
 ### 7.7 Error taxonomy
 
@@ -757,7 +767,8 @@ not apply here.
 > `status IN ('QUEUED','RUNNING')`: an allow-list refused `CANCELLED` the day it was added, where
 > (c)'s deny-list would have let a worker claim and run a cancelled job. A dead worker's row is
 > reconciled by BullMQ's stalled redelivery, whose `claim()` takes the `RUNNING` row over; a job
-> past `maxStalledCount` is finalised from the `failed` event (§7.6). `Job.attempts` is
+> past `maxStalledCount` is finalised from the `failed` event, and a sweep finishes the one that
+> event loses (§7.6). `Job.attempts` is
 > authoritative for policy and is the ownership token (§7.3); `attemptsMade` counts only
 > failures, so it never reaches the budget first, and is observability.
 
@@ -993,6 +1004,9 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `ACCESS_TOKEN_TTL` | duration | ✓ | — | Default `15m` |
 | `REFRESH_TOKEN_TTL` | duration | ✓ | — | Default `30d` |
 | `WORKER_CONCURRENCY` | int | — | ✓ | Default 5 |
+| `RELAY_SWEEP_INTERVAL_MS` | int ≥1000 | — | ✓ | Default 60000. The stranded-job sweep (§7.6) |
+| `RELAY_FAULT_AFTER_COMMIT` | bool | ✓ | — | Tests only (A6). Default `false` |
+| `RELAY_FAULT_SKIP_ABANDON` | bool | — | ✓ | Tests only (A5d). Default `false` |
 | `JOB_MAX_ATTEMPTS` | int | ✓ | ✓ | Default ceiling |
 | `LOG_LEVEL` | enum | ✓ | ✓ | |
 | `CORS_ORIGINS` | csv | ✓ | — | |
@@ -1120,6 +1134,7 @@ cases.
 | **A3b** | **A stale worker must not write over the live one.** Freeze a worker mid-handler, let the stalled checker hand its jobs to a second worker, then thaw the first | Every job terminal and `SELECT count(*) FROM "Job" WHERE status NOT IN ('SUCCEEDED','DEAD_LETTERED')` **= 0**. **Inconclusive unless the log shows refused stale writes** — otherwise the interleaving never happened | 6 |
 | **A5b** | **A job the queue abandons still terminates.** Stall a job past `maxStalledCount` so `process()` is never called again | `status = 'DEAD_LETTERED'` with `error->>'code' = 'DELIVERY_ABANDONED'`, exactly 2 deliveries against a budget of 5, and a re-drive that is *observed to be delivered* — a `202` alone is not evidence (§7.5a) | 6 |
 | **A5c** | **A filtered bulk re-drive revives exactly the matching dead letters.** Dead-letter jobs under two error codes; re-drive one code with `limit` below the match count | Calls return `{ redriven, remaining }` until `remaining = 0`; every match ends `SUCCEEDED` with `attempts = 1`, its outbox row published **by the relay** (`Outbox.attempts = 1`); every non-match is untouched and has no outbox row | PA |
+| **A5d** | **An abandonment the `failed` event loses is still finalised.** A5b's two stalls, with the worker that hears the `failed` event dropping it | `status = 'DEAD_LETTERED'`, `error->>'code' = 'DELIVERY_ABANDONED'`, and the worker's log shows the sweep finished it **and not the event** — otherwise the event path passing would look the same | 6 |
 | **A4** | **Redelivery of a succeeded job is a no-op.** Force redelivery of a `SUCCEEDED` job | `SUCCEEDED → RUNNING` never occurs; `SideEffect` count unchanged; the guarded update returns count `0` | 6 |
 | **A5** | **A poison job dead-letters exactly once.** Submit a job that always fails; separately, queue one whose payload can never parse | `attempts = maxAttempts`; exactly one `DEAD_LETTERED` row; `error` populated; it never returns to `QUEUED` without an explicit re-drive. The unparseable one dead-letters on attempt 1 with `TERMINAL_FAILURE`, its budget unspent | 6 |
 | **A6** | **The enqueue gap is real.** With a fault injected between commit and enqueue | A `QUEUED` job exists with no queue entry — i.e. **prove the hole exists in the v1 design**. After the outbox lands, the same test must show the job eventually runs | 6 |
@@ -1488,6 +1503,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-04 | §7.6, D7, §11, §14 — a sweep in every worker finishes a `RUNNING` job whose queue entry is gone or long finished: the backstop for the `failed` event, the one at-most-once step. A5d registered; `RELAY_SWEEP_INTERVAL_MS` and `RELAY_FAULT_SKIP_ABANDON` added, and `RELAY_FAULT_AFTER_COMMIT` listed. |
 | 2026-11-03 | §4.3, §6.2, §6.3, D28 — **decided**: a reused `Idempotency-Key` with a different body is `422 IDEMPOTENCY_KEY_REUSED`, checked against a stored SHA-256 of the canonical body; `requestHash` added to `Job` and kept out of responses. §16's D14–D16 rows moved back into the deferred table they had drifted out of. |
 | 2026-11-03 | D6b, D7, D8 marked decided, as the code already had them. Corrected to match the code: §7.4 (the BullMQ id is per outbox row), §9.3 (events can arrive out of order; keep the newer `updatedAt`), D11 and §6.2 (a looping bulk re-drive needs `deadLetteredTo`), D25 (`<=`, not `<`; one write per window), A12b (the fast case takes about 200 ms, not one), §4.5 (`Outbox.attempts` counts the relay's publishes only). |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

@@ -312,6 +312,11 @@ Each step is motivated by the failure of the one before it.
   ```
   _The transactional outbox closes the dual-write hole._
   ```
+- [x] **6.10 · A sweep for the abandonment the `failed` event loses** → A5d passes.
+  ```
+  _Found walking A5b: the event is heard once, so a worker killed at that moment stranded the
+  row in RUNNING for ever. The sweep asks the queue, not a clock._
+  ```
 
 ### Done when
 

@@ -6,6 +6,7 @@ import { PrismaModule } from '../prisma/prisma.module.js';
 import { JobCoreModule } from '../jobs/job-core.module.js';
 import { JOBS_QUEUE } from '../jobs/job-queue.js';
 import { JobsProcessor } from './jobs.processor.js';
+import { StrandedJobSweeper } from './stranded-job.sweeper.js';
 import { workerEnvSchema, type WorkerEnv } from '../config/env.schema.js';
 import { buildWorkerLoggerParams } from '../common/logging/logger.params.js';
 
@@ -31,6 +32,6 @@ import { buildWorkerLoggerParams } from '../common/logging/logger.params.js';
     }),
     BullModule.registerQueue({ name: JOBS_QUEUE }),
   ],
-  providers: [JobsProcessor],
+  providers: [JobsProcessor, StrandedJobSweeper],
 })
 export class WorkerModule {}

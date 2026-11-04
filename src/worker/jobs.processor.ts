@@ -1,4 +1,5 @@
 import { Logger, type OnModuleDestroy } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { UnrecoverableError, type Job as QueueJob } from 'bullmq';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
@@ -9,6 +10,7 @@ import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { TerminalJobError } from '../common/errors/app-error.js';
 import type { DeadLetterCode } from '../jobs/job-error-codes.js';
+import type { WorkerEnv } from '../config/env.schema.js';
 
 @Processor(JOBS_QUEUE, {
   concurrency: Number(process.env.WORKER_CONCURRENCY ?? 5),
@@ -22,6 +24,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     private readonly handlers: JobHandlerRegistry,
     private readonly contexts: JobContextFactory,
     private readonly events: JobEventsPublisher,
+    private readonly config: ConfigService<WorkerEnv, true>,
   ) {
     super();
   }
@@ -177,6 +180,12 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     const jobId = message?.data?.jobId;
 
     if (!jobId || !message?.finishedOn) {
+      return;
+    }
+
+    // Loses the event exactly as a worker killed before abandon() lands would,
+    // so A5d can prove the sweep recovers the job. Never set in production.
+    if (this.config.get('RELAY_FAULT_SKIP_ABANDON', { infer: true })) {
       return;
     }
 

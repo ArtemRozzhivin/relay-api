@@ -38,6 +38,8 @@ export const apiEnvSchema = sharedEnvSchema.extend({
 
 export const workerEnvSchema = sharedEnvSchema.extend({
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(5),
+  RELAY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1000).default(60_000),
+  RELAY_FAULT_SKIP_ABANDON: z.stringbool().default(false),
 });
 
 export type SharedEnv = z.infer<typeof sharedEnvSchema>;
