@@ -45,6 +45,12 @@ jobs:
       JWT_ACCESS_SECRET: ci-access-secret-not-used-anywhere-else
       JWT_REFRESH_SECRET: ci-refresh-secret-not-used-anywhere-else
       LOG_LEVEL: warn
+      # The dev bucket, through the relay-dev IAM user (D29). Set as repository
+      # secrets; a pull request from a fork gets none, and its run fails at boot.
+      AWS_REGION: eu-central-1
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
     steps:
       - uses: actions/checkout@v4

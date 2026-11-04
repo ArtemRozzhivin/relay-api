@@ -654,10 +654,11 @@ rows.
 
 ### Tasks
 
-- [ ] **B.1 · MinIO in compose** + `@aws-sdk/client-s3` (`forcePathStyle`), presigned `PUT` for
-  upload and short-expiry presigned `GET` for download.
+- [x] **B.1 · AWS S3** (D29) — a dev bucket and a bucket-only IAM user, `@aws-sdk/client-s3`,
+  `POST /uploads` returning a presigned **POST** for upload, and a short-expiry presigned `GET`
+  for download. MinIO, planned here, was archived in 2026.
   ```
-  _The API never streams a file body. Moving to real S3 then changes config, not code._
+  _The API never streams a file body, and S3 — not the API — enforces the upload's size._
   ```
 - [ ] **B.2 ·** `Product` **model** — `UNIQUE (userId, sku)`.
   ```

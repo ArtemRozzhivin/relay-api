@@ -342,13 +342,13 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/auth/login` | — | `200` | Access + refresh pair |
 | `POST` | `/auth/refresh` | refresh token | `200` | Rotation: presented token revoked, new pair issued |
 | `POST` | `/auth/logout` | refresh token | `204` | Idempotent — revoking an already-revoked token is a no-op |
-| `GET` | `/auth/me` | access | `200` | |
 | `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body. See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. Phase 6. See D6b |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
+| `POST` | `/uploads` | access | `200` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. See §6.3a |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
 
@@ -404,6 +404,29 @@ that is not on the row, that stops being true and a stored-response table become
 | | `delayMs` | `0`–`60000` | `0` |
 
 `maxAttempts` is on the body itself, not the payload: `1`–`20`, default `5`.
+
+### 6.3a `POST /uploads` — the upload contract (D29)
+
+A file never passes through the API. The client asks for a **signed upload slip**, sends the file
+**straight to S3** with it, and only then names the uploaded key in the job it submits.
+
+```
+POST /uploads                      (no body)
+→ 200 { "key": "uploads/<userId>/<uuid>.csv",
+        "url": "https://<bucket>.s3.<region>.amazonaws.com/",
+        "fields": { "key": "…", "Policy": "…", "X-Amz-Signature": "…", … },
+        "maxBytes": 52428800, "expiresAt": "…" }
+```
+
+- **The server mints the key**, under the caller's own prefix, so a client can neither overwrite
+  another tenant's file nor name a path an import would trust.
+- **Send it as a form:** `multipart/form-data` to `url`, every entry of `fields` first, then the
+  file as `file`, **last** — S3 ignores anything after the file. Success is S3's `204`.
+- **S3 enforces the signed policy itself**: that key, a size of 1 byte to `maxBytes` (50 MB), and
+  the 5-minute expiry. Breaking any of them is S3's answer, not ours: `403` for a changed key or
+  an expired slip, `400 EntityTooLarge` / `EntityTooSmall` for the size.
+- `200`, not `201`: nothing exists yet, and nothing on the API side records the request. An upload
+  the client never follows with a job is an orphan; the bucket's lifecycle rule removes it.
 
 ### 6.4 Validation
 
@@ -1017,6 +1040,10 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `JOB_MAX_ATTEMPTS` | int | ✓ | ✓ | Default ceiling |
 | `LOG_LEVEL` | enum | ✓ | ✓ | |
 | `CORS_ORIGINS` | csv | ✓ | — | |
+| `AWS_REGION` | str | ✓ | ✓ | The bucket's region (D29) |
+| `S3_BUCKET` | str | ✓ | ✓ | The dev bucket locally and in CI, the prod bucket when deployed |
+| `S3_ENDPOINT` | url? | ✓ | ✓ | Only for an S3-compatible emulator; unset for AWS |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | str | ✓ | ✓ | Read by the AWS SDK itself, not by the config schema, so a host with a role needs neither. Resolved at boot, so a missing key fails startup |
 
 **The two processes deliberately do not share a config surface.** The worker holding JWT secrets
 it never uses is needless blast radius. One schema, two required-sets.
@@ -1079,6 +1106,7 @@ Verified 2026-09-01 against the official NestJS, BullMQ, and Prisma documentatio
 | `@nestjs/schedule` | 12.x | Candidate host for the outbox relay tick |
 | `prisma` / `@prisma/client` | 7.x | |
 | `@prisma/adapter-pg` | 7.x | Driver adapter |
+| `@aws-sdk/client-s3`, `@aws-sdk/s3-presigned-post`, `@aws-sdk/s3-request-presigner` | 3.x | S3 client, the presigned POST for uploads, the presigned GET for downloads (D29) |
 | `zod` | 4.x | |
 | `nestjs-pino` + `pino` + `pino-http` | 5.x / 10.x / 11.x | pino 10 is required by nestjs-pino 5 |
 | `argon2` | latest | `Bun.password` does not exist on Node |
@@ -1108,6 +1136,28 @@ Recent releases changed the following. Documentation predating them is misleadin
 
 `docker compose`: `postgres:17`, `redis:7`, with healthchecks so `depends_on` waits for actual
 readiness rather than container start. App and worker are the same image with different commands.
+
+**Object storage is not in compose — it is a real S3 bucket (D29).** Once per developer, as an IAM
+admin user (never the root user):
+
+1. A bucket in the chosen region: ACLs disabled, Block Public Access on, SSE-S3, versioning off,
+   and a lifecycle rule expiring current objects after 7 days and incomplete multipart uploads
+   after 1.
+2. An IAM user for the app — no console access, no group — with one inline policy:
+
+   ```json
+   { "Version": "2012-10-17",
+     "Statement": [
+       { "Effect": "Allow",
+         "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+         "Resource": "arn:aws:s3:::<bucket>/*" },
+       { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::<bucket>" } ] }
+   ```
+
+   Objects and the bucket are separate resources: `/*` is every object, the bare ARN is the bucket
+   itself, which `ListBucket` acts on — and without which a missing object reads as `403`, not `404`.
+3. An access key for that user into `.env` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), with
+   `AWS_REGION` and `S3_BUCKET`. CI reads the same four from repository secrets.
 
 **After pulling a change that touches `prisma/`:**
 
@@ -1302,6 +1352,7 @@ so they move:
 | D25 | ~~Where does progress live and how often is it written?~~ | Phase A writes it; `GET /jobs/:id` has to answer it after a reconnect | **DECIDED** — `progress Json?` on `Job`, ownership-guarded |
 | D26 | ~~Does a re-drive resume from a checkpoint or restart from zero?~~ | `redrive()` currently clears `result` and resets `attempts` | **DECIDED** — resume from the checkpoint; `?from=start` to restart |
 | D27 | ~~A second ledger for quota, or reuse `SideEffect`?~~ | Phase B's checkpoint and Phase I's quota would otherwise invent two | **DECIDED** — reuse `SideEffect`, `effectKey = '<jobId>:quota:<batchIndex>' |
+| D29 | ~~Object storage: an emulator or real S3, and a presigned PUT or POST?~~ | B.1 needs a bucket, and MinIO's community images are gone | **DECIDED 2026-11-04** — real S3 in every environment, a bucket and a least-privilege IAM user each; presigned **POST** |
 
 **D21 — `Job.type` becomes a string, with the registry as the authority.**
 An enum makes every new job type a migration, which defeats §3.1's whole point that adding a type
@@ -1455,6 +1506,21 @@ between two bodies is decided by A1's mechanism and the check never reads before
 from before the column are `NULL` and can only be replayed: backfilling would mean reproducing
 the application's canonical JSON in SQL byte for byte.
 
+**D29 — object storage is AWS S3 everywhere, and uploads are presigned POSTs.**
+The plan named MinIO in compose as the local stand-in; its community edition was archived in 2026
+and its images are gone from Docker Hub, and LocalStack now requires an account token. So every
+environment uses real S3: a **dev bucket** (laptops and CI) and, at deployment, a **prod bucket**,
+each reachable only by its own IAM user whose policy names that bucket alone — a leaked dev key
+cannot reach prod. The dev bucket expires everything after 7 days, so tests never clean up by
+hand. What this costs is tests that need the network and credentials, accepted because what the
+upload tests prove is S3 enforcing a signed policy, which no stand-in proves; `S3_ENDPOINT` keeps
+an emulator possible by configuration alone. **POST, not PUT:** a presigned PUT carries no size
+limit, so a client could store 5 GB on a link meant for 5 MB and the API would learn only
+afterwards, having already paid for it; a presigned POST's policy carries `content-length-range`,
+which S3 enforces at the door. The cost is a `multipart/form-data` upload instead of a raw body,
+which a browser's `FormData` makes no harder. Credentials come from the SDK's default chain, so a
+host with an IAM role needs no key; they are resolved at boot so a missing one fails the deploy.
+
 **Rule this register enforces:** write in detail only what a test in the next two phases could
 falsify. Everything else is a trigger, not a design.
 
@@ -1511,6 +1577,8 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-04 | §6.2 — `GET /auth/me` removed: it was listed from the start and never built. Login already returns the user, and nothing has needed the route since. |
+| 2026-11-04 | §6.2, §6.3a, §11, §13.2, §13.4, D29 — **decided**: object storage is real AWS S3 in every environment, a bucket and a bucket-only IAM user each, and uploads are presigned POSTs so S3 enforces the size. `POST /uploads` added. MinIO, which the plan named, is archived. |
 | 2026-11-04 | §4.3, §5.2, D7, D25, §14 — the ownership token is `lease`, a counter every claim increments and nothing resets; `attempts` is only the retry budget. The token was `attempts`, which a re-drive resets, so it repeated across a job's lives. A3c registered. |
 | 2026-11-04 | §4.5 — the relay publishes row by row and skips one it cannot publish, retrying it every tick. It stopped at the first failure, and since every tick starts from the oldest unpublished row, a row that always failed would have blocked the outbox for good. Failures are logged once per tick, not once per row. |
 | 2026-11-04 | §9.2, D25 — the progress throttle keeps one write in flight and opens its window when that write settles. It opened the window on *send*, so a database slower than 500 ms had a write queued behind it every window, replayed in a burst on recovery, with `flush()` waiting for all of it. |

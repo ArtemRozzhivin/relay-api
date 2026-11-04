@@ -14,6 +14,9 @@ export const sharedEnvSchema = z.object({
   DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
   REDIS_URL: z.url({ protocol: /^rediss?$/ }),
   JOB_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
+  AWS_REGION: z.string().min(1),
+  S3_BUCKET: z.string().min(1),
+  S3_ENDPOINT: z.url().optional(),
 });
 
 export const apiEnvSchema = sharedEnvSchema.extend({
