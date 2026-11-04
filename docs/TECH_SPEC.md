@@ -164,6 +164,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `attempts` | `int` | Default `0`. Incremented by the worker when it *claims* the job |
 | `maxAttempts` | `int` | Default `5`. **DB** `CHECK (maxAttempts BETWEEN 1 AND 20)` |
 | `idempotencyKey` | `text` | See D1 |
+| `requestHash` | `text?` | SHA-256 of the canonical submit body, so a reused key with a different body is refused (D28). Internal — never in a response. `NULL` on rows from before it was stored, which can only be replayed |
 | `result` | `jsonb?` | Set on `SUCCEEDED` |
 | `error` | `jsonb?` | `{ code, message, retryable, attempt }` — set on every failed attempt, last one wins |
 | `progress` | `jsonb?` | `{ processed, total?, message? }` (D25). Written outside any status transition, under the attempt token **and** a `processed <=` predicate, so it can never move backwards. Cleared by a re-drive |
@@ -341,7 +342,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/auth/refresh` | refresh token | `200` | Rotation: presented token revoked, new pair issued |
 | `POST` | `/auth/logout` | refresh token | `204` | Idempotent — revoking an already-revoked token is a no-op |
 | `GET` | `/auth/me` | access | `200` | |
-| `POST` | `/jobs` | access | **`202`** | Persist + enqueue. See §6.3 |
+| `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body. See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. Phase 6. See D6b |
@@ -376,6 +377,12 @@ Idempotency-Key: <opaque client string, see D1>
 A replay returns `202` with **the identical job id** and `"replayed": true`. It is not a `409`:
 the client asked for the job to exist and it does. Returning an error would push retry logic back
 onto the client, which is the thing idempotency exists to remove.
+
+**A replay has to be the same request.** The body is fingerprinted — SHA-256 of its canonical
+JSON, after defaults are applied and with object keys sorted — and the fingerprint is stored on
+the row. A later request with the same key and a different fingerprint is
+`422 IDEMPOTENCY_KEY_REUSED` and changes nothing: a client that reused a key for a *different*
+charge must not be told its new charge was accepted when the old one is what exists (D28).
 
 Because the response body is derivable entirely from the existing `Job` row, **no separate
 idempotency-record table is needed** for the submit boundary. If the response ever grows a field
@@ -1227,6 +1234,7 @@ to settle it.
 | # | Question | Why it cannot wait | Section |
 |---|---|---|---|
 | D1 | ~~Idempotency key: who mints it, what scope~~ **DECIDED** — client header, per-user, no expiry | — | §7.1 |
+| D28 | ~~A reused key with a different body~~ **DECIDED 2026-11-03** — `422 IDEMPOTENCY_KEY_REUSED`; a body hash as a check, not as the key | — | §6.3 |
 | D4 | ~~Status in Postgres, Redis, or both~~ **DECIDED** — Postgres only | — | §4 |
 | D5 | ~~Persist/enqueue ordering~~ **DECIDED** — commit-then-enqueue in ph5, outbox in ph6 | — | §7.7 |
 
@@ -1243,6 +1251,9 @@ to settle it.
 | D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox |
 | D12 | Status cache in Redis | A **measured** slow `GET /jobs/:id`. Never before | — |
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
+| D14 | Cursor pagination | A list endpoint where offset pagination measurably hurts | — |
+| D15 | Job types beyond `MOCK` / `CHARGE` | A real use case | v2 |
+| D16 | Do replays bypass the rate limiter? | A client retrying with the same key gets `429` for a job already accepted | 8 |
 
 ### Forced earlier than planned by the real-job proposal
 
@@ -1406,9 +1417,20 @@ At least one filter is required — an empty body is what a client bug sends —
 counts without writing. A filter matching nothing answers `202 { redriven: 0, remaining: 0 }`:
 the caller asked for a set, and an empty set is a complete answer, unlike a cancel naming one
 job that had already finished.
-| D14 | Cursor pagination | A list endpoint where offset pagination measurably hurts | — |
-| D15 | Job types beyond `MOCK` / `CHARGE` | A real use case | v2 |
-| D16 | Do replays bypass the rate limiter? | A client retrying with the same key gets `429` for a job already accepted | 8 |
+
+**D28 — a reused key with a different body is a `422`, decided by a fingerprint.**
+D1 settled who mints the key, its scope and its lifetime, and never what a replay must match: a
+client that reused a key for a different request was answered `202 replayed` with the first job —
+told a charge of 5000 was accepted while the 1000 one is what exists. The submit now stores the
+SHA-256 of the canonical body (defaults applied, keys sorted) and, on losing the insert, compares:
+equal is a replay, different is `422 IDEMPOTENCY_KEY_REUSED` with nothing changed. `422` and not
+`409`: nothing is in the request's way; it is unprocessable as what it claims to be, a retry — the
+status the IETF `Idempotency-Key` draft assigns to this case. A hash *as a check* is not D1(b)'s
+hash *as the key*, which would merge two genuinely identical charges; here the client's key still
+decides identity. The comparison runs only after the unique index has picked the winner, so a race
+between two bodies is decided by A1's mechanism and the check never reads before it writes. Rows
+from before the column are `NULL` and can only be replayed: backfilling would mean reproducing
+the application's canonical JSON in SQL byte for byte.
 
 **Rule this register enforces:** write in detail only what a test in the next two phases could
 falsify. Everything else is a trigger, not a design.
@@ -1466,5 +1488,6 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-03 | §4.3, §6.2, §6.3, D28 — **decided**: a reused `Idempotency-Key` with a different body is `422 IDEMPOTENCY_KEY_REUSED`, checked against a stored SHA-256 of the canonical body; `requestHash` added to `Job` and kept out of responses. §16's D14–D16 rows moved back into the deferred table they had drifted out of. |
 | 2026-11-03 | D6b, D7, D8 marked decided, as the code already had them. Corrected to match the code: §7.4 (the BullMQ id is per outbox row), §9.3 (events can arrive out of order; keep the newer `updatedAt`), D11 and §6.2 (a looping bulk re-drive needs `deadLetteredTo`), D25 (`<=`, not `<`; one write per window), A12b (the fast case takes about 200 ms, not one), §4.5 (`Outbox.attempts` counts the relay's publishes only). |
 | 2026-09-01 | v0.1 — initial specification. D1, D4, D5 resolved; D6a, D6b, D7, D8 deferred with triggers (§16). |

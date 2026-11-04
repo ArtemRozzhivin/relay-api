@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { Req } from '@nestjs/common';
+import type { Job } from '../generated/prisma/client.js';
 import { JobsService } from './jobs.service.js';
 import { IdempotencyKey } from './idempotency-key.decorator.js';
 import { CurrentUser } from '../auth/decorators/current-user.decorator.js';
@@ -22,6 +23,10 @@ import {
   type ListJobsQuery,
   type SubmitJobInput,
 } from './jobs.schema.js';
+
+// The fingerprint is how the API recognises a retry (D28), not part of the job
+// a client sees, and a field in a response is a field clients come to rely on.
+const toJobView = ({ requestHash: _requestHash, ...job }: Job) => job;
 
 @Controller('jobs')
 export class JobsController {
@@ -42,7 +47,7 @@ export class JobsController {
       input,
     });
 
-    return { ...job, replayed };
+    return { ...toJobView(job), replayed };
   }
 
   @Post('retry')
@@ -57,36 +62,38 @@ export class JobsController {
 
   @Post(':id/retry')
   @HttpCode(202)
-  redrive(
+  async redrive(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id', { schema: jobIdSchema }) id: string,
     @Req() request: Request,
   ) {
-    return this.jobs.redrive(user.id, id, String(request.id));
+    return toJobView(await this.jobs.redrive(user.id, id, String(request.id)));
   }
 
   @Post(':id/cancel')
   @HttpCode(202)
-  cancel(
+  async cancel(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id', { schema: jobIdSchema }) id: string,
   ) {
-    return this.jobs.cancel(user.id, id);
+    return toJobView(await this.jobs.cancel(user.id, id));
   }
 
   @Get(':id')
-  findOne(
+  async findOne(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id', { schema: jobIdSchema }) id: string,
   ) {
-    return this.jobs.findOne(user.id, id);
+    return toJobView(await this.jobs.findOne(user.id, id));
   }
 
   @Get()
-  findMany(
+  async findMany(
     @CurrentUser() user: AuthenticatedUser,
     @Query({ schema: listJobsSchema }) query: ListJobsQuery,
   ) {
-    return this.jobs.findMany(user.id, query);
+    const page = await this.jobs.findMany(user.id, query);
+
+    return { ...page, items: page.items.map(toJobView) };
   }
 }

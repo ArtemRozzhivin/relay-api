@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
 import {
+  IdempotencyKeyReusedError,
   JobAlreadyFinishedError,
   JobNotDeadLetteredError,
   JobNotFoundError,
@@ -18,6 +19,7 @@ import type {
   SubmitJobInput,
 } from './jobs.schema.js';
 import type { ApiEnv } from '../config/env.schema.js';
+import { requestHash } from './request-hash.js';
 
 // One shape for every message the outbox carries — submit, re-drive and bulk
 // re-drive alike — so the relay and the direct path publish the same thing
@@ -77,6 +79,7 @@ export class JobsService {
   ) {}
 
   async submit({ userId, idempotencyKey, correlationId, input }: SubmitArgs) {
+    const hash = requestHash(input);
     let committed;
 
     try {
@@ -85,6 +88,7 @@ export class JobsService {
           data: {
             userId,
             idempotencyKey,
+            requestHash: hash,
             correlationId,
             type: input.type,
             payload: input.payload,
@@ -106,6 +110,14 @@ export class JobsService {
         const existing = await this.prisma.job.findUniqueOrThrow({
           where: { userId_idempotencyKey: { userId, idempotencyKey } },
         });
+
+        // Compared after losing the insert, never checked before it: the
+        // unique index already decided which request was first (A1), so this
+        // only has to say whether the loser was a retry of it. NULL is a row
+        // from before the hash was stored, which can only be replayed.
+        if (existing.requestHash !== null && existing.requestHash !== hash) {
+          throw new IdempotencyKeyReusedError();
+        }
 
         return { job: existing, replayed: true };
       }

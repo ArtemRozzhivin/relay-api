@@ -4,6 +4,7 @@ export type ErrorKind =
   | 'FORBIDDEN'
   | 'NOT_FOUND'
   | 'CONFLICT'
+  | 'UNPROCESSABLE'
   | 'INTERNAL';
 
 export abstract class AppError extends Error {
@@ -58,6 +59,20 @@ export class IdempotencyKeyRequiredError extends AppError {
 
   constructor() {
     super('The Idempotency-Key header is required');
+  }
+}
+
+// 422, not 409: the request is well-formed and nothing is in the way of it —
+// it is unprocessable as what it claims to be, a retry, because the body
+// differs from the one the key was first used with (D28).
+export class IdempotencyKeyReusedError extends AppError {
+  readonly kind = 'UNPROCESSABLE' as const;
+  readonly code = 'IDEMPOTENCY_KEY_REUSED';
+
+  constructor() {
+    super(
+      'This Idempotency-Key was already used with a different request body',
+    );
   }
 }
 

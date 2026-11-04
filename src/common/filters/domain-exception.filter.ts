@@ -15,6 +15,7 @@ const STATUS_BY_KIND: Record<ErrorKind, HttpStatus> = {
   FORBIDDEN: HttpStatus.FORBIDDEN,
   NOT_FOUND: HttpStatus.NOT_FOUND,
   CONFLICT: HttpStatus.CONFLICT,
+  UNPROCESSABLE: HttpStatus.UNPROCESSABLE_ENTITY,
   INTERNAL: HttpStatus.INTERNAL_SERVER_ERROR,
 };
 

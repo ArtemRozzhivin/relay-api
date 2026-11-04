@@ -108,6 +108,102 @@ describe('the job API contract', () => {
     expect(status).toBe(400);
   });
 
+  describe('a reused Idempotency-Key', () => {
+    const original = {
+      type: 'MOCK',
+      payload: { durationMs: 10, failureRate: 0 },
+    };
+    const different = {
+      ...original,
+      payload: { durationMs: 20, failureRate: 0 },
+    };
+
+    const submitAs = (token: string, key: string, body: object) =>
+      request(server)
+        .post('/jobs')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', key)
+        .send(body);
+
+    const listAs = async (token: string) =>
+      (
+        await request(server)
+          .get('/jobs')
+          .set('Authorization', `Bearer ${token}`)
+          .expect(200)
+      ).body.data;
+
+    it('replays a retry of the same body, whatever its key order or defaults', async () => {
+      const token = await register('reuse-same');
+      const key = `reuse-same-${Math.random()}`;
+
+      const first = await submitAs(token, key, original);
+      const retry = await submitAs(token, key, {
+        maxAttempts: 5,
+        payload: { failureRate: 0, durationMs: 10 },
+        type: 'MOCK',
+      });
+
+      expect(first.status).toBe(202);
+      expect(retry.status).toBe(202);
+      expect(retry.body.data).toMatchObject({
+        id: first.body.data.id,
+        replayed: true,
+      });
+      expect(retry.body.data).not.toHaveProperty('requestHash');
+    });
+
+    it('refuses the key with a different body and leaves the first job untouched', async () => {
+      const token = await register('reuse-diff');
+      const key = `reuse-diff-${Math.random()}`;
+
+      const first = await submitAs(token, key, original);
+      const reused = await submitAs(token, key, different);
+
+      expect(reused.status).toBe(422);
+      expect(reused.body.error.code).toBe('IDEMPOTENCY_KEY_REUSED');
+
+      const { total, items } = await listAs(token);
+      expect(total).toBe(1);
+      expect(items[0]).toMatchObject({
+        id: first.body.data.id,
+        payload: original.payload,
+      });
+      expect(items[0]).not.toHaveProperty('requestHash');
+    });
+
+    // The race A1 is about, with two bodies instead of one: the unique index
+    // picks the winner, and every copy of the other body must be refused
+    // whichever won.
+    it('lets one of two racing bodies win and refuses every copy of the other', async () => {
+      const token = await register('reuse-race');
+      const key = `reuse-race-${Math.random()}`;
+      const bodies = [
+        original,
+        different,
+        original,
+        different,
+        original,
+        different,
+      ];
+
+      const responses = await Promise.all(
+        bodies.map((body) => submitAs(token, key, body)),
+      );
+
+      const { total, items } = await listAs(token);
+      expect(total).toBe(1);
+
+      const winner = items[0].payload.durationMs;
+
+      bodies.forEach((body, index) => {
+        expect(responses[index].status).toBe(
+          body.payload.durationMs === winner ? 202 : 422,
+        );
+      });
+    });
+  });
+
   it("hides another tenant's job behind a 404", async () => {
     const [owner, stranger] = await Promise.all([
       register('owner'),

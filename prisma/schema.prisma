@@ -56,6 +56,9 @@ model Job {
   attempts        Int       @default(0)
   maxAttempts     Int       @default(5)
   idempotencyKey  String
+  /// SHA-256 of the canonical submit body: a reused key with a different body is
+  /// a 422, not a replay (D28). NULL on rows from before it was stored.
+  requestHash     String?
   result          Json?
   error           Json?
   progress        Json?
