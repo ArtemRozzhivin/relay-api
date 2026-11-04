@@ -268,6 +268,30 @@ describe('JobContextFactory', () => {
       expect(harness.counts()).toEqual([1, 2]);
     });
 
+    it('never queues writes behind a database slower than the window', async () => {
+      const harness = build(async (jobId, attempt, progress) => {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+
+        return accepts(jobId, attempt, progress);
+      });
+
+      // Six seconds of reports, one per 100ms, against writes that take two
+      // seconds each: three or four writes at most, never one per window
+      // queued behind the last and replayed in a burst once the database
+      // recovers.
+      for (let processed = 1; processed <= 60; processed += 1) {
+        void harness.context.reportProgress({ processed });
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      const flushed = harness.context.flush();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushed;
+
+      expect(harness.counts().length).toBeLessThanOrEqual(5);
+      expect(harness.counts().at(-1)).toBe(60);
+    });
+
     it('keeps writes in order even when one is slow', async () => {
       let release = () => {};
       const gate = new Promise<void>((resolve) => {
@@ -285,8 +309,9 @@ describe('JobContextFactory', () => {
       void harness.context.reportProgress({ processed: 1 });
       void harness.context.reportProgress({ processed: 2 });
 
-      // The window closes while the first write is still in flight, so the
-      // second is queued behind it on the chain rather than racing it.
+      // The window would have closed while the first write was still in
+      // flight; the second is held until that write settles rather than
+      // racing it.
       await vi.advanceTimersByTimeAsync(WINDOW_MS);
       release();
       await harness.context.flush();

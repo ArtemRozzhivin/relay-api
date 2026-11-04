@@ -9,11 +9,12 @@ import { readProgress, type JobProgress } from './job-progress.js';
 // that publishes the total before any work lands — is not mistaken for a repeat.
 const NOTHING_REPORTED = -1;
 
-// At most one write and one event per job per window. A handler chooses how
-// often it reports, and reporting per row is both cheaper than the work and
-// useless to a client: a bar repaints 60 times a second at best and is read ten
-// times. 500ms keeps a bar visibly alive at 2Hz while collapsing a tight loop
-// into almost nothing. The final report is exempt, which is what flush() is for.
+// At most one write and one event per job per window, and the window opens when
+// a write settles. A handler chooses how often it reports, and reporting per row
+// is both cheaper than the work and useless to a client: a bar repaints 60 times
+// a second at best and is read ten times. 500ms keeps a bar visibly alive at 2Hz
+// while collapsing a tight loop into almost nothing. The final report is exempt,
+// which is what flush() is for.
 const REPORT_WINDOW_MS = 500;
 
 interface RunningJob {
@@ -36,10 +37,18 @@ export interface ManagedJobContext extends JobContext {
 }
 
 class RunningJobContext implements ManagedJobContext {
-  // Writes are chained, not fired: the SQL predicate rejects a *stale* attempt
-  // but cannot order two writes from the live one, so a handler reporting batch
-  // 4 after batch 5 would otherwise land them in either order.
+  // The write in flight, if any. Never more than one: the SQL predicate rejects
+  // a *stale* attempt but cannot order two writes from the live one, and a
+  // second write sent while the first is slow is how a backlog starts — each
+  // window would queue another, and a recovering database would replay them
+  // all as a burst of stale values.
   private pending: Promise<void> = Promise.resolve();
+
+  private inFlight = false;
+
+  // Set while flush() empties the context, so a write settling meanwhile does
+  // not open a window nobody will close.
+  private draining = false;
 
   // The newest report the window is holding back. Later reports replace it
   // rather than queueing: nobody wants the bar to replay a backlog.
@@ -73,7 +82,7 @@ class RunningJobContext implements ManagedJobContext {
 
       const merged = { ...this.carried, processed: progress.processed };
 
-      if (this.window) {
+      if (this.inFlight || this.window) {
         this.held = merged;
       } else {
         this.send(merged);
@@ -91,33 +100,53 @@ class RunningJobContext implements ManagedJobContext {
     this.logger.log(`${this.prefix} ${message}`);
   }
 
-  flush() {
-    this.closeWindow();
+  async flush() {
+    this.draining = true;
 
-    if (this.held) {
-      const last = this.held;
-
-      this.held = undefined;
-      this.send(last);
-      // Sending opened a window the owner will never close, and a timer left
-      // behind would hold the process open past shutdown.
+    try {
       this.closeWindow();
-    }
 
-    return this.pending;
+      // A loop, not one send: a report can arrive while the last write is in
+      // flight, and nothing would send it once this returns.
+      for (;;) {
+        await this.pending;
+
+        if (!this.held) {
+          return;
+        }
+
+        const last = this.held;
+
+        this.held = undefined;
+        this.send(last);
+      }
+    } finally {
+      this.draining = false;
+    }
   }
 
   private send(progress: JobProgress) {
     const reclaim = this.reclaim;
 
     this.reclaim = false;
-    this.pending = this.pending.then(() => this.write(progress, reclaim));
+    this.inFlight = true;
 
+    // write() never rejects, so the window is sure to open.
+    this.pending = this.write(progress, reclaim).finally(() => {
+      this.inFlight = false;
+
+      if (!this.draining) {
+        this.openWindow();
+      }
+    });
+  }
+
+  private openWindow() {
     this.window = setTimeout(() => {
       this.window = undefined;
 
-      // Whatever arrived during the window goes now, which both honours the
-      // "always the last one" half of the contract and opens the next window.
+      // Whatever arrived since the last write goes now, which both honours the
+      // "always the last one" half of the contract and starts the next round.
       if (this.held) {
         const next = this.held;
 

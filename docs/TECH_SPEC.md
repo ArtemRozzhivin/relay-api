@@ -863,7 +863,10 @@ handler chooses how often it reports, and reporting per row would otherwise mean
 socket frame and one repaint per row — for a bar that repaints 60 times a second at best. Reports
 arriving inside a window replace each other rather than queueing, because nobody wants a bar to
 replay a backlog. The same window governs the **database write**, since the two are one decision
-and splitting them would give a client two different staleness windows to reason about.
+and splitting them would give a client two different staleness windows to reason about. Only one
+write is ever in flight, and the window opens when it **settles**, not when it is sent: a database
+slower than the window then slows the writes down, instead of having one queued behind the slow
+write every window and replayed as a burst of stale values once it recovers.
 
 The event is built from the row the guarded write returned, never from what the handler reported,
 so a progress event cannot describe a state the database does not hold (§9.2a). A refused write
@@ -1356,7 +1359,7 @@ also writes the parent's outbox row. Parent-runs-when-children-finish becomes a 
 on a counter — the idiom the whole project already uses — and the child-failure policy §3.5 asks
 about becomes ours to state rather than a BullMQ flag to look up.
 
-**D25 — `progress Json?` on `Job`, throttled to one write per 500 ms, guarded by the ownership token.**
+**D25 — `progress Json?` on `Job`, one write in flight and 500 ms between them, guarded by the ownership token.**
 Not Redis-only: D4 makes Postgres authoritative, and `GET /jobs/:id` has to answer "how far along"
 on reconnect, which is A7's shape. Not a separate table: progress is one current value, not a
 history, and a row per update is write amplification nobody reads back.
@@ -1503,6 +1506,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-04 | §9.2, D25 — the progress throttle keeps one write in flight and opens its window when that write settles. It opened the window on *send*, so a database slower than 500 ms had a write queued behind it every window, replayed in a burst on recovery, with `flush()` waiting for all of it. |
 | 2026-11-04 | §7.6, D7, §11, §14 — a sweep in every worker finishes a `RUNNING` job whose queue entry is gone or long finished: the backstop for the `failed` event, the one at-most-once step. A5d registered; `RELAY_SWEEP_INTERVAL_MS` and `RELAY_FAULT_SKIP_ABANDON` added, and `RELAY_FAULT_AFTER_COMMIT` listed. |
 | 2026-11-03 | §4.3, §6.2, §6.3, D28 — **decided**: a reused `Idempotency-Key` with a different body is `422 IDEMPOTENCY_KEY_REUSED`, checked against a stored SHA-256 of the canonical body; `requestHash` added to `Job` and kept out of responses. §16's D14–D16 rows moved back into the deferred table they had drifted out of. |
 | 2026-11-03 | D6b, D7, D8 marked decided, as the code already had them. Corrected to match the code: §7.4 (the BullMQ id is per outbox row), §9.3 (events can arrive out of order; keep the newer `updatedAt`), D11 and §6.2 (a looping bulk re-drive needs `deadLetteredTo`), D25 (`<=`, not `<`; one write per window), A12b (the fast case takes about 200 ms, not one), §4.5 (`Outbox.attempts` counts the relay's publishes only). |

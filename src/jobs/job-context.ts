@@ -27,9 +27,9 @@ export interface JobContext {
    * Never rejects and never fails a job: progress is presentational, and a
    * handler is free to report without awaiting.
    *
-   * Reports are **throttled**: at most one reaches the database and the socket
-   * per job every 500ms, and a report arriving inside that window replaces
-   * whatever was waiting. So awaiting this does *not* mean "my value is
+   * Reports are **throttled**: one write at a time reaches the database and the
+   * socket, the next no sooner than 500ms after it finished, and a report
+   * arriving in between replaces whatever was waiting. So awaiting this does *not* mean "my value is
    * stored" — an intermediate value may be coalesced away. What is guaranteed
    * is that the **last** value reported lands before the job finishes, which is
    * why reporting per row is safe and needs no throttling by the handler.
