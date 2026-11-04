@@ -14,11 +14,14 @@ const WINDOW_MS = 500;
 const running: {
   jobId: string;
   attempt: number;
+  lease: number;
   correlationId: string;
   progress: Prisma.JsonValue | null;
 } = {
   jobId: 'a-job',
   attempt: 2,
+  // Deliberately not the attempt, so a write carrying the wrong one shows.
+  lease: 7,
   correlationId: 'req-1',
   progress: null,
 };
@@ -92,17 +95,17 @@ describe('JobContextFactory', () => {
   });
 
   describe('the guarded write', () => {
-    it('carries the attempt that claimed the job', async () => {
+    it('carries the lease the claim handed out, not the attempt', async () => {
       const seen: number[] = [];
-      const harness = build(async (_jobId, attempt) => {
-        seen.push(attempt);
+      const harness = build(async (_jobId, lease) => {
+        seen.push(lease);
 
-        return accepts(_jobId, attempt, { processed: 0 });
+        return accepts(_jobId, lease, { processed: 0 });
       });
 
       await report(harness, { processed: 1 });
 
-      expect(seen).toEqual([2]);
+      expect(seen).toEqual([7]);
     });
 
     it('drops a report that would move progress backwards', async () => {

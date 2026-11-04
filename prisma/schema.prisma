@@ -54,6 +54,9 @@ model Job {
   payload         Json
   status          JobStatus @default(QUEUED)
   attempts        Int       @default(0)
+  /// The ownership token: every claim increments it and nothing resets it, unlike
+  /// `attempts`, which a re-drive resets — so no two deliveries ever share one (D7).
+  lease           Int       @default(0)
   maxAttempts     Int       @default(5)
   idempotencyKey  String
   /// SHA-256 of the canonical submit body: a reused key with a different body is

@@ -24,6 +24,8 @@ describe('a progress write', () => {
         payload: {},
         status: 'RUNNING',
         attempts,
+        // A row built as attempt N of its first life has had N claims.
+        lease: attempts,
         idempotencyKey: `progress-${Math.random()}`,
         correlationId: 'test',
         ...(progress === null ? {} : { progress }),

@@ -20,6 +20,9 @@ const REPORT_WINDOW_MS = 500;
 interface RunningJob {
   jobId: string;
   attempt: number;
+
+  /** The ownership token claim() handed this delivery; every write carries it. */
+  lease: number;
   correlationId: string;
 
   /** What the row already says, so a retry neither re-reports nor erases it. */
@@ -59,6 +62,7 @@ class RunningJobContext implements ManagedJobContext {
   constructor(
     readonly jobId: string,
     readonly attempt: number,
+    private readonly lease: number,
     private readonly correlationId: string,
     // The highest count accepted so far, and the last `total`/`message` seen —
     // both seeded from the claimed row. The seed spares the database the writes
@@ -93,7 +97,7 @@ class RunningJobContext implements ManagedJobContext {
   }
 
   async shouldStop() {
-    return !(await this.transitions.isWanted(this.jobId, this.attempt));
+    return !(await this.transitions.isWanted(this.jobId, this.lease));
   }
 
   log(message: string) {
@@ -174,7 +178,7 @@ class RunningJobContext implements ManagedJobContext {
     try {
       const written = await this.transitions.reportProgress(
         this.jobId,
-        this.attempt,
+        this.lease,
         progress,
         { reclaim },
       );
@@ -220,6 +224,7 @@ export class JobContextFactory {
   create({
     jobId,
     attempt,
+    lease,
     correlationId,
     progress,
   }: RunningJob): ManagedJobContext {
@@ -228,6 +233,7 @@ export class JobContextFactory {
     return new RunningJobContext(
       jobId,
       attempt,
+      lease,
       correlationId,
       stored.processed ?? NOTHING_REPORTED,
       stored,

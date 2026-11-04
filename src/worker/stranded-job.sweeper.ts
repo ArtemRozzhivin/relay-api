@@ -25,7 +25,7 @@ const STRANDED_AFTER_MS = 30_000;
 /** A `RUNNING` row, and the outbox row whose queue entry delivered it. */
 export interface SweepCandidate {
   id: string;
-  startedAt: Date | null;
+  lease: number;
   outboxId: bigint;
 }
 
@@ -98,23 +98,20 @@ export class StrandedJobSweeper
         ...(cursor === undefined ? {} : { cursor: { id: cursor }, skip: 1 }),
         select: {
           id: true,
-          startedAt: true,
+          lease: true,
           // The newest row is the delivery of this life: a re-drive is a new
           // row and so a new queue entry (§7.5a).
           outbox: { orderBy: { id: 'desc' }, take: 1, select: { id: true } },
         },
       });
 
-      for (const { id, startedAt, outbox } of page) {
+      for (const { id, lease, outbox } of page) {
         const [latest] = outbox;
 
         // Every delivery has an outbox row; without one there is no entry to
         // ask about, and guessing would finish a job someone may hold.
         if (latest) {
-          await this.finishIfStranded(
-            { id, startedAt, outboxId: latest.id },
-            now,
-          );
+          await this.finishIfStranded({ id, lease, outboxId: latest.id }, now);
         }
       }
 
@@ -153,7 +150,7 @@ export class StrandedJobSweeper
 
     const abandoned = await this.transitions.abandonStranded(
       job.id,
-      job.startedAt,
+      job.lease,
       {
         code: 'DELIVERY_ABANDONED' satisfies DeadLetterCode,
         message: `The queue no longer delivers this job (its entry is ${found})`,

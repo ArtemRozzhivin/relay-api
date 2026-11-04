@@ -55,7 +55,11 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       return;
     }
 
+    // Two numbers, two jobs: `attempt` counts against the retry budget and is
+    // what logs and errors show; `lease` is the ownership token every write
+    // carries. A re-drive resets the first and never the second.
     const attempt = claimed.attempts;
+    const lease = claimed.lease;
 
     await this.events.jobUpdated(claimed);
 
@@ -66,6 +70,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     const context = this.contexts.create({
       jobId,
       attempt,
+      lease,
       correlationId,
       progress: claimed.progress,
     });
@@ -79,7 +84,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       // showing its second-to-last batch.
       await context.flush();
 
-      const succeeded = await this.transitions.succeed(jobId, attempt, result);
+      const succeeded = await this.transitions.succeed(jobId, lease, result);
 
       if (succeeded) {
         await this.events.jobUpdated(succeeded);
@@ -96,7 +101,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       await context.flush();
 
       if (cause instanceof JobCancelledError) {
-        const stopped = await this.transitions.cancel(jobId, attempt);
+        const stopped = await this.transitions.cancel(jobId, lease);
 
         if (stopped) {
           await this.events.jobUpdated(stopped);
@@ -125,7 +130,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       const isExhausted = attempt >= claimed.maxAttempts;
 
       if (isTerminal || isExhausted) {
-        const dead = await this.transitions.deadLetter(jobId, attempt, {
+        const dead = await this.transitions.deadLetter(jobId, lease, {
           code: (isTerminal
             ? 'TERMINAL_FAILURE'
             : 'ATTEMPTS_EXHAUSTED') satisfies DeadLetterCode,
@@ -148,7 +153,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         throw new UnrecoverableError(reason);
       }
 
-      const requeued = await this.transitions.requeueForRetry(jobId, attempt, {
+      const requeued = await this.transitions.requeueForRetry(jobId, lease, {
         code: 'ATTEMPT_FAILED',
         message: reason,
         attempt,

@@ -29,6 +29,7 @@ Your job is to find the places where that invariant, or the security of the syst
   - `unique (effectKey)` on `SideEffect` — duplicate side effects across redeliveries
   - the row count from the conditional `WHERE` — illegal or concurrent transitions
   - an `Outbox` row written **inside the same transaction** as the job — the crash-between-commit-and-enqueue gap
+- Every write a worker makes on a job it claimed carries **`lease = <claimed>`**, the ownership token. `attempts` is only the retry budget and a re-drive resets it, so a guard written as `attempts = <n>` re-opens the hole A3c closed: a worker from a job's previous life matching its next one.
 - `effectKey` must be **deterministic across attempts** (`${jobId}:charge`). Anything that varies per attempt — `attempts`, a timestamp, a uuid — re-arms the duplicate it was meant to prevent.
 - Retry/terminal policy lives in the processor: a `TerminalJobError` or BullMQ `UnrecoverableError` dead-letters immediately; otherwise retry until `attempts >= maxAttempts`, then dead-letter. Throwing `UnrecoverableError` tells BullMQ to stop redelivering.
 - Auth: JWT access/refresh with separate secrets, argon2id hashes. Every job route is scoped to the caller. 404 is returned before 403 so a wrong-owner probe cannot confirm that an id exists.

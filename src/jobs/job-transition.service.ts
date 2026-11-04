@@ -21,6 +21,9 @@ const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
 // drift: a job re-driven one way must look exactly like one re-driven the other.
 const REDRIVE_RESET = {
   status: 'QUEUED',
+  // A fresh retry budget. `lease` is deliberately left alone: it is the
+  // ownership token, and resetting it would hand the next claim a number a
+  // worker from the previous life may still hold.
   attempts: 0,
   error: Prisma.DbNull,
   result: Prisma.DbNull,
@@ -69,14 +72,16 @@ export class JobTransitionService {
     return this.move(jobId, NOT_FINISHED, {
       status: 'RUNNING',
       attempts: { increment: 1 },
+      lease: { increment: 1 },
       startedAt: new Date(),
     });
   }
 
-  // `attempt` is the ownership token: claim() handed this worker that number, and
-  // any later claim has moved it on. A worker whose attempt is stale lost the job
-  // while it was still running, and must not write over whoever holds it now.
-  succeed(jobId: string, attempt: number, result: Prisma.InputJsonValue) {
+  // `lease` is the ownership token: claim() handed this worker that number, and
+  // any later claim has moved it on — in this life or a re-driven one, since
+  // nothing resets it. A worker whose lease is stale lost the job while it was
+  // still running, and must not write over whoever holds it now.
+  succeed(jobId: string, lease: number, result: Prisma.InputJsonValue) {
     return this.move(
       jobId,
       NOT_FINISHED,
@@ -86,35 +91,34 @@ export class JobTransitionService {
         error: Prisma.DbNull,
         finishedAt: new Date(),
       },
-      { where: { attempts: attempt } },
+      { where: { lease } },
     );
   }
 
-  requeueForRetry(
-    jobId: string,
-    attempt: number,
-    error: Prisma.InputJsonValue,
-  ) {
+  requeueForRetry(jobId: string, lease: number, error: Prisma.InputJsonValue) {
     return this.move(
       jobId,
       ['RUNNING'],
       { status: 'QUEUED', error },
-      { where: { attempts: attempt } },
+      { where: { lease } },
     );
   }
 
-  deadLetter(jobId: string, attempt: number, error: Prisma.InputJsonValue) {
+  deadLetter(jobId: string, lease: number, error: Prisma.InputJsonValue) {
     return this.move(
       jobId,
       NOT_FINISHED,
       { status: 'DEAD_LETTERED', error, finishedAt: new Date() },
-      { where: { attempts: attempt } },
+      { where: { lease } },
     );
   }
 
   // The queue abandoned the job outside any attempt we own, so there is no token
   // to match on. `attempts > 0` stands in for it: a re-drive resets the counter
-  // to 0, so this cannot overwrite a job an operator has just re-driven.
+  // to 0, so this cannot overwrite a job an operator has just re-driven. It
+  // could overwrite one a worker has also claimed since — which needs a
+  // re-drive and a claim to land between the queue failing the job and this
+  // write, a window of milliseconds.
   abandon(jobId: string, error: Prisma.InputJsonValue) {
     return this.move(
       jobId,
@@ -125,18 +129,14 @@ export class JobTransitionService {
   }
 
   // The sweep found a RUNNING row whose queue entry is finished or gone (§7.6).
-  // `startedAt` pins the delivery it inspected: claim() rewrites it, so a job
-  // claimed again since the sweep read it is not finished on stale evidence.
-  abandonStranded(
-    jobId: string,
-    startedAt: Date | null,
-    error: Prisma.InputJsonValue,
-  ) {
+  // The lease pins the delivery it inspected, so a job claimed again since the
+  // sweep read it is not finished on stale evidence.
+  abandonStranded(jobId: string, lease: number, error: Prisma.InputJsonValue) {
     return this.move(
       jobId,
       ['RUNNING'],
       { status: 'DEAD_LETTERED', error, finishedAt: new Date() },
-      { where: { startedAt } },
+      { where: { lease } },
     );
   }
 
@@ -157,7 +157,7 @@ export class JobTransitionService {
    */
   reportProgress(
     jobId: string,
-    attempt: number,
+    lease: number,
     progress: JobProgress,
     { reclaim = false }: { reclaim?: boolean } = {},
   ) {
@@ -180,7 +180,7 @@ export class JobTransitionService {
       { progress: toStoredProgress(progress) },
       {
         where: {
-          attempts: attempt,
+          lease,
           ...(reclaim ? {} : monotonic),
         },
       },
@@ -235,12 +235,12 @@ export class JobTransitionService {
    * stopped. Requires the flag, so a handler that stops without being asked
    * cannot turn a job into `CANCELLED` that its owner never cancelled.
    */
-  cancel(jobId: string, attempt: number) {
+  cancel(jobId: string, lease: number) {
     return this.move(
       jobId,
       ['RUNNING'],
       { status: 'CANCELLED', finishedAt: new Date() },
-      { where: { attempts: attempt, cancelRequested: true } },
+      { where: { lease, cancelRequested: true } },
     );
   }
 
@@ -249,12 +249,12 @@ export class JobTransitionService {
    * has asked it to stop. A read of the same predicate its next write will
    * carry, kept here so the predicate has one home.
    */
-  async isWanted(jobId: string, attempt: number) {
+  async isWanted(jobId: string, lease: number) {
     const job = await this.prisma.job.findFirst({
       where: {
         id: jobId,
         status: 'RUNNING',
-        attempts: attempt,
+        lease,
         cancelRequested: false,
       },
       select: { id: true },

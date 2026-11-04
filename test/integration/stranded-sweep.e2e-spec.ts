@@ -41,6 +41,7 @@ describe('the stranded-job sweep', () => {
         payload: {},
         status: 'RUNNING',
         attempts: 1,
+        lease: 1,
         startedAt: new Date(),
         idempotencyKey: `sweep-${randomUUID()}`,
         correlationId: 'sweep',
@@ -51,7 +52,7 @@ describe('the stranded-job sweep', () => {
       include: { outbox: true },
     });
 
-    return { id: job.id, startedAt: job.startedAt, outboxId: job.outbox[0].id };
+    return { id: job.id, lease: job.lease, outboxId: job.outbox[0].id };
   };
 
   const enqueue = (job: SweepCandidate, options: { delay?: number } = {}) =>
@@ -184,7 +185,7 @@ describe('the stranded-job sweep', () => {
 
     await prisma.job.update({
       where: { id: job.id },
-      data: { startedAt: new Date(Date.now() + 1000) },
+      data: { lease: { increment: 1 } },
     });
 
     expect(await sweeper.finishIfStranded(job)).toBeNull();

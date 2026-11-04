@@ -161,13 +161,14 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
 | `payload` | `jsonb` | Validated per-type at the edge (§6.4) |
 | `status` | `JobStatus` enum | See §5 |
-| `attempts` | `int` | Default `0`. Incremented by the worker when it *claims* the job |
+| `attempts` | `int` | Default `0`. Incremented by the worker when it *claims* the job. The retry budget, reset by a re-drive — so **not** the ownership token |
+| `lease` | `int` | Default `0`. The ownership token: every claim increments it and nothing resets it, so no two deliveries — in one life or across a re-drive — ever share one (D7). Every write a worker makes on a job it claimed carries `lease = <claimed>`. A counter, not a time: it fences a stale writer, it does not expire. Internal — never in a response |
 | `maxAttempts` | `int` | Default `5`. **DB** `CHECK (maxAttempts BETWEEN 1 AND 20)` |
 | `idempotencyKey` | `text` | See D1 |
 | `requestHash` | `text?` | SHA-256 of the canonical submit body, so a reused key with a different body is refused (D28). Internal — never in a response. `NULL` on rows from before it was stored, which can only be replayed |
 | `result` | `jsonb?` | Set on `SUCCEEDED` |
 | `error` | `jsonb?` | `{ code, message, retryable, attempt }` — set on every failed attempt, last one wins |
-| `progress` | `jsonb?` | `{ processed, total?, message? }` (D25). Written outside any status transition, under the attempt token **and** a `processed <=` predicate, so it can never move backwards. Cleared by a re-drive |
+| `progress` | `jsonb?` | `{ processed, total?, message? }` (D25). Written outside any status transition, under the ownership token (`lease`) **and** a `processed <=` predicate, so it can never move backwards. Cleared by a re-drive |
 | `cancelRequested` | `boolean` | Default `false`. The owner's request; `CANCELLED` is the worker's answer (D22). Set only while the job is unfinished, so a cancel of a finished job leaves no trace. Cleared by a re-drive |
 | `correlationId` | `text` | The submitting request's id. Carried onto the queue so worker logs join API logs (§12.1) |
 | `createdAt` | `timestamptz(6)` | |
@@ -281,15 +282,15 @@ to guard. Revisit if the status stream turns out to be unreadable without it (§
 | From | To | Actor | Guard (the `WHERE` clause is the truth) |
 |---|---|---|---|
 | — | `QUEUED` | API | `INSERT`; unique violation on `(userId, idempotencyKey)` = replay |
-| `QUEUED` | `RUNNING` | Worker | `WHERE id = ? AND status = 'QUEUED'`, sets `attempts = attempts + 1`, `startedAt` |
+| `QUEUED` | `RUNNING` | Worker | `WHERE id = ? AND status = 'QUEUED'`, sets `attempts = attempts + 1`, `lease = lease + 1`, `startedAt` |
 | `RUNNING` | `RUNNING` | Worker | **See D7** — this is the redelivery-after-stall case |
 | `RUNNING` | `SUCCEEDED` | Worker | `WHERE id = ? AND status = 'RUNNING'` |
 | `RUNNING` | `QUEUED` | Worker | `WHERE id = ? AND status = 'RUNNING' AND attempts < maxAttempts` |
 | `RUNNING` | `DEAD_LETTERED` | Worker | `WHERE id = ? AND status = 'RUNNING'` and (attempts exhausted OR terminal error) |
-| `DEAD_LETTERED` | `QUEUED` | API (re-drive) | `WHERE id = ? AND status = 'DEAD_LETTERED'`, resets `attempts = 0` and `cancelRequested = false` |
+| `DEAD_LETTERED` | `QUEUED` | API (re-drive) | `WHERE id = ? AND status = 'DEAD_LETTERED'`, resets `attempts = 0` and `cancelRequested = false` — never `lease` |
 | `QUEUED` | `CANCELLED` | API (cancel) | `WHERE id = ? AND status = 'QUEUED' AND cancelRequested` — nobody is running it, so the API may finish it |
 | `QUEUED`, `RUNNING` | `CANCELLED` | Worker, **before** claiming | `WHERE id = ? AND status IN ('QUEUED','RUNNING') AND cancelRequested` — a retry or a redelivery that arrives after the request runs no handler |
-| `RUNNING` | `CANCELLED` | Worker, after the handler stopped | `WHERE id = ? AND status = 'RUNNING' AND attempts = ? AND cancelRequested` — the handler threw `JobCancelledError` at a boundary |
+| `RUNNING` | `CANCELLED` | Worker, after the handler stopped | `WHERE id = ? AND status = 'RUNNING' AND lease = ? AND cancelRequested` — the handler threw `JobCancelledError` at a boundary |
 
 **There is no edge from `RUNNING` to `CANCELLED` for the API.** A running handler may be mid-effect, and a row that said `CANCELLED` about a charge that went through anyway would be a lie. The API sets `cancelRequested` and the worker decides.
 
@@ -768,9 +769,12 @@ not apply here.
 > (c)'s deny-list would have let a worker claim and run a cancelled job. A dead worker's row is
 > reconciled by BullMQ's stalled redelivery, whose `claim()` takes the `RUNNING` row over; a job
 > past `maxStalledCount` is finalised from the `failed` event, and a sweep finishes the one that
-> event loses (§7.6). `Job.attempts` is
-> authoritative for policy and is the ownership token (§7.3); `attemptsMade` counts only
-> failures, so it never reaches the budget first, and is observability.
+> event loses (§7.6). `Job.attempts` is authoritative for policy; `attemptsMade` counts only
+> failures, so it never reaches the budget first, and is observability. The ownership token is a
+> second counter, `Job.lease`, which every claim increments and nothing resets. Until 2026-11-04 the
+> token was `attempts` itself — and a re-drive's reset made it repeat, so a worker frozen in a
+> job's previous life matched the first claim of its next one and its writes landed (A3c). Two
+> counters, two jobs.
 
 > **DECISION — D6b · What is the dead-letter path, physically?**
 >
@@ -1135,6 +1139,7 @@ cases.
 | **A2** | **No lost work.** Submit N jobs, N distinct keys | After drain: terminal jobs **= N**, and `SELECT count(*) FROM "Job" WHERE status IN ('QUEUED','RUNNING')` **= 0** | 5 |
 | **A3** | **Crash mid-job — the headline test.** Submit N; `SIGKILL` the worker while jobs are `RUNNING`; restart | Terminal jobs **= N** *and* `SELECT count(*) FROM "SideEffect"` **= N** — not N + in-flight. **Fails if §7.1's effect guard was skipped** | 6 |
 | **A3b** | **A stale worker must not write over the live one.** Freeze a worker mid-handler, let the stalled checker hand its jobs to a second worker, then thaw the first | Every job terminal and `SELECT count(*) FROM "Job" WHERE status NOT IN ('SUCCEEDED','DEAD_LETTERED')` **= 0**. **Inconclusive unless the log shows refused stale writes** — otherwise the interleaving never happened | 6 |
+| **A3c** | **A worker from a job's previous life must not write over its next.** Freeze a worker holding a job's first claim; let the job be abandoned, re-driven and claimed again — as attempt 1, since a re-drive resets the budget — then thaw the first | The frozen worker's finish is **refused** (its log says it no longer owns the job) while the new life is still `RUNNING`; the job ends `SUCCEEDED` with `attempts = 1` and `lease = 3`. Fails if the token is a counter a re-drive resets | 6 |
 | **A5b** | **A job the queue abandons still terminates.** Stall a job past `maxStalledCount` so `process()` is never called again | `status = 'DEAD_LETTERED'` with `error->>'code' = 'DELIVERY_ABANDONED'`, exactly 2 deliveries against a budget of 5, and a re-drive that is *observed to be delivered* — a `202` alone is not evidence (§7.5a) | 6 |
 | **A5c** | **A filtered bulk re-drive revives exactly the matching dead letters.** Dead-letter jobs under two error codes; re-drive one code with `limit` below the match count | Calls return `{ redriven, remaining }` until `remaining = 0`; every match ends `SUCCEEDED` with `attempts = 1`, its outbox row published **by the relay** (`Outbox.attempts = 1`); every non-match is untouched and has no outbox row | PA |
 | **A5d** | **An abandonment the `failed` event loses is still finalised.** A5b's two stalls, with the worker that hears the `failed` event dropping it | `status = 'DEAD_LETTERED'`, `error->>'code' = 'DELIVERY_ABANDONED'`, and the worker's log shows the sweep finished it **and not the event** — otherwise the event path passing would look the same | 6 |
@@ -1364,11 +1369,11 @@ Not Redis-only: D4 makes Postgres authoritative, and `GET /jobs/:id` has to answ
 on reconnect, which is A7's shape. Not a separate table: progress is one current value, not a
 history, and a row per update is write amplification nobody reads back.
 A progress write is **not** a status transition and must not go through a status set, but it does
-carry the same `attempts = <claimed attempt>` predicate, so a stale worker cannot overwrite the
-live one's progress. Note for the future lease-based reaper: progress writes bump `updatedAt`, so
-the lease clock must be `startedAt`, never `updatedAt`.
+carry the same `lease = <claimed lease>` predicate, so a stale worker cannot overwrite the
+live one's progress. Note for any future time-based reaper: progress writes bump `updatedAt`, so
+its clock must be `startedAt`, never `updatedAt` — the §7.6 sweep asks the queue instead.
 
-The attempt token alone does not make the count monotonic, which A12 also requires: a **retry** is
+The ownership token alone does not make the count monotonic, which A12 also requires: a **retry** is
 the live attempt and counts from one again, so without a second predicate it would walk a client's
 bar backwards from wherever the failed attempt left it. The write therefore also requires
 `progress -> 'processed'` to be at or below the incoming count (at, so a handler can revise its
@@ -1506,6 +1511,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-04 | §4.3, §5.2, D7, D25, §14 — the ownership token is `lease`, a counter every claim increments and nothing resets; `attempts` is only the retry budget. The token was `attempts`, which a re-drive resets, so it repeated across a job's lives. A3c registered. |
 | 2026-11-04 | §4.5 — the relay publishes row by row and skips one it cannot publish, retrying it every tick. It stopped at the first failure, and since every tick starts from the oldest unpublished row, a row that always failed would have blocked the outbox for good. Failures are logged once per tick, not once per row. |
 | 2026-11-04 | §9.2, D25 — the progress throttle keeps one write in flight and opens its window when that write settles. It opened the window on *send*, so a database slower than 500 ms had a write queued behind it every window, replayed in a burst on recovery, with `flush()` waiting for all of it. |
 | 2026-11-04 | §7.6, D7, §11, §14 — a sweep in every worker finishes a `RUNNING` job whose queue entry is gone or long finished: the backstop for the `failed` event, the one at-most-once step. A5d registered; `RELAY_SWEEP_INTERVAL_MS` and `RELAY_FAULT_SKIP_ABANDON` added, and `RELAY_FAULT_AFTER_COMMIT` listed. |

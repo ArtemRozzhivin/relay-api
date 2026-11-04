@@ -26,6 +26,8 @@ describe('cancellation transitions', () => {
         payload: {},
         status,
         attempts,
+        // A row built as attempt N of its first life has had N claims.
+        lease: attempts,
         cancelRequested,
         idempotencyKey: `cancel-${Math.random()}`,
         correlationId: 'test',

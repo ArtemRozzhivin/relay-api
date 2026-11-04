@@ -317,6 +317,11 @@ Each step is motivated by the failure of the one before it.
   _Found walking A5b: the event is heard once, so a worker killed at that moment stranded the
   row in RUNNING for ever. The sweep asks the queue, not a clock._
   ```
+- [x] **6.11 · Split the ownership token from the retry budget** (`lease`) → A3c passes.
+  ```
+  _Found walking A3b: a re-drive resets `attempts`, so a token built on it repeats across a
+  job's lives. Two counters, two jobs._
+  ```
 
 ### Done when
 

@@ -24,9 +24,11 @@ import {
   type SubmitJobInput,
 } from './jobs.schema.js';
 
-// The fingerprint is how the API recognises a retry (D28), not part of the job
-// a client sees, and a field in a response is a field clients come to rely on.
-const toJobView = ({ requestHash: _requestHash, ...job }: Job) => job;
+// The fingerprint is how the API recognises a retry (D28) and the lease is how
+// workers recognise each other (D7); neither is part of the job a client sees,
+// and a field in a response is a field clients come to rely on.
+const toJobView = ({ requestHash: _requestHash, lease: _lease, ...job }: Job) =>
+  job;
 
 @Controller('jobs')
 export class JobsController {
