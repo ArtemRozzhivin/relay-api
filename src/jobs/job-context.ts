@@ -13,6 +13,9 @@ import type { JobProgress } from './job-progress.js';
 export interface JobContext {
   readonly jobId: string;
 
+  /** The account the job belongs to: what every write it makes is scoped to. */
+  readonly userId: string;
+
   /**
    * The attempt now running, counted against `maxAttempts` — for logs and
    * messages. Not the ownership token: that is a separate lease the context

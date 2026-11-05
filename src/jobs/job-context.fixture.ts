@@ -8,9 +8,11 @@ import type { JobProgress } from './job-progress.js';
  */
 export const recordingContext = ({
   stopAfterChecks = Infinity,
+  userId = 'a-user',
 }: {
   /** How many `shouldStop()` calls answer false before one answers true. */
   stopAfterChecks?: number;
+  userId?: string;
 } = {}) => {
   const reports: JobProgress[] = [];
   const lines: string[] = [];
@@ -18,6 +20,7 @@ export const recordingContext = ({
 
   const context: JobContext = {
     jobId: 'a-job',
+    userId,
     attempt: 1,
     reportProgress: async (progress) => {
       reports.push(progress);

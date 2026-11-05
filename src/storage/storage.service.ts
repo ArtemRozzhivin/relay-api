@@ -4,7 +4,14 @@ import {
   type OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import type { Readable } from 'node:stream';
+import {
+  GetObjectCommand,
+  HeadObjectCommand,
+  NoSuchKey,
+  S3Client,
+  S3ServiceException,
+} from '@aws-sdk/client-s3';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { SharedEnv } from '../config/env.schema.js';
@@ -70,6 +77,52 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
     });
 
     return { url, fields, expiresAt };
+  }
+
+  /**
+   * Whether an object exists. Only a 404 answers `false`: a permissions or
+   * network failure is not an absent file, and must not be reported as one.
+   */
+  async exists(key: string) {
+    try {
+      await this.client.send(
+        new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
+      );
+
+      return true;
+    } catch (error) {
+      if (
+        error instanceof S3ServiceException &&
+        error.$metadata.httpStatusCode === 404
+      ) {
+        return false;
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * Opens an object for reading, as a stream: nothing is buffered beyond what
+   * the reader has asked for, so a file of any size costs the same memory.
+   *
+   * @returns the stream, or `null` when there is no such object.
+   */
+  async openStream(key: string): Promise<Readable | null> {
+    try {
+      const { Body } = await this.client.send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+      );
+
+      // In Node the SDK's body is an IncomingMessage, which is a Readable.
+      return Body as Readable;
+    } catch (error) {
+      if (error instanceof NoSuchKey) {
+        return null;
+      }
+
+      throw error;
+    }
   }
 
   /** A link that downloads one object until it expires. */

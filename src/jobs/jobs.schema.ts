@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { JobStatus } from '../generated/prisma/enums.js';
 import { DEAD_LETTER_CODES } from './job-error-codes.js';
+import { UPLOAD_KEY_PATTERN } from '../storage/upload-key.js';
 
 // The payload schemas tolerate unknown keys: the worker re-parses the stored
 // payload (§6.4), and a job written by a newer deploy can reach an older worker.
@@ -13,6 +14,14 @@ export const mockPayloadSchema = z.object({
   // Splits the sleep into reporting intervals: a mock job is the only job that
   // can exercise progress until the CSV import exists (PB).
   steps: z.coerce.number().int().min(1).max(100).default(1),
+});
+
+// Whose upload it is cannot be known here, only its shape; the submit and the
+// handler both check the prefix against the job's owner.
+export const importCsvPayloadSchema = z.object({
+  key: z
+    .string()
+    .regex(UPLOAD_KEY_PATTERN, 'expected a key from POST /uploads'),
 });
 
 export const chargePayloadSchema = z.object({
@@ -35,6 +44,13 @@ export const submitJobSchema = z.discriminatedUnion('type', [
     .object({
       type: z.literal('CHARGE'),
       payload: chargePayloadSchema.strict(),
+      maxAttempts: maxAttemptsSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('import.csv'),
+      payload: importCsvPayloadSchema.strict(),
       maxAttempts: maxAttemptsSchema,
     })
     .strict(),

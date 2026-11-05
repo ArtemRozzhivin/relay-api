@@ -666,7 +666,7 @@ rows.
   _This constraint is what makes a replayed batch harmless, so the import never needs to know
   whether it has run before._
   ```
-- [ ] **B.3 · Stream and batch** — `csv-parse` in streaming mode, per-row Zod, upsert ~500 rows per
+- [x] **B.3 · Stream and batch** — `csv-parse` in streaming mode, per-row Zod, upsert ~500 rows per
   transaction.
   ```
   _Never load the file into memory: the whole client problem is that the naive version dies on
@@ -693,7 +693,7 @@ rows.
 - [ ] **A13 passes** — 20 000 rows import with flat memory
 - [ ] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
   exact and contains no duplicates
-- [ ] **A15 passes** — the same file submitted twice returns the first job
+- [x] **A15 passes** — the same file submitted twice returns the first job
 - [ ] The error report is downloadable and its row numbers match the source file
 
 ---

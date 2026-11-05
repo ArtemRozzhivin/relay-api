@@ -6,11 +6,11 @@ import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
 import { AppModule } from '../../src/app.module.js';
-import {
-  StorageService,
-  type UploadSlip,
-} from '../../src/storage/storage.service.js';
+import { DeleteObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { StorageService } from '../../src/storage/storage.service.js';
+import { mintUploadKey } from '../../src/storage/upload-key.js';
 import { UPLOAD_MAX_BYTES } from '../../src/uploads/uploads.service.js';
+import { postUploadForm as send } from '../support/upload-form.js';
 
 // Against the real dev bucket (D29): what is under test is S3 enforcing the
 // policy the API signed, which no stand-in for S3 can prove. Keys this file
@@ -39,26 +39,6 @@ describe('uploads', () => {
       token: body.data.accessToken as string,
       userId: body.data.user.id as string,
     };
-  };
-
-  // How a browser sends it: every signed field, then the file, last.
-  const send = (
-    slip: Pick<UploadSlip, 'url' | 'fields'>,
-    body: string,
-    override: Record<string, string> = {},
-  ) => {
-    const form = new FormData();
-
-    for (const [name, value] of Object.entries({
-      ...slip.fields,
-      ...override,
-    })) {
-      form.append(name, value);
-    }
-
-    form.append('file', new Blob([body], { type: 'text/csv' }));
-
-    return fetch(slip.url, { method: 'POST', body: form });
   };
 
   beforeAll(async () => {
@@ -126,6 +106,96 @@ describe('uploads', () => {
     });
 
     expect(tampered.status).toBe(403);
+  });
+
+  describe('submitting an import', () => {
+    const importJob = (
+      token: string,
+      key: string,
+      idempotencyKey = randomUUID(),
+    ) =>
+      request(server)
+        .post('/jobs')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', idempotencyKey)
+        .send({ type: 'import.csv', payload: { key } });
+
+    const uploaded = async (token: string) => {
+      const { body } = await request(server)
+        .post('/uploads')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect((await send(body.data, 'sku,name,price,currency\n')).status).toBe(
+        204,
+      );
+
+      return body.data.key as string;
+    };
+
+    const jobsOf = async (token: string) =>
+      (
+        await request(server)
+          .get('/jobs')
+          .set('Authorization', `Bearer ${token}`)
+      ).body.data.total as number;
+
+    // Uploaded, so it exists: only the ownership check can refuse it.
+    it("refuses another account's uploaded file, creating no job", async () => {
+      const [mine, theirs] = [
+        await register('import-mine'),
+        await register('import-theirs'),
+      ];
+      const theirKey = await uploaded(theirs.token);
+
+      const { status, body } = await importJob(mine.token, theirKey);
+
+      expect(status).toBe(422);
+      expect(body.error.code).toBe('UPLOAD_NOT_FOUND');
+      expect(await jobsOf(mine.token)).toBe(0);
+    });
+
+    // The same answer as above, so a probe cannot tell another tenant's key
+    // that exists from one that does not.
+    it('refuses a key of its own that was never uploaded', async () => {
+      const { token, userId } = await register('import-missing');
+
+      const { status, body } = await importJob(token, mintUploadKey(userId));
+
+      expect(status).toBe(422);
+      expect(body.error.code).toBe('UPLOAD_NOT_FOUND');
+      expect(await jobsOf(token)).toBe(0);
+    });
+
+    it('accepts an uploaded file of its own', async () => {
+      const { token } = await register('import-accepted');
+
+      const { status, body } = await importJob(token, await uploaded(token));
+
+      expect(status).toBe(202);
+      expect(body.data).toMatchObject({ type: 'import.csv', status: 'QUEUED' });
+    });
+
+    // The file can expire from the bucket after the job was accepted; a
+    // client retrying that submit must still get its job back (D1).
+    it('still answers a replay once the file is gone', async () => {
+      const { token } = await register('import-replay');
+      const key = await uploaded(token);
+      const idempotencyKey = randomUUID();
+
+      const first = await importJob(token, key, idempotencyKey);
+
+      await new S3Client({ region: process.env.AWS_REGION }).send(
+        new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }),
+      );
+
+      const replay = await importJob(token, key, idempotencyKey);
+
+      expect(replay.status).toBe(202);
+      expect(replay.body.data).toMatchObject({
+        id: first.body.data.id,
+        replayed: true,
+      });
+    });
   });
 
   it.each([

@@ -6,10 +6,12 @@ import { JobsService } from './jobs.service.js';
 import { JobCoreModule } from './job-core.module.js';
 import { JOBS_QUEUE } from './job-queue.js';
 import { OutboxRelayService } from './outbox-relay.service.js';
+import { StorageModule } from '../storage/storage.module.js';
 
 @Module({
   imports: [
     JobCoreModule,
+    StorageModule,
     ScheduleModule.forRoot(),
     BullModule.registerQueue({ name: JOBS_QUEUE }),
   ],

@@ -8,7 +8,10 @@ import {
   JobAlreadyFinishedError,
   JobNotDeadLetteredError,
   JobNotFoundError,
+  UploadNotFoundError,
 } from '../common/errors/app-error.js';
+import { StorageService } from '../storage/storage.service.js';
+import { uploadPrefix } from '../storage/upload-key.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
 import { Prisma, type Job } from '../generated/prisma/client.js';
@@ -75,10 +78,13 @@ export class JobsService {
     private readonly transitions: JobTransitionService,
     private readonly events: JobEventsPublisher,
     private readonly config: ConfigService<ApiEnv, true>,
+    private readonly storage: StorageService,
     @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
   ) {}
 
   async submit({ userId, idempotencyKey, correlationId, input }: SubmitArgs) {
+    await this.checkUpload(userId, idempotencyKey, input);
+
     const hash = requestHash(input);
     let committed;
 
@@ -144,6 +150,39 @@ export class JobsService {
     await this.events.jobUpdated(job);
 
     return { job, replayed: false };
+  }
+
+  // A job that names a file must name one of the caller's own that is really
+  // there — a client that submits before S3 has answered its upload learns so
+  // now, not from a dead letter. A replay of an import already accepted is let
+  // through even once its file has expired, so it is answered as the replay it
+  // is (D1); a different body under that key is still refused, by the hash.
+  private async checkUpload(
+    userId: string,
+    idempotencyKey: string,
+    input: SubmitJobInput,
+  ) {
+    if (input.type !== 'import.csv') {
+      return;
+    }
+
+    const { key } = input.payload;
+
+    if (
+      key.startsWith(uploadPrefix(userId)) &&
+      (await this.storage.exists(key))
+    ) {
+      return;
+    }
+
+    const accepted = await this.prisma.job.findUnique({
+      where: { userId_idempotencyKey: { userId, idempotencyKey } },
+      select: { id: true },
+    });
+
+    if (!accepted) {
+      throw new UploadNotFoundError();
+    }
   }
 
   private async enqueue(

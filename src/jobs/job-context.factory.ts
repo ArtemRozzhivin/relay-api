@@ -19,6 +19,7 @@ const REPORT_WINDOW_MS = 500;
 
 interface RunningJob {
   jobId: string;
+  userId: string;
   attempt: number;
 
   /** The ownership token claim() handed this delivery; every write carries it. */
@@ -61,6 +62,7 @@ class RunningJobContext implements ManagedJobContext {
 
   constructor(
     readonly jobId: string,
+    readonly userId: string,
     readonly attempt: number,
     private readonly lease: number,
     private readonly correlationId: string,
@@ -223,6 +225,7 @@ export class JobContextFactory {
 
   create({
     jobId,
+    userId,
     attempt,
     lease,
     correlationId,
@@ -232,6 +235,7 @@ export class JobContextFactory {
 
     return new RunningJobContext(
       jobId,
+      userId,
       attempt,
       lease,
       correlationId,

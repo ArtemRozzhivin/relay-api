@@ -28,7 +28,7 @@ describe('submitJobSchema', () => {
   });
 
   it('lists every type the union accepts', () => {
-    expect(JOB_TYPES).toEqual(['MOCK', 'CHARGE']);
+    expect(JOB_TYPES).toEqual(['MOCK', 'CHARGE', 'import.csv']);
   });
 });
 

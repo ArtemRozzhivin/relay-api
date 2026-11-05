@@ -366,7 +366,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/auth/login` | — | `200` | Access + refresh pair |
 | `POST` | `/auth/refresh` | refresh token | `200` | Rotation: presented token revoked, new pair issued |
 | `POST` | `/auth/logout` | refresh token | `204` | Idempotent — revoking an already-revoked token is a no-op |
-| `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body. See §6.3 |
+| `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded. See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. Phase 6. See D6b |
@@ -426,6 +426,7 @@ that is not on the row, that stops being true and a stored-response table become
 | `CHARGE` | `amountCents` | positive int | required |
 | | `reference` | 1–200 chars | required |
 | | `delayMs` | `0`–`60000` | `0` |
+| `import.csv` | `key` | a key from `POST /uploads` (§6.3a), the caller's own, uploaded | required |
 
 `maxAttempts` is on the body itself, not the payload: `1`–`20`, default `5`.
 
@@ -451,6 +452,53 @@ POST /uploads                      (no body)
   an expired slip, `400 EntityTooLarge` / `EntityTooSmall` for the size.
 - `200`, not `201`: nothing exists yet, and nothing on the API side records the request. An upload
   the client never follows with a job is an orphan; the bucket's lifecycle rule removes it.
+
+### 6.3b `import.csv` — the file and what comes back
+
+The job's payload is `{ key }`, the key `POST /uploads` minted. At submit the API refuses — as
+`422 UPLOAD_NOT_FOUND`, the same answer for both, so a probe learns nothing — a key outside the
+caller's own prefix and a key with no file behind it, so a client that submits before S3 has
+answered its upload learns so then and not from a dead letter. A **replay** of an import already
+accepted is still answered as one after its file has expired from the bucket (D1). The worker
+checks the prefix again: what it runs is the stored row, not the request the API checked.
+
+**The file.** A header row is required, matched case-insensitively, after an optional byte-order
+mark; any other column is ignored, because a store export carries dozens.
+
+| Column | Required | Rule |
+|---|---|---|
+| `sku` | ✓ | 1–100 characters |
+| `name` | ✓ | 1–500 characters |
+| `price` | ✓ | A decimal such as `19.99`: up to 7 whole digits and 2 decimals, read into cents from the text, never through a float. Two decimals is right for EUR and USD and wrong for a currency such as JPY |
+| `currency` | ✓ | Three letters, any case, stored upper-case |
+| `description` | | Up to 5000 characters |
+| `imageUrl` | | `http` or `https` only — it is fetched in phase C |
+
+**What happens to it.** The file is read as a stream and written 500 valid rows per statement
+(§4.7, D30), so memory holds one batch however long the file is: while a batch is being written
+the parser asks for no more, the download pauses, and S3 waits. A **bad row** — a missing cell, a
+price that does not parse — is counted and skipped; it never fails the import. A **bad file**
+fails it at once as a terminal error, because no retry can fix it: a header without a required
+column, CSV that does not parse (one record is capped at 64 KB, so an unclosed quote cannot pull
+the rest of the file into memory), a key that is another account's, a file that no longer exists.
+Rows written before a bad file is discovered stay written.
+
+**Progress and cancellation.** After each batch the job reports `processed` — rows read so far,
+bad ones included — with no `total`, because a stream does not know its length. The batch
+boundary is also where a cancellation is honoured: a cancelled import has committed whole batches
+and started none it did not finish, and keeps its `progress`, so the client sees how far it got
+(A11).
+
+```jsonc
+// result, on success
+{ "rows": 1201, "imported": 1200, "invalid": 1,
+  "invalidSamples": [ { "line": 1202, "reason": "name: Too small: expected string to have >=1 characters" } ] }
+```
+
+`line` is the line in the file the row ends on, counting the header as line 1. Only the first ten
+bad rows are sampled — a wrong file can have thousands, and the result is a row in Postgres; the
+full list is B.5's error report. Until B.4's checkpoint, a crashed import starts again from the
+first row, which is slower but correct: rewriting a batch changes nothing (D30).
 
 ### 6.4 Validation
 
@@ -1611,6 +1659,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-05 | §6.2, §6.3, §6.3b — the `import.csv` job: a streamed file, 500 rows per statement, bad rows counted by line and never fatal, a bad file terminal, the batch the cancellation boundary. `422 UPLOAD_NOT_FOUND` at submit; the worker re-checks the key's owner. Handlers now see the job's `userId`. A15 automated. |
 | 2026-11-04 | §4.7, D30 — `Product` added: `UNIQUE (userId, sku)`, money in whole cents with an ISO 4217 currency, CHECKs as the floor under row validation; one `INSERT … ON CONFLICT` per batch. **Decided**: the newer file wins, an import never deletes. |
 | 2026-11-04 | §6.2 — `GET /auth/me` removed: it was listed from the start and never built. Login already returns the user, and nothing has needed the route since. |
 | 2026-11-04 | §6.2, §6.3a, §11, §13.2, §13.4, D29 — **decided**: object storage is real AWS S3 in every environment, a bucket and a bucket-only IAM user each, and uploads are presigned POSTs so S3 enforces the size. `POST /uploads` added. MinIO, which the plan named, is archived. |

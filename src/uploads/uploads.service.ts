@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { StorageService } from '../storage/storage.service.js';
+import { mintUploadKey } from '../storage/upload-key.js';
 
 // Far beyond the 20 000-row catalog PB is built for, and small enough that a
 // wrong file — a video, a database dump — is refused by S3 before it is stored.
@@ -21,7 +21,7 @@ export class UploadsService {
    * tenant's file nor name a path an import would later trust.
    */
   async createUpload(userId: string) {
-    const key = `uploads/${userId}/${randomUUID()}.csv`;
+    const key = mintUploadKey(userId);
     const slip = await this.storage.signUpload(
       key,
       UPLOAD_MAX_BYTES,

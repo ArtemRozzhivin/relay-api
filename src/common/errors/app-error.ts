@@ -76,6 +76,18 @@ export class IdempotencyKeyReusedError extends AppError {
   }
 }
 
+// 422 like a reused key: the body is well-formed, but what it names is not
+// there. One answer for "not yours" and "not uploaded", so a probe for another
+// tenant's key learns nothing from the difference.
+export class UploadNotFoundError extends AppError {
+  readonly kind = 'UNPROCESSABLE' as const;
+  readonly code = 'UPLOAD_NOT_FOUND';
+
+  constructor() {
+    super('No upload of yours exists at this key');
+  }
+}
+
 export class TerminalJobError extends AppError {
   readonly kind = 'VALIDATION' as const;
   readonly code = 'JOB_TERMINAL_FAILURE';

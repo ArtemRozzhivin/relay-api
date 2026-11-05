@@ -13,12 +13,14 @@ const WINDOW_MS = 500;
 
 const running: {
   jobId: string;
+  userId: string;
   attempt: number;
   lease: number;
   correlationId: string;
   progress: Prisma.JsonValue | null;
 } = {
   jobId: 'a-job',
+  userId: 'a-user',
   attempt: 2,
   // Deliberately not the attempt, so a write carrying the wrong one shows.
   lease: 7,

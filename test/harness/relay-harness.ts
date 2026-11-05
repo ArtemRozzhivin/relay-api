@@ -11,6 +11,7 @@ import type {
   Prisma,
 } from '../../src/generated/prisma/client.js';
 import { JOBS_QUEUE, messageId } from '../../src/jobs/job-queue.js';
+import { postUploadForm } from '../support/upload-form.js';
 
 const QUEUE_PREFIX = 'bull:relay-jobs';
 
@@ -354,6 +355,31 @@ export class RelayHarness {
       },
       body: JSON.stringify(payload),
     });
+  }
+
+  /**
+   * Uploads a file the way a client does — a slip from the API, then the file
+   * straight to S3 — and returns the key a job then names.
+   */
+  async upload(account: Account, csv: string) {
+    const { body } = await this.request('/uploads', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${account.token}` },
+    });
+
+    const sent = await postUploadForm(body.data, csv);
+
+    if (sent.status !== 204) {
+      throw new Error(
+        `S3 refused the upload: ${sent.status} ${await sent.text()}`,
+      );
+    }
+
+    return body.data.key as string;
+  }
+
+  products(userId: string) {
+    return this.prisma.product.findMany({ where: { userId } });
   }
 
   fetchJob(account: Account, jobId: string) {
