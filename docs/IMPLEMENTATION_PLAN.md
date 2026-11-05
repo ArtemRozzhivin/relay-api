@@ -660,7 +660,8 @@ rows.
   ```
   _The API never streams a file body, and S3 — not the API — enforces the upload's size._
   ```
-- [ ] **B.2 ·** `Product` **model** — `UNIQUE (userId, sku)`.
+- [x] **B.2 ·** `Product` **model** — `UNIQUE (userId, sku)`, and the one-statement batch upsert
+  (D30).
   ```
   _This constraint is what makes a replayed batch harmless, so the import never needs to know
   whether it has run before._

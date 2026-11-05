@@ -23,6 +23,7 @@ model User {
 
   refreshTokens RefreshToken[]
   jobs          Job[]
+  products      Product[]
 }
 
 model RefreshToken {
@@ -106,4 +107,27 @@ model Outbox {
   publishedAt DateTime? @db.Timestamptz(6)
 
   job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+}
+
+/// A store's product, written by `import.csv`. A store knows it by its own `sku`, never by
+/// our `id`, so `(userId, sku)` is what an import matches on — and what makes a replayed batch
+/// harmless (D30).
+model Product {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @db.Uuid
+  sku         String
+  name        String
+  description String?
+  /// Whole minor units, never a float: 0.1 + 0.2 is not 0.3.
+  priceCents  Int
+  /// ISO 4217, three capital letters.
+  currency    String
+  /// As written in the file, so untrusted until phase C's guard has checked it.
+  imageUrl    String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, sku])
 }
