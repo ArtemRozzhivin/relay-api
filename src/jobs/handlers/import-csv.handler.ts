@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { pipeline } from 'node:stream/promises';
 import { CsvError, parse } from 'csv-parse';
+import { z } from 'zod';
 import { JobCancelledError, JobHandler } from '../job-handler.js';
 import type { JobContext } from '../job-context.js';
 import { importCsvPayloadSchema, type PayloadOf } from '../jobs.schema.js';
@@ -36,6 +37,21 @@ interface ParsedRecord {
   info: { lines: number };
 }
 
+const count = z.number().int().nonnegative();
+
+// What a committed batch records: how many records it reaches, the totals the
+// result reports, and which bytes it was reading — a resume that skipped the
+// first 1 000 records of a *different* file would skip rows nobody wrote.
+const checkpointSchema = z.object({
+  records: count,
+  imported: count,
+  invalid: count,
+  invalidSamples: z.array(z.object({ line: count, reason: z.string() })),
+  etag: z.string().min(1),
+});
+
+type ImportCheckpoint = z.infer<typeof checkpointSchema>;
+
 @Injectable()
 export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
   readonly type = 'import.csv' as const;
@@ -59,20 +75,51 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       throw new TerminalJobError('The upload belongs to another account');
     }
 
-    const file = await this.storage.openStream(key);
+    const saved = this.readCheckpoint(context);
+    const opened = await this.storage.openStream(key, {
+      ifMatch: saved?.etag,
+    });
 
-    if (!file) {
+    if (opened === 'missing') {
       throw new TerminalJobError('The uploaded file no longer exists');
     }
 
+    if (opened === 'changed') {
+      throw new TerminalJobError(
+        'The file was replaced after this import began; retry with ?from=start to import it from the top',
+      );
+    }
+
+    const { body: file, etag } = opened;
+
+    // Every record up to here is in a batch an earlier attempt committed.
+    const resumeAfter = saved?.records ?? 0;
+
     let rows = 0;
-    let imported = 0;
-    let invalid = 0;
-    const invalidSamples: { line: number; reason: string }[] = [];
+    let imported = saved?.imported ?? 0;
+    let invalid = saved?.invalid ?? 0;
+    const invalidSamples = [...(saved?.invalidSamples ?? [])];
     let batch: ProductRow[] = [];
 
+    if (resumeAfter > 0) {
+      context.log(`resuming after record ${resumeAfter}`);
+      void context.reportProgress({ processed: resumeAfter });
+    }
+
     const write = async () => {
-      imported += await this.products.upsertBatch(context.userId, batch);
+      const written = await context.commit(
+        (tx) => this.products.upsertBatch(context.userId, batch, tx),
+        (upserted): ImportCheckpoint => ({
+          records: rows,
+          imported: imported + upserted,
+          invalid,
+          // A copy: the array keeps growing after this batch commits.
+          invalidSamples: [...invalidSamples],
+          etag,
+        }),
+      );
+
+      imported += written;
       batch = [];
       void context.reportProgress({ processed: rows });
     };
@@ -100,6 +147,13 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
         async (records: AsyncIterable<ParsedRecord>) => {
           for await (const { record, info } of records) {
             rows += 1;
+
+            // Still parsed, because only parsing finds where a CSV record ends
+            // — a quoted field may hold a newline — but neither checked nor
+            // written again.
+            if (rows <= resumeAfter) {
+              continue;
+            }
 
             const parsed = csvRowSchema.safeParse(record);
 
@@ -145,5 +199,24 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
     }
 
     return { rows, imported, invalid, invalidSamples };
+  }
+
+  // A checkpoint this version cannot read costs a restart from the top, which
+  // the upsert makes harmless. Trusting one would skip rows for no reason
+  // anyone could later see.
+  private readCheckpoint(context: JobContext) {
+    if (context.checkpoint === null) {
+      return undefined;
+    }
+
+    const parsed = checkpointSchema.safeParse(context.checkpoint);
+
+    if (!parsed.success) {
+      context.log('checkpoint unreadable; importing from the top');
+
+      return undefined;
+    }
+
+    return parsed.data;
   }
 }

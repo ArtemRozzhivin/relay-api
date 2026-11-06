@@ -214,11 +214,22 @@ export class JobsService {
     });
   }
 
-  async redrive(userId: string, jobId: string, correlationId: string) {
+  /**
+   * @param fromStart discards the job's checkpoint, so it does its work again
+   * from the beginning; by default it resumes where it got to (D26).
+   */
+  async redrive(
+    userId: string,
+    jobId: string,
+    correlationId: string,
+    { fromStart = false }: { fromStart?: boolean } = {},
+  ) {
     const existing = await this.findOne(userId, jobId);
 
     const requeued = await this.prisma.$transaction(async (tx) => {
-      const job = await this.transitions.redrive(existing.id, tx);
+      const job = await this.transitions.redrive(existing.id, tx, {
+        fromStart,
+      });
 
       if (!job) {
         return null;

@@ -672,7 +672,7 @@ rows.
   _Never load the file into memory: the whole client problem is that the naive version dies on
   size._
   ```
-- [ ] **B.4 · Checkpoint and resume** (D26) — its own storage, not `result` and not `progress`;
+- [x] **B.4 · Checkpoint and resume** (D26) — its own storage, not `result` and not `progress`;
   `redrive()` leaves it alone; `?from=start` forces a restart.
   ```
   _A re-drive asks "did this happen?", not "do it again" — the same semantic already settled for_
@@ -691,7 +691,7 @@ rows.
 ### Done when
 
 - [ ] **A13 passes** — 20 000 rows import with flat memory
-- [ ] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
+- [x] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
   exact and contains no duplicates
 - [x] **A15 passes** — the same file submitted twice returns the first job
 - [ ] The error report is downloadable and its row numbers match the source file

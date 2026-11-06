@@ -74,6 +74,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       lease,
       correlationId,
       progress: claimed.progress,
+      checkpoint: claimed.checkpoint,
     });
 
     try {

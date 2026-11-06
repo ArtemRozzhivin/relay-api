@@ -16,6 +16,17 @@ import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { SharedEnv } from '../config/env.schema.js';
 
+/** An object opened for reading, and the version of it being read. */
+export interface OpenedObject {
+  body: Readable;
+
+  /**
+   * S3's fingerprint of these exact bytes. Passed back as `ifMatch`, it makes a
+   * later read fail rather than return different bytes under the same key.
+   */
+  etag: string;
+}
+
 /** A signed permission to upload one object, as an HTML form would (presigned POST). */
 export interface UploadSlip {
   url: string;
@@ -106,19 +117,45 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
    * Opens an object for reading, as a stream: nothing is buffered beyond what
    * the reader has asked for, so a file of any size costs the same memory.
    *
-   * @returns the stream, or `null` when there is no such object.
+   * @param ifMatch an `etag` from an earlier read: the object is opened only if
+   * it still holds those bytes.
+   * @returns the opened object, `'missing'` when there is no such object, or
+   * `'changed'` when it no longer matches `ifMatch`.
    */
-  async openStream(key: string): Promise<Readable | null> {
+  async openStream(
+    key: string,
+    { ifMatch }: { ifMatch?: string } = {},
+  ): Promise<OpenedObject | 'missing' | 'changed'> {
     try {
-      const { Body } = await this.client.send(
-        new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+      const { Body, ETag } = await this.client.send(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          IfMatch: ifMatch,
+        }),
       );
 
       // In Node the SDK's body is an IncomingMessage, which is a Readable.
-      return Body as Readable;
+      const body = Body as Readable;
+
+      // S3 sends one on every GetObject; the SDK types every header optional.
+      if (!ETag) {
+        body.destroy();
+
+        throw new Error(`S3 returned ${key} without an ETag`);
+      }
+
+      return { body, etag: ETag };
     } catch (error) {
       if (error instanceof NoSuchKey) {
-        return null;
+        return 'missing';
+      }
+
+      if (
+        error instanceof S3ServiceException &&
+        error.$metadata.httpStatusCode === 412
+      ) {
+        return 'changed';
       }
 
       throw error;

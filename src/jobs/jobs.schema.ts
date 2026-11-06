@@ -126,4 +126,12 @@ export type BulkRedriveInput = z.infer<typeof bulkRedriveSchema>;
 
 export const jobIdSchema = z.uuid();
 
+// Resuming is the default and needs no word for it (D26); a restart is the one
+// a caller has to ask for.
+export const redriveQuerySchema = z
+  .object({ from: z.literal('start').optional() })
+  .strict();
+
+export type RedriveQuery = z.infer<typeof redriveQuerySchema>;
+
 export type ListJobsQuery = z.infer<typeof listJobsSchema>;

@@ -158,7 +158,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 |---|---|---|
 | `id` | `uuid` | PK. This is the id returned to the client and the only thing put on the queue (§8.3) |
 | `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE` |
-| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
+| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` \| `import.csv` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
 | `payload` | `jsonb` | Validated per-type at the edge (§6.4) |
 | `status` | `JobStatus` enum | See §5 |
 | `attempts` | `int` | Default `0`. Incremented by the worker when it *claims* the job. The retry budget, reset by a re-drive — so **not** the ownership token |
@@ -169,6 +169,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `result` | `jsonb?` | Set on `SUCCEEDED` |
 | `error` | `jsonb?` | `{ code, message, retryable, attempt }` — set on every failed attempt, last one wins |
 | `progress` | `jsonb?` | `{ processed, total?, message? }` (D25). Written outside any status transition, under the ownership token (`lease`) **and** a `processed <=` predicate, so it can never move backwards. Cleared by a re-drive |
+| `checkpoint` | `jsonb?` | How far the job's committed work reaches, in a shape its handler owns (D26). Written in the **same transaction** as the batch it describes, under `lease`, so it never claims work that did not commit; an attempt that lost the job has its batch rolled back with it. **Kept** by a re-drive, cleared by `?from=start`. Internal — never in a response |
 | `cancelRequested` | `boolean` | Default `false`. The owner's request; `CANCELLED` is the worker's answer (D22). Set only while the job is unfinished, so a cancel of a finished job leaves no trace. Cleared by a re-drive |
 | `correlationId` | `text` | The submitting request's id. Carried onto the queue so worker logs join API logs (§12.1) |
 | `createdAt` | `timestamptz(6)` | |
@@ -369,7 +370,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded. See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
-| `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. Phase 6. See D6b |
+| `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
 | `POST` | `/uploads` | access | `200` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. See §6.3a |
@@ -497,8 +498,17 @@ and started none it did not finish, and keeps its `progress`, so the client sees
 
 `line` is the line in the file the row ends on, counting the header as line 1. Only the first ten
 bad rows are sampled — a wrong file can have thousands, and the result is a row in Postgres; the
-full list is B.5's error report. Until B.4's checkpoint, a crashed import starts again from the
-first row, which is slower but correct: rewriting a batch changes nothing (D30).
+full list is B.5's error report.
+
+**Resuming.** Each batch commits together with a checkpoint — the records it reaches, the running
+counts, and the file's S3 `ETag` — so an import that crashes, fails an attempt, or is re-driven
+continues after its last committed batch instead of at row 1 (D26, A14). It reads the file from
+the top again, because only parsing finds where a CSV record ends, but skips the records the
+checkpoint covers without validating or writing them; the counts it reports are the whole file's.
+The file is reopened only if its `ETag` still matches: the upload slip is reusable until it
+expires, and a resume over different bytes under the same key would skip rows nobody imported, so
+a replaced file is a terminal error and `POST /jobs/:id/retry?from=start` imports it from the top.
+A resumed import reports its checkpoint as its first `processed`.
 
 ### 6.4 Validation
 
@@ -1530,7 +1540,10 @@ Three details the implementation settled:
 
 **D26 — a re-drive resumes from the checkpoint; restarting is opt-in.**
 The checkpoint is neither `result` (which `redrive()` clears) nor `progress` (which is
-presentational), so it gets its own storage keyed by job, and `redrive()` does not clear it.
+presentational), so it gets its own column, `Job.checkpoint`, and `redrive()` does not clear it.
+It is written in the transaction that commits the batch it describes, under the lease, so it can
+neither run ahead of the work nor be written by an attempt that lost the job. Its shape belongs
+to the handler, which parses it and starts over from the top if it cannot.
 Resuming is safe because the row-level upsert on `(userId, sku)` makes a replayed batch harmless,
 and restarting a 20 000-row import from zero is expensive. `POST /jobs/:id/retry?from=start` forces
 a restart. This is the same semantic already settled for `effectKey`: a re-drive asks *did this
@@ -1659,6 +1672,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-05 | §4.3, §6.2, §6.3b, D26 — `Job.checkpoint` added, written in the batch's own transaction under the lease; a handler commits through `JobContext.commit()` and reads `JobContext.checkpoint`. `import.csv` resumes after its last committed batch, refusing a file whose `ETag` changed. `POST /jobs/:id/retry?from=start` restarts instead. A14 automated. |
 | 2026-11-05 | §6.2, §6.3, §6.3b — the `import.csv` job: a streamed file, 500 rows per statement, bad rows counted by line and never fatal, a bad file terminal, the batch the cancellation boundary. `422 UPLOAD_NOT_FOUND` at submit; the worker re-checks the key's owner. Handlers now see the job's `userId`. A15 automated. |
 | 2026-11-04 | §4.7, D30 — `Product` added: `UNIQUE (userId, sku)`, money in whole cents with an ISO 4217 currency, CHECKs as the floor under row validation; one `INSERT … ON CONFLICT` per batch. **Decided**: the newer file wins, an import never deletes. |
 | 2026-11-04 | §6.2 — `GET /auth/me` removed: it was listed from the start and never built. Login already returns the user, and nothing has needed the route since. |

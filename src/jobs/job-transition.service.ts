@@ -17,8 +17,13 @@ const TERMINAL: readonly JobStatus[] = [
 
 const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
 
+// Thrown inside a checkpoint's transaction only to roll it back; never escapes.
+class CheckpointRefused extends Error {}
+
 // What a re-drive resets, shared by the single and bulk forms so they cannot
 // drift: a job re-driven one way must look exactly like one re-driven the other.
+// `checkpoint` is deliberately absent: a re-drive resumes where the work got to
+// (D26), and only a restart asked for by name clears it.
 const REDRIVE_RESET = {
   status: 'QUEUED',
   // A fresh retry budget. `lease` is deliberately left alone: it is the
@@ -27,9 +32,9 @@ const REDRIVE_RESET = {
   attempts: 0,
   error: Prisma.DbNull,
   result: Prisma.DbNull,
-  // Cleared because the work starts over: leaving it would show a client 19 500
-  // of 20 000 on a job that has done nothing yet. D26 protects the *checkpoint*
-  // from a re-drive, not this, which is presentational.
+  // Cleared because the next run reports its own: a resumed import starts by
+  // reporting its checkpoint, and a restarted one would otherwise show 19 500
+  // of 20 000 on a job that has done nothing yet.
   progress: Prisma.DbNull,
   // An operator re-driving a job is asking for it to run again, so a
   // cancellation requested during its previous life must not stop it at the
@@ -263,8 +268,70 @@ export class JobTransitionService {
     return job !== null;
   }
 
-  redrive(jobId: string, client?: Prisma.TransactionClient) {
-    return this.move(jobId, ['DEAD_LETTERED'], REDRIVE_RESET, { client });
+  /**
+   * Runs `work` and records `checkpoint` in one transaction, so a checkpoint
+   * never claims work that did not commit, and work never commits without the
+   * checkpoint that lets a later attempt skip it.
+   *
+   * Guarded by the lease like every other write a worker makes: an attempt that
+   * lost the job has its work rolled back with the refused checkpoint.
+   *
+   * @param checkpoint builds the value from what `work` returned.
+   * @returns `{ value }` holding what `work` returned, or `null` when this
+   * attempt no longer owns the job and nothing was written.
+   */
+  async commitCheckpoint<T>(
+    jobId: string,
+    lease: number,
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+    checkpoint: (value: T) => Prisma.InputJsonValue,
+  ): Promise<{ value: T } | null> {
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const value = await work(tx);
+
+        // Written after the work, not before: the job row stays locked from
+        // here to the commit, and a progress write or a cancel request queued
+        // behind that lock should wait for one statement, not the whole batch.
+        const saved = await this.move(
+          jobId,
+          ['RUNNING'],
+          { checkpoint: checkpoint(value) },
+          { client: tx, where: { lease } },
+        );
+
+        if (!saved) {
+          throw new CheckpointRefused();
+        }
+
+        return { value };
+      });
+    } catch (error) {
+      if (error instanceof CheckpointRefused) {
+        return null;
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * @param fromStart also clears the checkpoint, so the job does its work again
+   * from the beginning instead of resuming (D26).
+   */
+  redrive(
+    jobId: string,
+    client?: Prisma.TransactionClient,
+    { fromStart = false }: { fromStart?: boolean } = {},
+  ) {
+    return this.move(
+      jobId,
+      ['DEAD_LETTERED'],
+      fromStart
+        ? { ...REDRIVE_RESET, checkpoint: Prisma.DbNull }
+        : REDRIVE_RESET,
+      { client },
+    );
   }
 
   /**

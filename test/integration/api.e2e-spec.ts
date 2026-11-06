@@ -242,6 +242,61 @@ describe('the job API contract', () => {
       .expect(404);
   });
 
+  describe('a re-drive of a job with a checkpoint', () => {
+    // Dead-lettered with a checkpoint, as an import that died halfway is.
+    const halfDone = async () => {
+      const token = await register('rd-checkpoint');
+      const { body: created } = await submit(token);
+      const jobId = created.data.id as string;
+
+      await app.get(PrismaService).job.update({
+        where: { id: jobId },
+        data: { status: 'DEAD_LETTERED', checkpoint: { records: 1000 } },
+      });
+
+      return { token, jobId };
+    };
+
+    const retry = (token: string, jobId: string, query = '') =>
+      request(server)
+        .post(`/jobs/${jobId}/retry${query}`)
+        .set('Authorization', `Bearer ${token}`);
+
+    const checkpointOf = async (jobId: string) =>
+      (
+        await app
+          .get(PrismaService)
+          .job.findUniqueOrThrow({ where: { id: jobId } })
+      ).checkpoint;
+
+    it('resumes by default, and never shows the checkpoint', async () => {
+      const { token, jobId } = await halfDone();
+
+      const { status, body } = await retry(token, jobId);
+
+      expect(status).toBe(202);
+      expect(body.data.status).toBe('QUEUED');
+      expect(body.data).not.toHaveProperty('checkpoint');
+      expect(await checkpointOf(jobId)).toEqual({ records: 1000 });
+    });
+
+    it('starts over with ?from=start', async () => {
+      const { token, jobId } = await halfDone();
+
+      await retry(token, jobId, '?from=start').expect(202);
+
+      expect(await checkpointOf(jobId)).toBeNull();
+    });
+
+    it('rejects any other ?from', async () => {
+      const { token, jobId } = await halfDone();
+
+      await retry(token, jobId, '?from=middle').expect(400);
+
+      expect(await checkpointOf(jobId)).toEqual({ records: 1000 });
+    });
+  });
+
   it('rejects a malformed job id', async () => {
     const token = await register('badid');
 
