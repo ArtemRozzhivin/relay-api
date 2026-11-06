@@ -101,6 +101,14 @@ export class JobsController {
     return toJobView(await this.jobs.findOne(user.id, id));
   }
 
+  @Get(':id/error-report')
+  errorReport(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', { schema: jobIdSchema }) id: string,
+  ) {
+    return this.jobs.errorReportLink(user.id, id);
+  }
+
   @Get()
   async findMany(
     @CurrentUser() user: AuthenticatedUser,

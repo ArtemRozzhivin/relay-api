@@ -1,3 +1,4 @@
+import { parse } from 'csv-parse/sync';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
 
@@ -56,5 +57,24 @@ describe('A15 · the same file submitted twice is one import', () => {
       progress: { processed: ROWS + 1 },
     });
     expect(await harness.products(account.id)).toHaveLength(ROWS);
+
+    // The one bad row, downloadable, at the line it has in the file: the
+    // header is line 1, so the row after 1 200 good ones is line 1 202.
+    const link = await harness.request(
+      `/jobs/${first.body.data.id}/error-report`,
+      { headers: { Authorization: `Bearer ${account.token}` } },
+    );
+
+    expect(link.status).toBe(200);
+
+    const report = await fetch(link.body.data.url);
+
+    expect(parse(await report.text(), { bom: true, columns: true })).toEqual([
+      expect.objectContaining({
+        line: String(ROWS + 2),
+        sku: 'BAD-1',
+        reason: expect.stringMatching(/^name:/),
+      }),
+    ]);
   });
 });

@@ -167,7 +167,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `idempotencyKey` | `text` | See D1 |
 | `requestHash` | `text?` | SHA-256 of the canonical submit body, so a reused key with a different body is refused (D28). Internal — never in a response. `NULL` on rows from before it was stored, which can only be replayed |
 | `result` | `jsonb?` | Set on `SUCCEEDED` |
-| `error` | `jsonb?` | `{ code, message, retryable, attempt }` — set on every failed attempt, last one wins |
+| `error` | `jsonb?` | `{ code, reason?, message, retryable, attempt }` — set on every failed attempt, last one wins. `code` is how the job died, one of the engine's dead-letter codes; `reason` is a handler's own name for a terminal failure, such as `IMPORT_MOSTLY_INVALID`, so a client can tell one from another without reading `message` |
 | `progress` | `jsonb?` | `{ processed, total?, message? }` (D25). Written outside any status transition, under the ownership token (`lease`) **and** a `processed <=` predicate, so it can never move backwards. Cleared by a re-drive |
 | `checkpoint` | `jsonb?` | How far the job's committed work reaches, in a shape its handler owns (D26). Written in the **same transaction** as the batch it describes, under `lease`, so it never claims work that did not commit; an attempt that lost the job has its batch rolled back with it. **Kept** by a re-drive, cleared by `?from=start`. Internal — never in a response |
 | `cancelRequested` | `boolean` | Default `false`. The owner's request; `CANCELLED` is the worker's answer (D22). Set only while the job is unfinished, so a cancel of a finished job leaves no trace. Cleared by a re-drive |
@@ -369,6 +369,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/auth/logout` | refresh token | `204` | Idempotent — revoking an already-revoked token is a no-op |
 | `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded. See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
+| `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. See D11 |
@@ -498,7 +499,30 @@ and started none it did not finish, and keeps its `progress`, so the client sees
 
 `line` is the line in the file the row ends on, counting the header as line 1. Only the first ten
 bad rows are sampled — a wrong file can have thousands, and the result is a row in Postgres; the
-full list is B.5's error report.
+full list is the error report.
+
+**The error report.** When any row was bad, the import ends by writing every bad row to
+`reports/<userId>/<jobId>.csv` — its line, the reason, and the values it held — and
+`GET /jobs/:id/error-report` answers with a link to it, signed on each call rather than stored in
+`result`, where it would have expired before anyone clicked it. The report comes from a second
+read of the file, not from rows collected during the import, because a resumed import never
+looked at the rows before its checkpoint; reading is cheap next to writing a batch. It is streamed
+to S3 as it is produced, so memory stays flat however many rows are bad, and written for a
+spreadsheet: a byte-order mark so Excel reads it as UTF-8, and any cell starting `=`, `+`, `-` or
+`@` prefixed with `'`, so a formula in the seller's own file is shown rather than run. One per job,
+so a re-run overwrites it; the bucket's 7-day lifecycle rule removes it.
+
+```
+line,reason,sku,name,price,currency,description,imageUrl
+3,"name: Too small: expected string to have >=1 characters",B-2,,5,EUR,,
+```
+
+**A wrong file fails fast.** When more than half of the first 100 rows — or of the whole file, if
+it is shorter — are bad, the import is not data with problems but the wrong file: an export whose
+prices have decimal commas, another shop's columns under the right headers. It fails as a
+terminal error with `error.reason: 'IMPORT_MOSTLY_INVALID'` before anything is written, since 100
+rows is less than a batch, and leaves no report. Bad rows after the first 100 never fail an
+import; they go in the report.
 
 **Resuming.** Each batch commits together with a checkpoint — the records it reaches, the running
 counts, and the file's S3 `ETag` — so an import that crashes, fails an attempt, or is re-driven
@@ -1672,6 +1696,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-06 | §4.3, §6.2, §6.3b — the error report: every bad row to `reports/<userId>/<jobId>.csv` from a second read of the file, and `GET /jobs/:id/error-report` signing a link on each call. A file whose first 100 rows are mostly bad fails before anything is written, as `error.reason: 'IMPORT_MOSTLY_INVALID'` — `reason` added beside the engine's `code`. |
 | 2026-11-05 | §4.3, §6.2, §6.3b, D26 — `Job.checkpoint` added, written in the batch's own transaction under the lease; a handler commits through `JobContext.commit()` and reads `JobContext.checkpoint`. `import.csv` resumes after its last committed batch, refusing a file whose `ETag` changed. `POST /jobs/:id/retry?from=start` restarts instead. A14 automated. |
 | 2026-11-05 | §6.2, §6.3, §6.3b — the `import.csv` job: a streamed file, 500 rows per statement, bad rows counted by line and never fatal, a bad file terminal, the batch the cancellation boundary. `422 UPLOAD_NOT_FOUND` at submit; the worker re-checks the key's owner. Handlers now see the job's `userId`. A15 automated. |
 | 2026-11-04 | §4.7, D30 — `Product` added: `UNIQUE (userId, sku)`, money in whole cents with an ISO 4217 currency, CHECKs as the floor under row validation; one `INSERT … ON CONFLICT` per batch. **Decided**: the newer file wins, an import never deletes. |

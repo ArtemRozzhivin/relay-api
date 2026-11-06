@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { JobStatus } from '../generated/prisma/enums.js';
 import { DEAD_LETTER_CODES } from './job-error-codes.js';
-import { UPLOAD_KEY_PATTERN } from '../storage/upload-key.js';
+import { UPLOAD_KEY_PATTERN } from '../storage/object-keys.js';
 
 // The payload schemas tolerate unknown keys: the worker re-parses the stored
 // payload (§6.4), and a job written by a newer deploy can reach an older worker.

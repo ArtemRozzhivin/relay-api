@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { StorageService } from '../storage/storage.service.js';
-import { mintUploadKey } from '../storage/upload-key.js';
+import { mintUploadKey } from '../storage/object-keys.js';
 
 // Far beyond the 20 000-row catalog PB is built for, and small enough that a
 // wrong file — a video, a database dump — is refused by S3 before it is stored.

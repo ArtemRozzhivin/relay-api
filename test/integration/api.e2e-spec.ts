@@ -5,7 +5,10 @@ import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
 import { AppModule } from '../../src/app.module.js';
+import { Readable } from 'node:stream';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
+import { StorageService } from '../../src/storage/storage.service.js';
+import { errorReportKey } from '../../src/storage/object-keys.js';
 
 // The in-process tier: the real app, the real database, no worker. It covers the
 // request contract — validation, authentication, tenant scoping — which the
@@ -294,6 +297,86 @@ describe('the job API contract', () => {
       await retry(token, jobId, '?from=middle').expect(400);
 
       expect(await checkpointOf(jobId)).toEqual({ records: 1000 });
+    });
+  });
+
+  describe("an import's error report", () => {
+    // A finished import of the caller's, and the report the worker would have
+    // left for it — no worker runs in this tier.
+    const importWithReport = async (
+      status: 'SUCCEEDED' | 'RUNNING' = 'SUCCEEDED',
+      { withReport = true } = {},
+    ) => {
+      const token = await register('report');
+      const { body: created } = await submit(token);
+      const jobId = created.data.id as string;
+      const job = await app.get(PrismaService).job.update({
+        where: { id: jobId },
+        data: { type: 'import.csv', status },
+      });
+
+      if (withReport) {
+        await app
+          .get(StorageService)
+          .upload(
+            errorReportKey(job.userId, jobId),
+            Readable.from(['line,reason\n3,name: Too small\n']),
+            {
+              contentType: 'text/csv; charset=utf-8',
+              downloadAs: 'import-errors.csv',
+            },
+          );
+      }
+
+      return { token, jobId };
+    };
+
+    const reportLink = (token: string, jobId: string) =>
+      request(server)
+        .get(`/jobs/${jobId}/error-report`)
+        .set('Authorization', `Bearer ${token}`);
+
+    it('answers with a short-lived link that downloads the report', async () => {
+      const { token, jobId } = await importWithReport();
+
+      const { status, body } = await reportLink(token, jobId);
+
+      expect(status).toBe(200);
+      expect(new Date(body.data.expiresAt).getTime()).toBeGreaterThan(
+        Date.now(),
+      );
+
+      const download = await fetch(body.data.url);
+
+      expect(download.status).toBe(200);
+      expect(download.headers.get('content-disposition')).toBe(
+        'attachment; filename="import-errors.csv"',
+      );
+      expect(await download.text()).toBe('line,reason\n3,name: Too small\n');
+    });
+
+    it("hides another tenant's report behind the job's 404", async () => {
+      const { jobId } = await importWithReport();
+      const stranger = await register('report-stranger');
+
+      const { status, body } = await reportLink(stranger, jobId);
+
+      expect(status).toBe(404);
+      expect(body.error.code).toBe('JOB_NOT_FOUND');
+    });
+
+    it.each([
+      ['every row was valid', 'SUCCEEDED', false],
+      ['the job is running again', 'RUNNING', true],
+    ] as const)('is not found when %s', async (_label, status, withReport) => {
+      const { token, jobId } = await importWithReport(status, {
+        withReport,
+      });
+
+      const { status: code, body } = await reportLink(token, jobId);
+
+      expect(code).toBe(404);
+      expect(body.error.code).toBe('ERROR_REPORT_NOT_FOUND');
     });
   });
 

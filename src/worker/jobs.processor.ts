@@ -136,6 +136,9 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           code: (isTerminal
             ? 'TERMINAL_FAILURE'
             : 'ATTEMPTS_EXHAUSTED') satisfies DeadLetterCode,
+          ...(cause instanceof TerminalJobError && cause.reason
+            ? { reason: cause.reason }
+            : {}),
           message: reason,
           attempt,
         });

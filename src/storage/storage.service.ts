@@ -12,6 +12,7 @@ import {
   S3Client,
   S3ServiceException,
 } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { SharedEnv } from '../config/env.schema.js';
@@ -160,6 +161,31 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
 
       throw error;
     }
+  }
+
+  /**
+   * Writes a stream to an object as it is produced, in parts, so an object of
+   * unknown length costs a part's worth of memory rather than its whole size.
+   * Replaces whatever the key held.
+   *
+   * @param downloadAs the file name a browser saves the object under.
+   * @throws when the stream or S3 fails; the parts already sent are discarded.
+   */
+  async upload(
+    key: string,
+    body: Readable,
+    { contentType, downloadAs }: { contentType: string; downloadAs: string },
+  ) {
+    await new Upload({
+      client: this.client,
+      params: {
+        Bucket: this.bucket,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+        ContentDisposition: `attachment; filename="${downloadAs}"`,
+      },
+    }).done();
   }
 
   /** A link that downloads one object until it expires. */

@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
 import {
+  ErrorReportNotFoundError,
   IdempotencyKeyReusedError,
   JobAlreadyFinishedError,
   JobNotDeadLetteredError,
@@ -11,7 +12,7 @@ import {
   UploadNotFoundError,
 } from '../common/errors/app-error.js';
 import { StorageService } from '../storage/storage.service.js';
-import { uploadPrefix } from '../storage/upload-key.js';
+import { errorReportKey, uploadPrefix } from '../storage/object-keys.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
 import { Prisma, type Job } from '../generated/prisma/client.js';
@@ -23,6 +24,10 @@ import type {
 } from './jobs.schema.js';
 import type { ApiEnv } from '../config/env.schema.js';
 import { requestHash } from './request-hash.js';
+
+// Fetched when the seller clicks, so a short life costs nothing: a link that
+// leaks from a browser history is dead within minutes.
+const REPORT_LINK_SECONDS = 300;
 
 // One shape for every message the outbox carries — submit, re-drive and bulk
 // re-drive alike — so the relay and the direct path publish the same thing
@@ -420,6 +425,36 @@ export class JobsService {
     }
 
     return job;
+  }
+
+  /**
+   * A link that downloads an import's error report, signed on each call rather
+   * than stored, so the link a client holds is never one that has expired.
+   *
+   * @throws JobNotFoundError when the job is not the caller's.
+   * @throws ErrorReportNotFoundError when the job has none: it has not
+   * succeeded, every row was valid, or the bucket has expired the report.
+   */
+  async errorReportLink(userId: string, jobId: string) {
+    const job = await this.findOne(userId, jobId);
+    const key = errorReportKey(userId, job.id);
+
+    // Only a finished import's: a report left by an earlier life of a job
+    // that is running again describes a run that is being redone.
+    if (
+      job.type !== 'import.csv' ||
+      job.status !== 'SUCCEEDED' ||
+      !(await this.storage.exists(key))
+    ) {
+      throw new ErrorReportNotFoundError();
+    }
+
+    // Taken before signing, like an upload slip's, so the time a client is
+    // told is never later than the one S3 holds the link to.
+    const expiresAt = new Date(Date.now() + REPORT_LINK_SECONDS * 1000);
+    const url = await this.storage.signDownload(key, REPORT_LINK_SECONDS);
+
+    return { url, expiresAt };
   }
 
   async findMany(userId: string, query: ListJobsQuery) {

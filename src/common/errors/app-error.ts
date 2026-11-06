@@ -76,6 +76,17 @@ export class IdempotencyKeyReusedError extends AppError {
   }
 }
 
+export class ErrorReportNotFoundError extends AppError {
+  readonly kind = 'NOT_FOUND' as const;
+  readonly code = 'ERROR_REPORT_NOT_FOUND';
+
+  constructor() {
+    super(
+      'This job has no error report: it has not finished, every row was valid, or the report has expired',
+    );
+  }
+}
+
 // 422 like a reused key: the body is well-formed, but what it names is not
 // there. One answer for "not yours" and "not uploaded", so a probe for another
 // tenant's key learns nothing from the difference.
@@ -91,6 +102,18 @@ export class UploadNotFoundError extends AppError {
 export class TerminalJobError extends AppError {
   readonly kind = 'VALIDATION' as const;
   readonly code = 'JOB_TERMINAL_FAILURE';
+
+  /**
+   * @param reason the handler's own name for this failure, stored on the dead
+   * letter beside the engine's `TERMINAL_FAILURE`, so a client can tell one
+   * terminal failure from another without reading the message.
+   */
+  constructor(
+    message: string,
+    readonly reason?: string,
+  ) {
+    super(message);
+  }
 }
 
 export class JobNotDeadLetteredError extends AppError {

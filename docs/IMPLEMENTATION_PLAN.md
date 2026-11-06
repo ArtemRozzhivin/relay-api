@@ -678,8 +678,9 @@ rows.
   _A re-drive asks "did this happen?", not "do it again" — the same semantic already settled for_
   `effectKey`_._
   ```
-- [ ] **B.5 · Error report** — invalid rows to `error-report.csv` in storage, presigned link in the
-  job result; bad rows never fail the job, but `IMPORT_MOSTLY_INVALID` fails fast on a wrong file.
+- [x] **B.5 · Error report** — invalid rows to `reports/<userId>/<jobId>.csv` in storage, a link
+  signed on request by `GET /jobs/:id/error-report` rather than stored in the result, where it
+  would expire; bad rows never fail the job, but `IMPORT_MOSTLY_INVALID` fails fast on a wrong file.
   ```
   _Distinguish "this data has problems" from "this is not the file you think it is"._
   ```
@@ -694,7 +695,7 @@ rows.
 - [x] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
   exact and contains no duplicates
 - [x] **A15 passes** — the same file submitted twice returns the first job
-- [ ] The error report is downloadable and its row numbers match the source file
+- [x] The error report is downloadable and its row numbers match the source file
 
 ---
 

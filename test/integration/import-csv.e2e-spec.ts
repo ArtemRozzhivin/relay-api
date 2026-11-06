@@ -1,13 +1,26 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { Readable } from 'node:stream';
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+  vi,
+} from 'vitest';
 import { Test } from '@nestjs/testing';
 import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { StorageModule } from '../../src/storage/storage.module.js';
 import { StorageService } from '../../src/storage/storage.service.js';
-import { mintUploadKey } from '../../src/storage/upload-key.js';
+import { parse as parseCsv } from 'csv-parse/sync';
+import {
+  errorReportKey,
+  mintUploadKey,
+} from '../../src/storage/object-keys.js';
 import { ProductsModule } from '../../src/products/products.module.js';
 import { ImportCsvJobHandler } from '../../src/jobs/handlers/import-csv.handler.js';
 import { JobCancelledError } from '../../src/jobs/job-handler.js';
@@ -62,6 +75,26 @@ describe('the import.csv handler', () => {
     return {
       ...recorded,
       result: handler.run(recorded.context, { key }),
+    };
+  };
+
+  // The report as a seller would open it: undefined when none was written.
+  const reportOf = async (userId: string) => {
+    // 'a-job' is the job id every recording context carries.
+    const opened = await storage.openStream(errorReportKey(userId, 'a-job'));
+
+    if (typeof opened === 'string') {
+      return undefined;
+    }
+
+    const text = Buffer.concat(await opened.body.toArray()).toString('utf8');
+
+    return {
+      text,
+      rows: parseCsv(text, { bom: true, columns: true }) as Record<
+        string,
+        string
+      >[],
     };
   };
 
@@ -232,6 +265,170 @@ describe('the import.csv handler', () => {
     );
   });
 
+  describe('the error report', () => {
+    it('lists every bad row by its line in the file, with what it held', async () => {
+      const userId = await store();
+      const key = await upload(
+        userId,
+        [
+          'sku,name,price,currency,description',
+          // A quoted newline: this record spans lines 2 and 3, so every line
+          // after it is one more than its record number.
+          'A-1,Mug,8.99,EUR,"two',
+          'lines"',
+          'B-2,,5,EUR,',
+          'C-3,"=HYPERLINK(""https://evil.example"")",abc,EUR,',
+          'D-4,Bowl,1,EUR,',
+          'E-5,Plate,2,EUR,',
+          'F-6,Cup,3,EUR,',
+        ].join('\n'),
+      );
+
+      expect(await run(userId, key).result).toMatchObject({
+        imported: 4,
+        invalid: 2,
+      });
+
+      const report = await reportOf(userId);
+
+      expect(report?.rows).toEqual([
+        {
+          line: '4',
+          reason: expect.stringMatching(/^name:/),
+          sku: 'B-2',
+          name: '',
+          price: '5',
+          currency: 'EUR',
+          description: '',
+          imageUrl: '',
+        },
+        expect.objectContaining({
+          line: '5',
+          reason: expect.stringMatching(/^price:/),
+          // Escaped, so a spreadsheet shows it rather than running it.
+          name: `'=HYPERLINK("https://evil.example")`,
+        }),
+      ]);
+      // Excel needs it to read the file as UTF-8.
+      expect(report?.text.startsWith('\uFEFF')).toBe(true);
+    });
+
+    // About 1.5 MB of bad rows, far more than the streams between the file
+    // and the report buffer, so the pass that writes the report is left
+    // waiting on a reader that has gone. The attempt fails either way; what
+    // matters is that the pass is torn down, or the download it reads would
+    // stay open for the life of the worker. A small file would prove nothing:
+    // the parser takes all of it into its buffer and the download ends anyway.
+    it('closes the file when S3 stops taking the report', async () => {
+      const userId = await store();
+      const key = await upload(
+        userId,
+        [
+          ...rowsOf(100).split('\n'),
+          ...Array.from({ length: 100_000 }, (_, index) => `X-${index},,1,EUR`),
+        ].join('\n'),
+      );
+
+      const reads: Readable[] = [];
+      const openStream = storage.openStream.bind(storage);
+
+      onTestFinished(() => {
+        vi.restoreAllMocks();
+      });
+      vi.spyOn(storage, 'openStream').mockImplementation(async (...args) => {
+        const opened = await openStream(...args);
+
+        if (typeof opened !== 'string') {
+          reads.push(opened.body);
+        }
+
+        return opened;
+      });
+      vi.spyOn(storage, 'upload').mockRejectedValueOnce(
+        new Error('S3 is down'),
+      );
+
+      await expect(run(userId, key).result).rejects.toThrow('S3 is down');
+
+      // The second read is the report's, stopped before its end.
+      expect(reads).toHaveLength(2);
+      await vi.waitFor(() => {
+        expect(reads[1]?.destroyed).toBe(true);
+      });
+      expect(reads[1]?.readableEnded).toBe(false);
+    });
+
+    it('is not written when every row is valid', async () => {
+      const userId = await store();
+      const key = await upload(userId, rowsOf(10));
+
+      await run(userId, key).result;
+
+      expect(await reportOf(userId)).toBeUndefined();
+    });
+  });
+
+  describe('a file that is mostly invalid', () => {
+    // Prices with decimal commas, as a European spreadsheet exports them.
+    const commaPrices = (count: number) =>
+      Array.from(
+        { length: count },
+        (_, index) => `C-${index},Product ${index},"19,99",EUR`,
+      );
+
+    it('fails for good on its opening rows, writing nothing', async () => {
+      const userId = await store();
+      const key = await upload(
+        userId,
+        [
+          'sku,name,price,currency',
+          ...commaPrices(60),
+          ...rowsOf(1000).split('\n').slice(1),
+        ].join('\n'),
+      );
+
+      const failure = run(userId, key).result;
+
+      await expect(failure).rejects.toMatchObject({
+        reason: 'IMPORT_MOSTLY_INVALID',
+        message: expect.stringMatching(
+          /^60 of the first 100 rows are invalid \(line 2: price:/,
+        ),
+      });
+      expect(await catalog(userId)).toEqual([]);
+      expect(await reportOf(userId)).toBeUndefined();
+    });
+
+    it('judges a file shorter than that whole', async () => {
+      const userId = await store();
+      const key = await upload(
+        userId,
+        ['sku,name,price,currency', ...commaPrices(2), 'A-1,Mug,1,EUR'].join(
+          '\n',
+        ),
+      );
+
+      await expect(run(userId, key).result).rejects.toMatchObject({
+        reason: 'IMPORT_MOSTLY_INVALID',
+      });
+      expect(await catalog(userId)).toEqual([]);
+    });
+
+    it('judges only the opening rows: later bad rows are reported, not fatal', async () => {
+      const userId = await store();
+      const key = await upload(
+        userId,
+        [...rowsOf(100).split('\n'), ...commaPrices(150)].join('\n'),
+      );
+
+      expect(await run(userId, key).result).toMatchObject({
+        imported: 100,
+        invalid: 150,
+      });
+      expect((await reportOf(userId))?.rows).toHaveLength(150);
+    });
+  });
+
   describe('resuming from a checkpoint', () => {
     // One bad row ahead of the first batch, so the counts a resume carries
     // forward are not all equal to the row count.
@@ -308,6 +505,12 @@ describe('the import.csv handler', () => {
         1001, 1201,
       ]);
       expect(second.lines).toContain('resuming after record 1001');
+
+      // The bad row sits before the checkpoint, where this run never looked;
+      // the report lists it all the same.
+      expect((await reportOf(userId))?.rows).toEqual([
+        expect.objectContaining({ line: '2', sku: 'BAD' }),
+      ]);
     });
 
     it('fails for good when the file was replaced after the import began', async () => {

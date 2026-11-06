@@ -8,7 +8,7 @@ import request from 'supertest';
 import { AppModule } from '../../src/app.module.js';
 import { DeleteObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { StorageService } from '../../src/storage/storage.service.js';
-import { mintUploadKey } from '../../src/storage/upload-key.js';
+import { mintUploadKey } from '../../src/storage/object-keys.js';
 import { UPLOAD_MAX_BYTES } from '../../src/uploads/uploads.service.js';
 import { postUploadForm as send } from '../support/upload-form.js';
 
