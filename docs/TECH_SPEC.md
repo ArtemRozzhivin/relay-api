@@ -255,6 +255,9 @@ code it gives each item it sells), never by our `id`, so the SKU is the key an i
 | `priceCents` | `int` | Whole minor units, never a float. **DB** `CHECK (priceCents >= 0)` |
 | `currency` | `text` | ISO 4217. **DB** `CHECK (currency ~ '^[A-Z]{3}$')` |
 | `imageUrl` | `text?` | As written in the file — untrusted until phase C's outbound guard has checked it |
+| `imageStatus` | `text?` | `READY` or `FAILED`: what `image.process` concluded about `imageSourceUrl` (§6.3c). **DB** `CHECK` |
+| `imageSourceUrl` | `text?` | The `imageUrl` that conclusion is about. Set exactly when `imageStatus` is (**DB** `CHECK`). Once an import replaces `imageUrl`, the two differ and the image reads as not processed yet — nothing has to clear the old conclusion |
+| `imageError` | `text?` | Why the image at `imageSourceUrl` could not be used. **DB** `CHECK`: only when `FAILED` |
 | `createdAt` / `updatedAt` | `timestamptz(6)` | |
 
 **DB** `UNIQUE (userId, sku)` — per store, because two stores' `A-1` are unrelated. This is what
@@ -373,7 +376,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
-| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14) |
+| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
@@ -432,6 +435,7 @@ that is not on the row, that stops being true and a stored-response table become
 | | `reference` | 1–200 chars | required |
 | | `delayMs` | `0`–`60000` | `0` |
 | `import.csv` | `key` | a key from `POST /uploads` (§6.3a), the caller's own, uploaded | required |
+| `image.process` | `skus` | 1–50 skus, each 1–100 chars; any the caller has no product for are reported, not refused | required |
 
 `maxAttempts` is on the body itself, not the payload: `1`–`20`, default `5`.
 
@@ -536,6 +540,40 @@ The file is reopened only if its `ETag` still matches: the upload slip is reusab
 expires, and a resume over different bytes under the same key would skip rows nobody imported, so
 a replaced file is a terminal error and `POST /jobs/:id/retry?from=start` imports it from the top.
 A resumed import reports its checkpoint as its first `processed`.
+
+### 6.3c `image.process` — a batch of product images
+
+The payload names up to 50 of the caller's skus: a batch, because one job per product makes a
+20 000-product catalog 20 000 jobs, and one job for the catalog lets a single slow image hold up
+the rest. For each product whose current `imageUrl` has no `READY` result yet, the worker
+downloads it through the guard (§7.9) — `jpeg`, `png`, `webp`, `gif` or `avif`, at most 10 MB, 15 s
+— and makes three WebP sizes with `sharp`: `thumb` 200, `medium` 600 and `large` 1200 pixels wide,
+upright by their EXIF orientation, never enlarged, without the source's metadata, which can carry
+where a photo was taken. A source over 40 megapixels is refused before it is decoded: a small file
+can declare enormous dimensions and take gigabytes to open.
+
+The sizes go to `products/<userId>/<productId>/<hash of the source URL>/<size>.webp`. The source
+URL is in the key so that a slow job still making a URL the seller has since replaced writes beside
+the new image rather than over it; the key is otherwise fixed, so a re-run overwrites its own
+files with the same bytes and needs no ledger. The files are written first and the product
+recorded `READY` second, and only while `imageUrl` still equals the URL that was processed — a
+crash between the two leaves files nothing points at yet, never a row pointing at missing files,
+and an import that replaced the URL meanwhile wins. A replaced URL's old files stay in the bucket.
+
+Between products the job reports `processed` out of `total` and honours a cancellation, so a
+stopped batch has recorded whole images only. A product already `READY` for its current URL is
+skipped, which is what lets a retry redo only the rest.
+
+```jsonc
+// result
+{ "requested": 3, "processed": 1, "superseded": 0, "alreadyReady": 1, "withoutImage": 0,
+  "notFound": ["X-9"] }
+```
+
+`superseded` counts products whose URL changed while the job worked on the old one. In
+`GET /products`, each product's `image` is `null` without an `imageUrl`, `{ "status": "PENDING" }`
+until its current URL is processed, `{ "status": "READY", "thumb", "medium", "large" }` with links
+signed for an hour on each read, or `{ "status": "FAILED", "error" }`.
 
 ### 6.4 Validation
 
@@ -1281,8 +1319,9 @@ readiness rather than container start. App and worker are the same image with di
 admin user (never the root user):
 
 1. A bucket in the chosen region: ACLs disabled, Block Public Access on, SSE-S3, versioning off,
-   and a lifecycle rule expiring current objects after 7 days and incomplete multipart uploads
-   after 1.
+   and lifecycle rules **scoped by prefix**, because `products/` holds product images that must
+   not expire: `uploads/` and `reports/` expire after 7 days, `fixtures/` (written by the tests)
+   after 1, and incomplete multipart uploads are aborted after 1 day across the bucket.
 2. An IAM user for the app — no console access, no group — with one inline policy:
 
    ```json
@@ -1750,6 +1789,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-09 | §4.7, §6.2, §6.3, §6.3c, §13.4 — `image.process`: a batch of up to 50 skus made into three WebP sizes under the source URL's hash, recorded `READY` only while that URL is still the product's. `Product` gains `imageStatus`, `imageSourceUrl` and `imageError`; `GET /products` shows each product's `image` with links signed per read. The bucket's lifecycle rules are scoped by prefix so product images do not expire. |
 | 2026-11-09 | §7.9 — requests to a user's URL go through a guard: public unicast addresses only, checked inside the connection's own lookup and again on every redirect, ports 80 and 443, a whole-download timeout and a counted byte cap. A16 automated, in the integration tier: the guard needs no process to attack. |
 | 2026-11-09 | §4.3, §6.2, D14 — **decided**: `/jobs` and the new `/products` page with an opaque keyset cursor; `offset` and `total` removed from `/jobs`. `Job.createdAt` narrowed to milliseconds so a cursor survives a JS `Date`, and the job list's indexes gain `id`. Measured: 6.3 ms by offset against 0.019 ms by cursor on the last page of 20 000 products. |
 | 2026-11-06 | §4.3, §6.2, §6.3b — the error report: every bad row to `reports/<userId>/<jobId>.csv` from a second read of the file, and `GET /jobs/:id/error-report` signing a link on each call. A file whose first 100 rows are mostly bad fails before anything is written, as `error.reason: 'IMPORT_MOSTLY_INVALID'` — `reason` added beside the engine's `code`. |

@@ -1,10 +1,23 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
-import type { Prisma } from '../generated/prisma/client.js';
+import type { Prisma, Product } from '../generated/prisma/client.js';
 import { toPage } from '../common/pagination/cursor.js';
+import { StorageService } from '../storage/storage.service.js';
+import { productImageKey } from '../storage/object-keys.js';
+import { IMAGE_SIZES, type ImageSize } from '../images/image-variants.js';
 import type { ListProductsQuery } from './products.schema.js';
 
 /** One product as an import writes it, after its row has been validated. */
+// Signed per page, never stored: a stored link would have expired by the time
+// anyone opened it. An hour outlives any page a client keeps open.
+const IMAGE_LINK_SECONDS = 3600;
+
+/** A product's image as a client sees it. */
+export type ProductImage =
+  | { status: 'PENDING' }
+  | ({ status: 'READY' } & Record<ImageSize, string>)
+  | { status: 'FAILED'; error: string | null };
+
 export interface ProductRow {
   sku: string;
   name: string;
@@ -16,7 +29,10 @@ export interface ProductRow {
 
 @Injectable()
 export class ProductsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly storage: StorageService,
+  ) {}
 
   /**
    * The caller's catalog in sku order, one page per call (D14). Read from the
@@ -33,7 +49,87 @@ export class ProductsService {
       take: limit + 1,
     });
 
-    return toPage(rows, limit, (product) => ({ sku: product.sku }));
+    const page = toPage(rows, limit, (product) => ({ sku: product.sku }));
+
+    return {
+      ...page,
+      items: await Promise.all(
+        page.items.map((product) => this.toView(product)),
+      ),
+    };
+  }
+
+  /**
+   * The caller's products among `skus`, with what image.process needs to know
+   * about each. A sku the caller has no product for is simply absent.
+   */
+  forImages(userId: string, skus: string[]) {
+    return this.prisma.product.findMany({
+      where: { userId, sku: { in: skus } },
+      select: {
+        id: true,
+        sku: true,
+        imageUrl: true,
+        imageStatus: true,
+        imageSourceUrl: true,
+      },
+    });
+  }
+
+  /**
+   * Records that the image at `sourceUrl` is ready — only while it is still the
+   * product's `imageUrl`. An import that replaced the URL meanwhile wins: this
+   * result describes an image the product no longer has.
+   *
+   * @returns whether it was recorded.
+   */
+  async recordImageReady(userId: string, productId: string, sourceUrl: string) {
+    const { count } = await this.prisma.product.updateMany({
+      where: { id: productId, userId, imageUrl: sourceUrl },
+      data: {
+        imageStatus: 'READY',
+        imageSourceUrl: sourceUrl,
+        imageError: null,
+      },
+    });
+
+    return count === 1;
+  }
+
+  // The image columns describe the URL they were concluded for; the client is
+  // told what they mean for the URL the product has now.
+  private async toView({
+    imageStatus,
+    imageSourceUrl,
+    imageError,
+    ...product
+  }: Product) {
+    let image: ProductImage | null = null;
+
+    if (product.imageUrl === null) {
+      image = null;
+    } else if (imageSourceUrl !== product.imageUrl) {
+      image = { status: 'PENDING' };
+    } else if (imageStatus === 'FAILED') {
+      image = { status: 'FAILED', error: imageError };
+    } else {
+      const links = await Promise.all(
+        IMAGE_SIZES.map(async ({ name }) => [
+          name,
+          await this.storage.signDownload(
+            productImageKey(product.userId, product.id, imageSourceUrl, name),
+            IMAGE_LINK_SECONDS,
+          ),
+        ]),
+      );
+
+      image = {
+        status: 'READY',
+        ...(Object.fromEntries(links) as Record<ImageSize, string>),
+      };
+    }
+
+    return { ...product, image };
   }
 
   /**

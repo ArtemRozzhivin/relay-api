@@ -5,6 +5,7 @@ import { Test } from '@nestjs/testing';
 import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
+import { ProductsModule } from '../../src/products/products.module.js';
 import {
   ProductsService,
   type ProductRow,
@@ -56,8 +57,8 @@ describe('the product upsert', () => {
           envFilePath: ['.env'],
         }),
         PrismaModule,
+        ProductsModule,
       ],
-      providers: [ProductsService],
     }).compile();
 
     await moduleRef.init();

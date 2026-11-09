@@ -713,7 +713,10 @@ private.
   _Blocking by hostname is not enough: a name that resolves to 169.254.169.254 is the attack.
   Resolve first, check the address, then connect._
   ```
-- [ ] **C.2 ·** `sharp` **variants** at deterministic keys `products/{userId}/{sku}/{size}.webp`.
+- [x] **C.2 ·** `sharp` **variants** at deterministic keys
+  `products/{userId}/{productId}/{hash of source URL}/{size}.webp` (§6.3c) — the product's id, not
+  its sku, which can hold `/` or spaces; the source URL's hash, so a slow job for a replaced URL
+  writes beside the new image instead of over it.
   ```
   _A deterministic key makes a re-run overwrite with identical bytes, so idempotency needs no
   ledger here._

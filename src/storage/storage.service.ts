@@ -168,13 +168,14 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
    * unknown length costs a part's worth of memory rather than its whole size.
    * Replaces whatever the key held.
    *
-   * @param downloadAs the file name a browser saves the object under.
+   * @param downloadAs the file name a browser saves the object under; without
+   * one, a browser shows the object rather than saving it.
    * @throws when the stream or S3 fails; the parts already sent are discarded.
    */
   async upload(
     key: string,
     body: Readable,
-    { contentType, downloadAs }: { contentType: string; downloadAs: string },
+    { contentType, downloadAs }: { contentType: string; downloadAs?: string },
   ) {
     await new Upload({
       client: this.client,
@@ -183,7 +184,9 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
         Key: key,
         Body: body,
         ContentType: contentType,
-        ContentDisposition: `attachment; filename="${downloadAs}"`,
+        ...(downloadAs === undefined
+          ? {}
+          : { ContentDisposition: `attachment; filename="${downloadAs}"` }),
       },
     }).done();
   }

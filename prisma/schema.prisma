@@ -118,19 +118,25 @@ model Outbox {
 /// our `id`, so `(userId, sku)` is what an import matches on — and what makes a replayed batch
 /// harmless (D30).
 model Product {
-  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId      String   @db.Uuid
-  sku         String
-  name        String
-  description String?
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String   @db.Uuid
+  sku            String
+  name           String
+  description    String?
   /// Whole minor units, never a float: 0.1 + 0.2 is not 0.3.
-  priceCents  Int
+  priceCents     Int
   /// ISO 4217, three capital letters.
-  currency    String
+  currency       String
   /// As written in the file, so untrusted until phase C's guard has checked it.
-  imageUrl    String?
-  createdAt   DateTime @default(now()) @db.Timestamptz(6)
-  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+  imageUrl       String?
+  /// `READY` or `FAILED`: what image.process concluded about `imageSourceUrl`. Describes the
+  /// product's image only while `imageSourceUrl` equals `imageUrl`.
+  imageStatus    String?
+  imageSourceUrl String?
+  /// Why the image at `imageSourceUrl` could not be used; set only when `FAILED`.
+  imageError     String?
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(6)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
