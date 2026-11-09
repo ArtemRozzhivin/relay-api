@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { JobStatus } from '../generated/prisma/enums.js';
 import { DEAD_LETTER_CODES } from './job-error-codes.js';
+import { UPLOAD_KEY_PATTERN } from '../storage/object-keys.js';
+import { cursorParam, limitParam } from '../common/pagination/cursor.js';
 
 // The payload schemas tolerate unknown keys: the worker re-parses the stored
 // payload (§6.4), and a job written by a newer deploy can reach an older worker.
@@ -13,6 +15,14 @@ export const mockPayloadSchema = z.object({
   // Splits the sleep into reporting intervals: a mock job is the only job that
   // can exercise progress until the CSV import exists (PB).
   steps: z.coerce.number().int().min(1).max(100).default(1),
+});
+
+// Whose upload it is cannot be known here, only its shape; the submit and the
+// handler both check the prefix against the job's owner.
+export const importCsvPayloadSchema = z.object({
+  key: z
+    .string()
+    .regex(UPLOAD_KEY_PATTERN, 'expected a key from POST /uploads'),
 });
 
 export const chargePayloadSchema = z.object({
@@ -38,6 +48,13 @@ export const submitJobSchema = z.discriminatedUnion('type', [
       maxAttempts: maxAttemptsSchema,
     })
     .strict(),
+  z
+    .object({
+      type: z.literal('import.csv'),
+      payload: importCsvPayloadSchema.strict(),
+      maxAttempts: maxAttemptsSchema,
+    })
+    .strict(),
 ]);
 
 export type SubmitJobInput = z.infer<typeof submitJobSchema>;
@@ -59,8 +76,14 @@ export const listJobsSchema = z
     // would otherwise have left jobs in that state unfilterable.
     status: z.enum(JobStatus).optional(),
     type: z.enum(JOB_TYPES).optional(),
-    limit: z.coerce.number().int().min(1).max(100).default(20),
-    offset: z.coerce.number().int().min(0).default(0),
+    limit: limitParam,
+    // The last job a page held, by the two values the list is ordered on.
+    cursor: cursorParam(
+      z.object({
+        createdAt: z.iso.datetime().pipe(z.coerce.date()),
+        id: z.uuid(),
+      }),
+    ).optional(),
   })
   .strict();
 
@@ -109,5 +132,13 @@ export const bulkRedriveSchema = z
 export type BulkRedriveInput = z.infer<typeof bulkRedriveSchema>;
 
 export const jobIdSchema = z.uuid();
+
+// Resuming is the default and needs no word for it (D26); a restart is the one
+// a caller has to ask for.
+export const redriveQuerySchema = z
+  .object({ from: z.literal('start').optional() })
+  .strict();
+
+export type RedriveQuery = z.infer<typeof redriveQuerySchema>;
 
 export type ListJobsQuery = z.infer<typeof listJobsSchema>;

@@ -8,22 +8,27 @@ import {
 import type { JobEventsPublisher } from './job-events.publisher.js';
 import type { JobTransitionService } from './job-transition.service.js';
 import type { JobProgress } from './job-progress.js';
+import { JobCancelledError } from './job-handler.js';
 
 const WINDOW_MS = 500;
 
 const running: {
   jobId: string;
+  userId: string;
   attempt: number;
   lease: number;
   correlationId: string;
   progress: Prisma.JsonValue | null;
+  checkpoint: Prisma.JsonValue | null;
 } = {
   jobId: 'a-job',
+  userId: 'a-user',
   attempt: 2,
   // Deliberately not the attempt, so a write carrying the wrong one shows.
   lease: 7,
   correlationId: 'req-1',
   progress: null,
+  checkpoint: null,
 };
 
 type Write = (
@@ -44,6 +49,12 @@ const build = (
   write: Write,
   job: Partial<typeof running> = {},
   isWanted: () => Promise<boolean> = async () => true,
+  commitCheckpoint: (
+    jobId: string,
+    lease: number,
+    work: (tx: Prisma.TransactionClient) => Promise<unknown>,
+    checkpoint: (value: unknown) => Prisma.InputJsonValue,
+  ) => Promise<{ value: unknown } | null> = async () => null,
 ): Harness => {
   const writes: JobProgress[] = [];
   const emitted: Job[] = [];
@@ -55,6 +66,7 @@ const build = (
       return write(...args);
     },
     isWanted,
+    commitCheckpoint,
   } as unknown as JobTransitionService;
 
   const events = {
@@ -373,6 +385,51 @@ describe('JobContextFactory', () => {
       await expect(harness.context.shouldStop()).rejects.toThrow(
         'connection terminated',
       );
+    });
+  });
+
+  describe('commit', () => {
+    const tx = {} as Prisma.TransactionClient;
+
+    it('hands back what the work returned, under the claimed lease', async () => {
+      const seen: { lease: number; checkpoint: Prisma.InputJsonValue }[] = [];
+      const harness = build(
+        accepts,
+        {},
+        undefined,
+        async (_jobId, lease, work, checkpoint) => {
+          const value = await work(tx);
+
+          seen.push({ lease, checkpoint: checkpoint(value) });
+
+          return { value };
+        },
+      );
+
+      const value = await harness.context.commit(
+        async () => 500,
+        (count) => ({ records: count }),
+      );
+
+      expect(value).toBe(500);
+      expect(seen).toEqual([{ lease: 7, checkpoint: { records: 500 } }]);
+    });
+
+    it('stops the handler when the checkpoint was refused', async () => {
+      const harness = build(accepts, {}, undefined, async () => null);
+
+      await expect(
+        harness.context.commit(
+          async () => 500,
+          () => ({}),
+        ),
+      ).rejects.toBeInstanceOf(JobCancelledError);
+    });
+
+    it('exposes the checkpoint the claimed row holds', () => {
+      const harness = build(accepts, { checkpoint: { records: 1000 } });
+
+      expect(harness.context.checkpoint).toEqual({ records: 1000 });
     });
   });
 

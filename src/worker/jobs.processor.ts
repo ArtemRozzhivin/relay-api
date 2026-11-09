@@ -69,10 +69,12 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
     const context = this.contexts.create({
       jobId,
+      userId: claimed.userId,
       attempt,
       lease,
       correlationId,
       progress: claimed.progress,
+      checkpoint: claimed.checkpoint,
     });
 
     try {
@@ -134,6 +136,9 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           code: (isTerminal
             ? 'TERMINAL_FAILURE'
             : 'ATTEMPTS_EXHAUSTED') satisfies DeadLetterCode,
+          ...(cause instanceof TerminalJobError && cause.reason
+            ? { reason: cause.reason }
+            : {}),
           message: reason,
           attempt,
         });

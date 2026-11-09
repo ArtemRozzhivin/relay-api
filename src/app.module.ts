@@ -10,6 +10,8 @@ import { HealthModule } from './health/health.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { JobsModule } from './jobs/jobs.module.js';
 import { EventsModule } from './events/events.module.js';
+import { UploadsModule } from './uploads/uploads.module.js';
+import { ProductsModule } from './products/products.module.js';
 import { BullModule } from '@nestjs/bullmq';
 import { DomainExceptionFilter } from './common/filters/domain-exception.filter.js';
 import { ResponseEnvelopeInterceptor } from './common/interceptors/response-envelope.interceptor.js';
@@ -40,6 +42,8 @@ import { buildLoggerParams } from './common/logging/logger.params.js';
     AuthModule,
     JobsModule,
     EventsModule,
+    UploadsModule,
+    ProductsModule,
   ],
   controllers: [AppController],
   providers: [

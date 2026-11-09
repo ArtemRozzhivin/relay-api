@@ -23,6 +23,7 @@ model User {
 
   refreshTokens RefreshToken[]
   jobs          Job[]
+  products      Product[]
 }
 
 model RefreshToken {
@@ -65,9 +66,13 @@ model Job {
   result          Json?
   error           Json?
   progress        Json?
+  /// What the last committed batch recorded, so a retry or a re-drive resumes
+  /// after it (D26). Written in the batch's own transaction; never sent to a client.
+  checkpoint      Json?
   cancelRequested Boolean   @default(false)
   correlationId   String
-  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+  /// Milliseconds, not microseconds: the list's cursor carries it through a JS Date (D14).
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
   startedAt       DateTime? @db.Timestamptz(6)
   finishedAt      DateTime? @db.Timestamptz(6)
@@ -77,7 +82,8 @@ model Job {
   outbox      Outbox[]
 
   @@unique([userId, idempotencyKey])
-  @@index([userId, status, createdAt(sort: Desc)])
+  @@index([userId, status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model SideEffect {
@@ -106,4 +112,27 @@ model Outbox {
   publishedAt DateTime? @db.Timestamptz(6)
 
   job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+}
+
+/// A store's product, written by `import.csv`. A store knows it by its own `sku`, never by
+/// our `id`, so `(userId, sku)` is what an import matches on — and what makes a replayed batch
+/// harmless (D30).
+model Product {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @db.Uuid
+  sku         String
+  name        String
+  description String?
+  /// Whole minor units, never a float: 0.1 + 0.2 is not 0.3.
+  priceCents  Int
+  /// ISO 4217, three capital letters.
+  currency    String
+  /// As written in the file, so untrusted until phase C's guard has checked it.
+  imageUrl    String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, sku])
 }

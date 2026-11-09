@@ -18,17 +18,24 @@ import {
   bulkRedriveSchema,
   jobIdSchema,
   listJobsSchema,
+  redriveQuerySchema,
   submitJobSchema,
   type BulkRedriveInput,
   type ListJobsQuery,
+  type RedriveQuery,
   type SubmitJobInput,
 } from './jobs.schema.js';
 
-// The fingerprint is how the API recognises a retry (D28) and the lease is how
-// workers recognise each other (D7); neither is part of the job a client sees,
-// and a field in a response is a field clients come to rely on.
-const toJobView = ({ requestHash: _requestHash, lease: _lease, ...job }: Job) =>
-  job;
+// The fingerprint is how the API recognises a retry (D28), the lease is how
+// workers recognise each other (D7), and the checkpoint is where a handler
+// resumes (D26); none is part of the job a client sees, and a field in a
+// response is a field clients come to rely on.
+const toJobView = ({
+  requestHash: _requestHash,
+  lease: _lease,
+  checkpoint: _checkpoint,
+  ...job
+}: Job) => job;
 
 @Controller('jobs')
 export class JobsController {
@@ -67,9 +74,14 @@ export class JobsController {
   async redrive(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id', { schema: jobIdSchema }) id: string,
+    @Query({ schema: redriveQuerySchema }) { from }: RedriveQuery,
     @Req() request: Request,
   ) {
-    return toJobView(await this.jobs.redrive(user.id, id, String(request.id)));
+    return toJobView(
+      await this.jobs.redrive(user.id, id, String(request.id), {
+        fromStart: from === 'start',
+      }),
+    );
   }
 
   @Post(':id/cancel')
@@ -87,6 +99,14 @@ export class JobsController {
     @Param('id', { schema: jobIdSchema }) id: string,
   ) {
     return toJobView(await this.jobs.findOne(user.id, id));
+  }
+
+  @Get(':id/error-report')
+  errorReport(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', { schema: jobIdSchema }) id: string,
+  ) {
+    return this.jobs.errorReportLink(user.id, id);
   }
 
   @Get()

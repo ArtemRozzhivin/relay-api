@@ -6,6 +6,8 @@ const valid = {
   REDIS_URL: 'redis://localhost:6379',
   JWT_ACCESS_SECRET: 'a'.repeat(32),
   JWT_REFRESH_SECRET: 'b'.repeat(32),
+  AWS_REGION: 'eu-central-1',
+  S3_BUCKET: 'a-bucket',
 };
 
 describe('apiEnvSchema', () => {

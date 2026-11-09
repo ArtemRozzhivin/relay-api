@@ -3,6 +3,7 @@ import type { Prisma } from '../generated/prisma/client.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
 import type { JobContext } from './job-context.js';
+import { JobCancelledError } from './job-handler.js';
 import { readProgress, type JobProgress } from './job-progress.js';
 
 // Below any real count, so a handler's first report of `processed: 0` — the one
@@ -19,6 +20,7 @@ const REPORT_WINDOW_MS = 500;
 
 interface RunningJob {
   jobId: string;
+  userId: string;
   attempt: number;
 
   /** The ownership token claim() handed this delivery; every write carries it. */
@@ -27,6 +29,7 @@ interface RunningJob {
 
   /** What the row already says, so a retry neither re-reports nor erases it. */
   progress: Prisma.JsonValue | null;
+  checkpoint: Prisma.JsonValue | null;
 }
 
 /**
@@ -61,7 +64,9 @@ class RunningJobContext implements ManagedJobContext {
 
   constructor(
     readonly jobId: string,
+    readonly userId: string,
     readonly attempt: number,
+    readonly checkpoint: Prisma.JsonValue | null,
     private readonly lease: number,
     private readonly correlationId: string,
     // The highest count accepted so far, and the last `total`/`message` seen —
@@ -94,6 +99,27 @@ class RunningJobContext implements ManagedJobContext {
     }
 
     return this.pending;
+  }
+
+  async commit<T>(
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+    checkpoint: (value: T) => Prisma.InputJsonValue,
+  ) {
+    const committed = await this.transitions.commitCheckpoint(
+      this.jobId,
+      this.lease,
+      work,
+      checkpoint,
+    );
+
+    // The same answer shouldStop() would give: nothing more this attempt does
+    // will count, and the attempt that holds the job now resumes from the last
+    // checkpoint that did.
+    if (!committed) {
+      throw new JobCancelledError();
+    }
+
+    return committed.value;
   }
 
   async shouldStop() {
@@ -223,16 +249,20 @@ export class JobContextFactory {
 
   create({
     jobId,
+    userId,
     attempt,
     lease,
     correlationId,
     progress,
+    checkpoint,
   }: RunningJob): ManagedJobContext {
     const stored = readProgress(progress);
 
     return new RunningJobContext(
       jobId,
+      userId,
       attempt,
+      checkpoint,
       lease,
       correlationId,
       stored.processed ?? NOTHING_REPORTED,

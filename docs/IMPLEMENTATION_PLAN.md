@@ -654,34 +654,37 @@ rows.
 
 ### Tasks
 
-- [ ] **B.1 · MinIO in compose** + `@aws-sdk/client-s3` (`forcePathStyle`), presigned `PUT` for
-  upload and short-expiry presigned `GET` for download.
+- [x] **B.1 · AWS S3** (D29) — a dev bucket and a bucket-only IAM user, `@aws-sdk/client-s3`,
+  `POST /uploads` returning a presigned **POST** for upload, and a short-expiry presigned `GET`
+  for download. MinIO, planned here, was archived in 2026.
   ```
-  _The API never streams a file body. Moving to real S3 then changes config, not code._
+  _The API never streams a file body, and S3 — not the API — enforces the upload's size._
   ```
-- [ ] **B.2 ·** `Product` **model** — `UNIQUE (userId, sku)`.
+- [x] **B.2 ·** `Product` **model** — `UNIQUE (userId, sku)`, and the one-statement batch upsert
+  (D30).
   ```
   _This constraint is what makes a replayed batch harmless, so the import never needs to know
   whether it has run before._
   ```
-- [ ] **B.3 · Stream and batch** — `csv-parse` in streaming mode, per-row Zod, upsert ~500 rows per
+- [x] **B.3 · Stream and batch** — `csv-parse` in streaming mode, per-row Zod, upsert ~500 rows per
   transaction.
   ```
   _Never load the file into memory: the whole client problem is that the naive version dies on
   size._
   ```
-- [ ] **B.4 · Checkpoint and resume** (D26) — its own storage, not `result` and not `progress`;
+- [x] **B.4 · Checkpoint and resume** (D26) — its own storage, not `result` and not `progress`;
   `redrive()` leaves it alone; `?from=start` forces a restart.
   ```
   _A re-drive asks "did this happen?", not "do it again" — the same semantic already settled for_
   `effectKey`_._
   ```
-- [ ] **B.5 · Error report** — invalid rows to `error-report.csv` in storage, presigned link in the
-  job result; bad rows never fail the job, but `IMPORT_MOSTLY_INVALID` fails fast on a wrong file.
+- [x] **B.5 · Error report** — invalid rows to `reports/<userId>/<jobId>.csv` in storage, a link
+  signed on request by `GET /jobs/:id/error-report` rather than stored in the result, where it
+  would expire; bad rows never fail the job, but `IMPORT_MOSTLY_INVALID` fails fast on a wrong file.
   ```
   _Distinguish "this data has problems" from "this is not the file you think it is"._
   ```
-- [ ] **B.6 · Cursor pagination** on `/jobs` and `/products` (D14).
+- [x] **B.6 · Cursor pagination** on `/jobs` and `/products` (D14).
   ```
   _A 20k-product catalog is where offset paging starts to hurt._
   ```
@@ -689,10 +692,10 @@ rows.
 ### Done when
 
 - [ ] **A13 passes** — 20 000 rows import with flat memory
-- [ ] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
+- [x] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
   exact and contains no duplicates
-- [ ] **A15 passes** — the same file submitted twice returns the first job
-- [ ] The error report is downloadable and its row numbers match the source file
+- [x] **A15 passes** — the same file submitted twice returns the first job
+- [x] The error report is downloadable and its row numbers match the source file
 
 ---
 

@@ -1,3 +1,4 @@
+import type { Prisma } from '../generated/prisma/client.js';
 import type { JobProgress } from './job-progress.js';
 
 /**
@@ -12,6 +13,9 @@ import type { JobProgress } from './job-progress.js';
  */
 export interface JobContext {
   readonly jobId: string;
+
+  /** The account the job belongs to: what every write it makes is scoped to. */
+  readonly userId: string;
 
   /**
    * The attempt now running, counted against `maxAttempts` — for logs and
@@ -57,6 +61,35 @@ export interface JobContext {
    * fails the attempt rather than being guessed.
    */
   shouldStop(): Promise<boolean>;
+
+  /**
+   * What the last {@link commit} recorded for this job — by an earlier attempt,
+   * or by an earlier life before a re-drive — or `null` when nothing has been
+   * committed. Its shape is the handler's own, and so is checking it: a value an
+   * older version wrote may not parse, and must not be trusted if it does not.
+   */
+  readonly checkpoint: Prisma.JsonValue | null;
+
+  /**
+   * Commits one batch of work together with the checkpoint that describes it,
+   * in one transaction, so a later attempt can skip exactly the work that
+   * committed.
+   *
+   * The one place a handler is handed a database client, because atomicity
+   * needs it: `work` must make every write through `tx` and do nothing else
+   * — no event, no HTTP call — since a rollback cannot take those back (A10).
+   *
+   * @param checkpoint builds the value to store from what `work` returned; it
+   * must be enough to resume from, including any running totals the result
+   * reports.
+   * @returns what `work` returned.
+   * @throws JobCancelledError when this attempt no longer owns the job. The
+   * batch was rolled back, so let it propagate.
+   */
+  commit<T>(
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+    checkpoint: (value: T) => Prisma.InputJsonValue,
+  ): Promise<T>;
 
   /** Writes one line tagged with the job, the attempt and the request that submitted it. */
   log(message: string): void;

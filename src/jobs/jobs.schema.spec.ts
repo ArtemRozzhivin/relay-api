@@ -28,7 +28,7 @@ describe('submitJobSchema', () => {
   });
 
   it('lists every type the union accepts', () => {
-    expect(JOB_TYPES).toEqual(['MOCK', 'CHARGE']);
+    expect(JOB_TYPES).toEqual(['MOCK', 'CHARGE', 'import.csv']);
   });
 });
 
@@ -59,6 +59,26 @@ describe('listJobsSchema', () => {
 
   it('rejects a status the state machine does not have', () => {
     expect(listJobsSchema.safeParse({ status: 'FAILED' }).success).toBe(false);
+  });
+
+  it('reads a cursor as the instant and id the last page ended on', () => {
+    const cursor = Buffer.from(
+      JSON.stringify({
+        createdAt: '2026-11-09T10:00:00.123Z',
+        id: '0318b953-7c93-4af3-ba9b-d51c30a11d8b',
+      }),
+    ).toString('base64url');
+
+    expect(listJobsSchema.parse({ cursor }).cursor).toEqual({
+      createdAt: new Date('2026-11-09T10:00:00.123Z'),
+      id: '0318b953-7c93-4af3-ba9b-d51c30a11d8b',
+    });
+  });
+
+  // An offset would be ignored by keyset paging, and a client still sending
+  // one would be shown page one for ever.
+  it('refuses an offset rather than ignoring it', () => {
+    expect(listJobsSchema.safeParse({ offset: '20' }).success).toBe(false);
   });
 });
 

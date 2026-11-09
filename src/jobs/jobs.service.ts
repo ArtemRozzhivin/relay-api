@@ -4,11 +4,15 @@ import { ConfigService } from '@nestjs/config';
 import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
 import {
+  ErrorReportNotFoundError,
   IdempotencyKeyReusedError,
   JobAlreadyFinishedError,
   JobNotDeadLetteredError,
   JobNotFoundError,
+  UploadNotFoundError,
 } from '../common/errors/app-error.js';
+import { StorageService } from '../storage/storage.service.js';
+import { errorReportKey, uploadPrefix } from '../storage/object-keys.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
 import { Prisma, type Job } from '../generated/prisma/client.js';
@@ -20,6 +24,11 @@ import type {
 } from './jobs.schema.js';
 import type { ApiEnv } from '../config/env.schema.js';
 import { requestHash } from './request-hash.js';
+import { toPage } from '../common/pagination/cursor.js';
+
+// Fetched when the seller clicks, so a short life costs nothing: a link that
+// leaks from a browser history is dead within minutes.
+const REPORT_LINK_SECONDS = 300;
 
 // One shape for every message the outbox carries — submit, re-drive and bulk
 // re-drive alike — so the relay and the direct path publish the same thing
@@ -75,10 +84,13 @@ export class JobsService {
     private readonly transitions: JobTransitionService,
     private readonly events: JobEventsPublisher,
     private readonly config: ConfigService<ApiEnv, true>,
+    private readonly storage: StorageService,
     @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
   ) {}
 
   async submit({ userId, idempotencyKey, correlationId, input }: SubmitArgs) {
+    await this.checkUpload(userId, idempotencyKey, input);
+
     const hash = requestHash(input);
     let committed;
 
@@ -146,6 +158,39 @@ export class JobsService {
     return { job, replayed: false };
   }
 
+  // A job that names a file must name one of the caller's own that is really
+  // there — a client that submits before S3 has answered its upload learns so
+  // now, not from a dead letter. A replay of an import already accepted is let
+  // through even once its file has expired, so it is answered as the replay it
+  // is (D1); a different body under that key is still refused, by the hash.
+  private async checkUpload(
+    userId: string,
+    idempotencyKey: string,
+    input: SubmitJobInput,
+  ) {
+    if (input.type !== 'import.csv') {
+      return;
+    }
+
+    const { key } = input.payload;
+
+    if (
+      key.startsWith(uploadPrefix(userId)) &&
+      (await this.storage.exists(key))
+    ) {
+      return;
+    }
+
+    const accepted = await this.prisma.job.findUnique({
+      where: { userId_idempotencyKey: { userId, idempotencyKey } },
+      select: { id: true },
+    });
+
+    if (!accepted) {
+      throw new UploadNotFoundError();
+    }
+  }
+
   private async enqueue(
     jobId: string,
     outboxId: bigint,
@@ -175,11 +220,22 @@ export class JobsService {
     });
   }
 
-  async redrive(userId: string, jobId: string, correlationId: string) {
+  /**
+   * @param fromStart discards the job's checkpoint, so it does its work again
+   * from the beginning; by default it resumes where it got to (D26).
+   */
+  async redrive(
+    userId: string,
+    jobId: string,
+    correlationId: string,
+    { fromStart = false }: { fromStart?: boolean } = {},
+  ) {
     const existing = await this.findOne(userId, jobId);
 
     const requeued = await this.prisma.$transaction(async (tx) => {
-      const job = await this.transitions.redrive(existing.id, tx);
+      const job = await this.transitions.redrive(existing.id, tx, {
+        fromStart,
+      });
 
       if (!job) {
         return null;
@@ -372,23 +428,73 @@ export class JobsService {
     return job;
   }
 
-  async findMany(userId: string, query: ListJobsQuery) {
-    const where = {
-      userId,
-      ...(query.status ? { status: query.status } : {}),
-      ...(query.type ? { type: query.type } : {}),
-    };
+  /**
+   * A link that downloads an import's error report, signed on each call rather
+   * than stored, so the link a client holds is never one that has expired.
+   *
+   * @throws JobNotFoundError when the job is not the caller's.
+   * @throws ErrorReportNotFoundError when the job has none: it has not
+   * succeeded, every row was valid, or the bucket has expired the report.
+   */
+  async errorReportLink(userId: string, jobId: string) {
+    const job = await this.findOne(userId, jobId);
+    const key = errorReportKey(userId, job.id);
 
-    const [items, total] = await Promise.all([
-      this.prisma.job.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: query.limit,
-        skip: query.offset,
-      }),
-      this.prisma.job.count({ where }),
-    ]);
+    // Only a finished import's: a report left by an earlier life of a job
+    // that is running again describes a run that is being redone.
+    if (
+      job.type !== 'import.csv' ||
+      job.status !== 'SUCCEEDED' ||
+      !(await this.storage.exists(key))
+    ) {
+      throw new ErrorReportNotFoundError();
+    }
 
-    return { items, total, limit: query.limit, offset: query.offset };
+    // Taken before signing, like an upload slip's, so the time a client is
+    // told is never later than the one S3 holds the link to.
+    const expiresAt = new Date(Date.now() + REPORT_LINK_SECONDS * 1000);
+    const url = await this.storage.signDownload(key, REPORT_LINK_SECONDS);
+
+    return { url, expiresAt };
+  }
+
+  /**
+   * The caller's jobs, newest first, one page per call (D14).
+   *
+   * A page starts after the cursor's values rather than at an offset, so a job
+   * submitted mid-scroll lands before the first page instead of pushing one
+   * already shown onto the next, and a deep page costs what the first does.
+   * The cursor carries values, not a reference to a row: a row the caller is
+   * paging past may have left the filter since — a QUEUED job that started —
+   * and its position must still mean the same thing.
+   */
+  async findMany(
+    userId: string,
+    { status, type, limit, cursor }: ListJobsQuery,
+  ) {
+    const rows = await this.prisma.job.findMany({
+      where: {
+        userId,
+        ...(status ? { status } : {}),
+        ...(type ? { type } : {}),
+        // Strictly after the cursor in (createdAt, id) order — the id breaks
+        // ties, which a millisecond clock makes common.
+        ...(cursor
+          ? {
+              OR: [
+                { createdAt: { lt: cursor.createdAt } },
+                { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+    });
+
+    return toPage(rows, limit, (job) => ({
+      createdAt: job.createdAt.toISOString(),
+      id: job.id,
+    }));
   }
 }

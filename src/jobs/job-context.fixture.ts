@@ -1,3 +1,5 @@
+import type { Prisma } from '../generated/prisma/client.js';
+import type { PrismaService } from '../prisma/prisma.service.js';
 import type { JobContext } from './job-context.js';
 import type { JobProgress } from './job-progress.js';
 
@@ -8,17 +10,33 @@ import type { JobProgress } from './job-progress.js';
  */
 export const recordingContext = ({
   stopAfterChecks = Infinity,
+  userId = 'a-user',
+  checkpoint = null,
+  client,
 }: {
   /** How many `shouldStop()` calls answer false before one answers true. */
   stopAfterChecks?: number;
+  userId?: string;
+
+  /** What the context reports an earlier attempt committed. */
+  checkpoint?: Prisma.JsonValue | null;
+
+  /**
+   * The database `commit()` writes through. Without one it throws, which is
+   * right for a handler that has no batch to commit.
+   */
+  client?: PrismaService;
 } = {}) => {
   const reports: JobProgress[] = [];
   const lines: string[] = [];
+  const checkpoints: Prisma.InputJsonValue[] = [];
   let checks = 0;
 
   const context: JobContext = {
     jobId: 'a-job',
+    userId,
     attempt: 1,
+    checkpoint,
     reportProgress: async (progress) => {
       reports.push(progress);
     },
@@ -27,10 +45,21 @@ export const recordingContext = ({
 
       return checks > stopAfterChecks;
     },
+    commit: async (work, checkpointOf) => {
+      if (!client) {
+        throw new Error('This context has no database to commit through');
+      }
+
+      const value = await client.$transaction((tx) => work(tx));
+
+      checkpoints.push(checkpointOf(value));
+
+      return value;
+    },
     log: (message) => {
       lines.push(message);
     },
   };
 
-  return { context, reports, lines, checks: () => checks };
+  return { context, reports, lines, checkpoints, checks: () => checks };
 };
