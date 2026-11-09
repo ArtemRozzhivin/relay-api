@@ -2,9 +2,9 @@
   "name": "relay-api",
   "version": "0.1.0",
   "description": "Async job-processing API with exactly-once delivery semantics",
-  "author": "",
+  "author": "Artem Rozzhyvin",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "nest build",
