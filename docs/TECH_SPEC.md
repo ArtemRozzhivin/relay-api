@@ -564,10 +564,20 @@ Between products the job reports `processed` out of `total` and honours a cancel
 stopped batch has recorded whole images only. A product already `READY` for its current URL is
 skipped, which is what lets a retry redo only the rest.
 
+An image that cannot be made marks its product, not the job (D31). A failure another try cannot
+change — a 404 or another 4xx, a host that does not exist, a refused address, a type that is not
+an image, bytes that do not decode, a source over the pixel limit — records the product `FAILED`
+with the reason, and the batch goes on. One that might pass later — a timeout, a 5xx, a 408 or a
+429 — leaves the product `PENDING` and the batch goes on as well; once every product has been
+tried, the attempt fails, so the job is retried and the retry skips what is `READY` (A17). A bad
+URL costs its own product one download, never the rest of the batch their images. A `FAILED`
+product is tried again by any later run that names it, a retry included: the seller may have
+fixed the file behind the same URL, and naming the sku again is how they ask.
+
 ```jsonc
 // result
-{ "requested": 3, "processed": 1, "superseded": 0, "alreadyReady": 1, "withoutImage": 0,
-  "notFound": ["X-9"] }
+{ "requested": 3, "processed": 1, "failed": 0, "superseded": 0, "alreadyReady": 1,
+  "withoutImage": 0, "notFound": ["X-9"] }
 ```
 
 `superseded` counts products whose URL changed while the job worked on the old one. In
@@ -856,7 +866,9 @@ themselves:
 
 Every failure says whether asking again could change it: a refused address, a 404, a 4xx other
 than 408 and 429, a host that does not exist or a certificate that does not verify are permanent;
-a timeout, a 5xx, a 408 or a 429 are not (§7.7).
+a timeout, a 5xx, a 408 or a 429 are not (§7.7). A message names what was refused, never what a
+host name resolved to: it reaches the URL's owner as the product's `image.error` (§6.3c), and a
+resolved internal address would map the network for whoever asks.
 
 ---
 
@@ -1386,7 +1398,7 @@ cases.
 | **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
 | **A16** | **A hostile image URL reaches nothing private.** `http://localhost`, `http://169.254.169.254`, and a public DNS name resolving to a private address | All three rejected **after resolution, before connect**; the product fails, the batch does not | PC |
-| **A17** | **A permanent error does not burn the budget.** A 404 image | `attempts = 1` at `DEAD_LETTERED`; no backoff was waited | PC |
+| **A17** | **A permanent error does not burn the budget.** One batch: an image, a 404, a page, undecodable bytes, the metadata address | `attempts = 1` at `SUCCEEDED`; the four products `FAILED`, each with its reason; no backoff was waited (D31) | PC |
 | **A18** | **Image batches do not self-stall.** N concurrent batches at the chosen concurrency | Zero `stalled` events; resolves D10 with a measurement rather than an assumption | PC |
 | **A19** | **LLM output is untrusted input.** Fake provider returns malformed JSON and an out-of-enum category | Nothing is written for those items; `enrichmentStatus = 'failed'` with a reason; the DB holds no value outside the taxonomy | PD |
 | **A20** | **Rate limits slow the queue, not the jobs.** Fake provider returns 429 with `Retry-After` | No job reaches `DEAD_LETTERED` because of a 429; the queue's throughput drops and recovers | PD |
@@ -1533,6 +1545,7 @@ so they move:
 | D27 | ~~A second ledger for quota, or reuse `SideEffect`?~~ | Phase B's checkpoint and Phase I's quota would otherwise invent two | **DECIDED** — reuse `SideEffect`, `effectKey = '<jobId>:quota:<batchIndex>' |
 | D29 | ~~Object storage: an emulator or real S3, and a presigned PUT or POST?~~ | B.1 needs a bucket, and MinIO's community images are gone | **DECIDED 2026-11-04** — real S3 in every environment, a bucket and a least-privilege IAM user each; presigned **POST** |
 | D30 | ~~What does an import do to products already there, or missing from the file?~~ | B.2's upsert encodes the answer | **DECIDED 2026-11-04** — the newer file wins, nothing is deleted, currency is a required column |
+| D31 | ~~Does an image that cannot be made fail the job?~~ | C.3's handler and A17 encode the answer | **DECIDED 2026-11-09** — no: the product is `FAILED` and the job succeeds; a transient failure fails the attempt only after the rest are done |
 
 **D21 — `Job.type` becomes a string, with the registry as the authority.**
 An enum makes every new job type a migration, which defeats §3.1's whole point that adding a type
@@ -1733,6 +1746,16 @@ SKU twice in one batch is written once with its last values, the same answer it 
 two batches. `currency` is a required column of the file rather than a per-account default: a
 price without a currency is ambiguous, and a default is a guess the file never made.
 
+**D31 — an image that cannot be made is the product's state; the job still succeeds.**
+The plan's first reading had a 404 throw `TerminalJobError` and dead-letter the job. In a batch of
+50 that costs 49 products their images for one seller's typo, and a re-drive fails the same way.
+So a permanent failure is recorded on the product — `imageStatus = 'FAILED'` and `imageError` —
+and the job succeeds with `failed` counted in its result: the split D22 makes for an import, where
+bad rows are data in `result`, not a status. A transient failure is passed over rather than
+thrown, and the attempt fails only once every product was tried: thrown at once, a host that never
+answers would stop the batch at the same product on every attempt and dead-letter the rest
+untouched.
+
 **Rule this register enforces:** write in detail only what a test in the next two phases could
 falsify. Everything else is a trigger, not a design.
 
@@ -1789,6 +1812,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-09 | §6.3c, §7.9, §14, D31 — an image that can never be made marks its product `FAILED` with the reason and the batch goes on; one that might pass later is passed over and retried after the rest. A17 restated to match — `attempts = 1` at `SUCCEEDED`, not at `DEAD_LETTERED` — and automated against the real guard and real S3. The guard's refusal no longer names the address a host resolved to, since the message now reaches the seller. |
 | 2026-11-09 | §4.7, §6.2, §6.3, §6.3c, §13.4 — `image.process`: a batch of up to 50 skus made into three WebP sizes under the source URL's hash, recorded `READY` only while that URL is still the product's. `Product` gains `imageStatus`, `imageSourceUrl` and `imageError`; `GET /products` shows each product's `image` with links signed per read. The bucket's lifecycle rules are scoped by prefix so product images do not expire. |
 | 2026-11-09 | §7.9 — requests to a user's URL go through a guard: public unicast addresses only, checked inside the connection's own lookup and again on every redirect, ports 80 and 443, a whole-download timeout and a counted byte cap. A16 automated, in the integration tier: the guard needs no process to attack. |
 | 2026-11-09 | §4.3, §6.2, D14 — **decided**: `/jobs` and the new `/products` page with an opaque keyset cursor; `offset` and `total` removed from `/jobs`. `Job.createdAt` narrowed to milliseconds so a cursor survives a JS `Date`, and the job list's indexes gain `id`. Measured: 6.3 ms by offset against 0.019 ms by cursor on the last page of 20 000 products. |

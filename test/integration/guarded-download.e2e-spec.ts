@@ -214,7 +214,7 @@ describe('the guarded download', () => {
     ])('refuses %s', async (url) => {
       const error = await failure(guard.download(url, limits));
 
-      expect(error.message).toMatch(/not a public address/);
+      expect(error.message).toMatch(/not .*a public address/);
       expect(error.permanent).toBe(true);
     });
 
@@ -241,8 +241,8 @@ describe('the guarded download', () => {
         rebinding.download('http://images.example.com/a.png', limits),
       );
 
-      expect(error.message).toMatch(
-        /images\.example\.com resolves to .+, which is not a public address/,
+      expect(error.message).toBe(
+        'images.example.com does not resolve to a public address',
       );
     });
 

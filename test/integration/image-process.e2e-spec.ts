@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { crc32 } from 'node:zlib';
 import { ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import sharp from 'sharp';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -41,6 +42,11 @@ describe('the image.process handler', () => {
   const users: string[] = [];
   const hits = new Map<string, number>();
   const images = new Map<string, Buffer>();
+  // A path answered with something other than an image, before `images`.
+  const answers = new Map<
+    string,
+    { status: number; type?: string; body?: string }
+  >();
 
   // Runs before the response is sent, so a test can change the world while
   // the handler is mid-download.
@@ -106,6 +112,25 @@ describe('the image.process handler', () => {
     images.set('/large.png', await png(2000, 1500));
     images.set('/small.png', await png(100, 80));
     images.set('/other.png', await png(800, 800));
+
+    // 91 bytes declaring 8000 × 8000: what sharp must refuse from the header
+    // rather than decode. IHDR's checksum is redone so the file stays valid.
+    const bomb = await png(10, 10);
+
+    bomb.writeUInt32BE(8000, 16);
+    bomb.writeUInt32BE(8000, 20);
+    bomb.writeUInt32BE(crc32(bomb.subarray(12, 29)), 29);
+    images.set('/bomb.png', bomb);
+    answers.set('/page.png', {
+      status: 200,
+      type: 'text/html',
+      body: '<html>Sign in</html>',
+    });
+    answers.set('/garbage.png', {
+      status: 200,
+      type: 'image/png',
+      body: 'not an image',
+    });
     // Stored landscape, 1000 × 400, with EXIF saying "turn me a quarter":
     // upright it is 400 wide. It also carries a GPS position.
     images.set(
@@ -128,7 +153,15 @@ describe('the image.process handler', () => {
       hits.set(path, (hits.get(path) ?? 0) + 1);
 
       void (onRequest.get(path)?.() ?? Promise.resolve()).then(() => {
-        if (image) {
+        const answer = answers.get(path);
+
+        if (answer) {
+          response.writeHead(
+            answer.status,
+            answer.type ? { 'content-type': answer.type } : {},
+          );
+          response.end(answer.body);
+        } else if (image) {
           response.writeHead(200, { 'content-type': 'image/png' });
           response.end(image);
         } else {
@@ -193,6 +226,7 @@ describe('the image.process handler', () => {
     expect(await run(userId, ['MUG']).result).toEqual({
       requested: 1,
       processed: 1,
+      failed: 0,
       superseded: 0,
       alreadyReady: 0,
       withoutImage: 0,
@@ -366,6 +400,7 @@ describe('the image.process handler', () => {
     ).toEqual({
       requested: 3,
       processed: 0,
+      failed: 0,
       superseded: 0,
       alreadyReady: 0,
       withoutImage: 1,
@@ -390,6 +425,117 @@ describe('the image.process handler', () => {
       await prisma.product.count({ where: { userId, imageStatus: 'READY' } }),
     ).toBe(2);
     expect(stopped.reports.at(-1)).toEqual({ processed: 2, total: 3 });
+  });
+
+  describe('when an image cannot be made', () => {
+    const statuses = async (userId: string) =>
+      (
+        await prisma.product.findMany({
+          where: { userId },
+          orderBy: { sku: 'asc' },
+        })
+      ).map(({ sku, imageStatus }) => [sku, imageStatus]);
+
+    it('marks the product FAILED, says why, and makes the rest', async () => {
+      const userId = await store();
+      const here = `/small.png?here=${userId}`;
+
+      images.set(here, images.get('/small.png')!);
+      await product(userId, 'A-GONE', `${base}/gone.png`);
+      await product(userId, 'B-HERE', `${base}${here}`);
+
+      expect(await run(userId, ['A-GONE', 'B-HERE']).result).toMatchObject({
+        processed: 1,
+        failed: 1,
+      });
+      expect(
+        (await products.findMany(userId, { limit: 20 })).items,
+      ).toMatchObject([
+        {
+          sku: 'A-GONE',
+          image: { status: 'FAILED', error: 'The server answered 404' },
+        },
+        { sku: 'B-HERE', image: { status: 'READY' } },
+      ]);
+    });
+
+    it.each([
+      ['a page', () => `${base}/page.png`, 'text/html is not an accepted type'],
+      [
+        'bytes that are not an image',
+        () => `${base}/garbage.png`,
+        'Not a readable image: Input buffer contains unsupported image format',
+      ],
+      [
+        'an image declaring more pixels than allowed',
+        () => `${base}/bomb.png`,
+        'Not a readable image: Input image exceeds pixel limit',
+      ],
+      [
+        'a private address',
+        () => 'http://10.0.0.1/a.png',
+        '10.0.0.1 is not a public address',
+      ],
+    ])('marks %s FAILED', async (_label, url, error) => {
+      const userId = await store();
+      const bad = await product(userId, 'BAD', url());
+
+      expect(await run(userId, ['BAD']).result).toMatchObject({ failed: 1 });
+      expect(
+        await prisma.product.findUniqueOrThrow({ where: { id: bad.id } }),
+      ).toMatchObject({ imageStatus: 'FAILED', imageError: error });
+    });
+
+    // The plan's first reading — a failed image dead-letters the job — would
+    // have cost the batch's other products their image for one bad URL.
+    it('passes over a host that is down, makes the rest, then fails the attempt', async () => {
+      const userId = await store();
+      const down = `/small.png?down=${userId}`;
+      const up = `/small.png?up=${userId}`;
+
+      images.set(down, images.get('/small.png')!);
+      images.set(up, images.get('/small.png')!);
+      answers.set(down, { status: 503 });
+      await product(userId, 'A-DOWN', `${base}${down}`);
+      await product(userId, 'B-UP', `${base}${up}`);
+
+      const first = run(userId, ['A-DOWN', 'B-UP']);
+
+      await expect(first.result).rejects.toThrow(
+        '1 of 2 images could not be downloaded this time (The server answered 503)',
+      );
+      expect(first.reports.at(-1)).toEqual({ processed: 2, total: 2 });
+      expect(await statuses(userId)).toEqual([
+        ['A-DOWN', null],
+        ['B-UP', 'READY'],
+      ]);
+
+      answers.delete(down);
+
+      expect(await run(userId, ['A-DOWN', 'B-UP']).result).toMatchObject({
+        processed: 1,
+        alreadyReady: 1,
+      });
+      expect(hits.get(up)).toBe(1);
+    });
+
+    it('tries a FAILED product again, for a file fixed behind the same URL', async () => {
+      const userId = await store();
+      const path = `/small.png?fixed=${userId}`;
+      const shelf = await product(userId, 'SHELF', `${base}${path}`);
+
+      expect(await run(userId, ['SHELF']).result).toMatchObject({ failed: 1 });
+
+      images.set(path, images.get('/small.png')!);
+
+      expect(await run(userId, ['SHELF']).result).toMatchObject({
+        processed: 1,
+        failed: 0,
+      });
+      expect(
+        await prisma.product.findUniqueOrThrow({ where: { id: shelf.id } }),
+      ).toMatchObject({ imageStatus: 'READY', imageError: null });
+    });
   });
 
   describe("a product's image as the list shows it", () => {

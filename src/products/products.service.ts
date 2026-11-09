@@ -73,6 +73,8 @@ export class ProductsService {
         imageStatus: true,
         imageSourceUrl: true,
       },
+      // The same order on every attempt, so progress means the same thing.
+      orderBy: { sku: 'asc' },
     });
   }
 
@@ -83,13 +85,39 @@ export class ProductsService {
    *
    * @returns whether it was recorded.
    */
-  async recordImageReady(userId: string, productId: string, sourceUrl: string) {
+  recordImageReady(userId: string, productId: string, sourceUrl: string) {
+    return this.recordImage(userId, productId, sourceUrl, 'READY', null);
+  }
+
+  /**
+   * Records that the image at `sourceUrl` cannot be made, and why — under the
+   * same condition as `recordImageReady`. `error` is shown to the product's
+   * owner.
+   *
+   * @returns whether it was recorded.
+   */
+  recordImageFailed(
+    userId: string,
+    productId: string,
+    sourceUrl: string,
+    error: string,
+  ) {
+    return this.recordImage(userId, productId, sourceUrl, 'FAILED', error);
+  }
+
+  private async recordImage(
+    userId: string,
+    productId: string,
+    sourceUrl: string,
+    status: 'READY' | 'FAILED',
+    error: string | null,
+  ) {
     const { count } = await this.prisma.product.updateMany({
       where: { id: productId, userId, imageUrl: sourceUrl },
       data: {
-        imageStatus: 'READY',
+        imageStatus: status,
         imageSourceUrl: sourceUrl,
-        imageError: null,
+        imageError: error,
       },
     });
 

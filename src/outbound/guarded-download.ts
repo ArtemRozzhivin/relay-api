@@ -180,8 +180,11 @@ export class GuardedDownloader {
 
       if (refused || found.length === 0) {
         done(
+          // Without the address: this message reaches the URL's owner, and
+          // naming what an internal host resolves to maps the network for
+          // whoever asks.
           new DownloadFailedError(
-            `${hostname} resolves to ${refused?.address ?? 'nothing'}, which is not a public address`,
+            `${hostname} does not resolve to a public address`,
             true,
           ),
           '',
