@@ -71,7 +71,8 @@ model Job {
   checkpoint      Json?
   cancelRequested Boolean   @default(false)
   correlationId   String
-  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+  /// Milliseconds, not microseconds: the list's cursor carries it through a JS Date (D14).
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
   startedAt       DateTime? @db.Timestamptz(6)
   finishedAt      DateTime? @db.Timestamptz(6)
@@ -81,7 +82,8 @@ model Job {
   outbox      Outbox[]
 
   @@unique([userId, idempotencyKey])
-  @@index([userId, status, createdAt(sort: Desc)])
+  @@index([userId, status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model SideEffect {

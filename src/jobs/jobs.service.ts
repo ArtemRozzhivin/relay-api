@@ -24,6 +24,7 @@ import type {
 } from './jobs.schema.js';
 import type { ApiEnv } from '../config/env.schema.js';
 import { requestHash } from './request-hash.js';
+import { toPage } from '../common/pagination/cursor.js';
 
 // Fetched when the seller clicks, so a short life costs nothing: a link that
 // leaks from a browser history is dead within minutes.
@@ -457,23 +458,43 @@ export class JobsService {
     return { url, expiresAt };
   }
 
-  async findMany(userId: string, query: ListJobsQuery) {
-    const where = {
-      userId,
-      ...(query.status ? { status: query.status } : {}),
-      ...(query.type ? { type: query.type } : {}),
-    };
+  /**
+   * The caller's jobs, newest first, one page per call (D14).
+   *
+   * A page starts after the cursor's values rather than at an offset, so a job
+   * submitted mid-scroll lands before the first page instead of pushing one
+   * already shown onto the next, and a deep page costs what the first does.
+   * The cursor carries values, not a reference to a row: a row the caller is
+   * paging past may have left the filter since — a QUEUED job that started —
+   * and its position must still mean the same thing.
+   */
+  async findMany(
+    userId: string,
+    { status, type, limit, cursor }: ListJobsQuery,
+  ) {
+    const rows = await this.prisma.job.findMany({
+      where: {
+        userId,
+        ...(status ? { status } : {}),
+        ...(type ? { type } : {}),
+        // Strictly after the cursor in (createdAt, id) order — the id breaks
+        // ties, which a millisecond clock makes common.
+        ...(cursor
+          ? {
+              OR: [
+                { createdAt: { lt: cursor.createdAt } },
+                { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+    });
 
-    const [items, total] = await Promise.all([
-      this.prisma.job.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: query.limit,
-        skip: query.offset,
-      }),
-      this.prisma.job.count({ where }),
-    ]);
-
-    return { items, total, limit: query.limit, offset: query.offset };
+    return toPage(rows, limit, (job) => ({
+      createdAt: job.createdAt.toISOString(),
+      id: job.id,
+    }));
   }
 }

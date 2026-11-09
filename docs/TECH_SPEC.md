@@ -172,7 +172,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `checkpoint` | `jsonb?` | How far the job's committed work reaches, in a shape its handler owns (D26). Written in the **same transaction** as the batch it describes, under `lease`, so it never claims work that did not commit; an attempt that lost the job has its batch rolled back with it. **Kept** by a re-drive, cleared by `?from=start`. Internal — never in a response |
 | `cancelRequested` | `boolean` | Default `false`. The owner's request; `CANCELLED` is the worker's answer (D22). Set only while the job is unfinished, so a cancel of a finished job leaves no trace. Cleared by a re-drive |
 | `correlationId` | `text` | The submitting request's id. Carried onto the queue so worker logs join API logs (§12.1) |
-| `createdAt` | `timestamptz(6)` | |
+| `createdAt` | `timestamptz(3)` | Milliseconds, not microseconds: the list's cursor carries it through a JS `Date`, which holds no finer, and a rounded cursor would skip a job created microseconds after the one a page ended on (D14) |
 | `updatedAt` | `timestamptz(6)` | |
 | `startedAt` | `timestamptz(6)?` | First claim |
 | `finishedAt` | `timestamptz(6)?` | Terminal transition |
@@ -181,7 +181,9 @@ every line of application code is wrong; constraints listed as **APP** are polic
 
 - **DB** `UNIQUE (userId, idempotencyKey)` — *the* guarantee behind assertion A1. Scoped per user
   so one tenant's key can never collide with another's (see D1).
-- `(userId, status, createdAt DESC)` — the list endpoint's query.
+- `(userId, createdAt DESC, id DESC)` and `(userId, status, createdAt DESC, id DESC)` — the job
+  list's order without and with a status filter, so a page is a range of an index rather than a
+  sort of every job the caller has (D14).
 - `(status)` partial `WHERE status IN ('QUEUED','RUNNING')` — operational "what is in flight".
 
 **DB** `CHECK (attempts >= 0)`.
@@ -370,7 +372,8 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded. See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
-| `GET` | `/jobs` | access | `200` | Filter `?status=`, `?type=`; offset pagination in v1 |
+| `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
+| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14) |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
@@ -1430,7 +1433,7 @@ to settle it.
 | D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox |
 | D12 | Status cache in Redis | A **measured** slow `GET /jobs/:id`. Never before | — |
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
-| D14 | Cursor pagination | A list endpoint where offset pagination measurably hurts | — |
+| D14 | ~~Cursor pagination~~ | A list endpoint where offset pagination measurably hurts | **DECIDED 2026-11-09** — keyset cursors on `/jobs` and `/products`, measured below |
 | D15 | Job types beyond `MOCK` / `CHARGE` | A real use case | v2 |
 | D16 | Do replays bypass the rate limiter? | A client retrying with the same key gets `429` for a job already accepted | 8 |
 
@@ -1561,6 +1564,26 @@ Three details the implementation settled:
   no rows and the column would stay frozen for the job's whole life. There is no Prisma filter for
   "this jsonb path is SQL NULL", so the worker — which has already read the value — tells the
   write to drop the monotonic clause once. The ownership clause is never dropped.
+
+**D14 — lists page with an opaque cursor, never an offset.**
+A page starts strictly after the last item the previous one held — `(createdAt, id)` for jobs,
+newest first; `sku` for products — and the response carries that position as `nextCursor`. Three
+things an offset gets wrong: a deep page reads and discards every row before it; a row inserted
+mid-scroll shifts the rest, so the next page repeats one already shown; and `total` is a
+`count(*)` over every matching row on every page. Measured on the last page of 20 000 rows,
+locally: products **6.3 ms** by offset, a sequential scan and a sort of all 20 000, against
+**0.019 ms** by cursor, an index range of 20; jobs **1.9 ms plus a 1.9 ms count** against
+**0.029 ms**. Both grow with depth by offset and stay flat by cursor.
+
+The cursor carries the **values**, not a reference to a row. Prisma's own cursor names a row and
+skips it with `OFFSET 1`, so once that row leaves the filter — paging `?status=QUEUED` past a job
+that has since started — it skips a real row instead. Carrying the values through JavaScript is
+why `Job.createdAt` holds milliseconds (§4.3), and why `id` breaks ties, which a millisecond
+clock makes common. It is base64url JSON and deliberately unsigned: every list is filtered to the
+caller's rows on the server, so an edited cursor moves the caller only through their own data,
+and one that does not decode is a `400`. A page reads `limit + 1` rows; the extra one proves a
+next page without counting the rest. There is no `total`: a client that needs one asks for it
+when it does, not on every page.
 
 **D26 — a re-drive resumes from the checkpoint; restarting is opt-in.**
 The checkpoint is neither `result` (which `redrive()` clears) nor `progress` (which is
@@ -1696,6 +1719,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-09 | §4.3, §6.2, D14 — **decided**: `/jobs` and the new `/products` page with an opaque keyset cursor; `offset` and `total` removed from `/jobs`. `Job.createdAt` narrowed to milliseconds so a cursor survives a JS `Date`, and the job list's indexes gain `id`. Measured: 6.3 ms by offset against 0.019 ms by cursor on the last page of 20 000 products. |
 | 2026-11-06 | §4.3, §6.2, §6.3b — the error report: every bad row to `reports/<userId>/<jobId>.csv` from a second read of the file, and `GET /jobs/:id/error-report` signing a link on each call. A file whose first 100 rows are mostly bad fails before anything is written, as `error.reason: 'IMPORT_MOSTLY_INVALID'` — `reason` added beside the engine's `code`. |
 | 2026-11-05 | §4.3, §6.2, §6.3b, D26 — `Job.checkpoint` added, written in the batch's own transaction under the lease; a handler commits through `JobContext.commit()` and reads `JobContext.checkpoint`. `import.csv` resumes after its last committed batch, refusing a file whose `ETag` changed. `POST /jobs/:id/retry?from=start` restarts instead. A14 automated. |
 | 2026-11-05 | §6.2, §6.3, §6.3b — the `import.csv` job: a streamed file, 500 rows per statement, bad rows counted by line and never fatal, a bad file terminal, the batch the cancellation boundary. `422 UPLOAD_NOT_FOUND` at submit; the worker re-checks the key's owner. Handlers now see the job's `userId`. A15 automated. |

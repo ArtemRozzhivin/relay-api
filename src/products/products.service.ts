@@ -1,6 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import type { Prisma } from '../generated/prisma/client.js';
+import { toPage } from '../common/pagination/cursor.js';
+import type { ListProductsQuery } from './products.schema.js';
 
 /** One product as an import writes it, after its row has been validated. */
 export interface ProductRow {
@@ -15,6 +17,24 @@ export interface ProductRow {
 @Injectable()
 export class ProductsService {
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * The caller's catalog in sku order, one page per call (D14). Read from the
+   * `(userId, sku)` index the import already matches on, so a page deep in a
+   * 20 000-product catalog costs what the first one does.
+   */
+  async findMany(userId: string, { limit, cursor }: ListProductsQuery) {
+    const rows = await this.prisma.product.findMany({
+      where: {
+        userId,
+        ...(cursor ? { sku: { gt: cursor.sku } } : {}),
+      },
+      orderBy: { sku: 'asc' },
+      take: limit + 1,
+    });
+
+    return toPage(rows, limit, (product) => ({ sku: product.sku }));
+  }
 
   /**
    * Writes a batch of one store's products in a single statement: a new sku is

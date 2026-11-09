@@ -166,8 +166,8 @@ describe('the job API contract', () => {
       expect(reused.status).toBe(422);
       expect(reused.body.error.code).toBe('IDEMPOTENCY_KEY_REUSED');
 
-      const { total, items } = await listAs(token);
-      expect(total).toBe(1);
+      const { items } = await listAs(token);
+      expect(items).toHaveLength(1);
       expect(items[0]).toMatchObject({
         id: first.body.data.id,
         payload: original.payload,
@@ -194,8 +194,8 @@ describe('the job API contract', () => {
         bodies.map((body) => submitAs(token, key, body)),
       );
 
-      const { total, items } = await listAs(token);
-      expect(total).toBe(1);
+      const { items } = await listAs(token);
+      expect(items).toHaveLength(1);
 
       const winner = items[0].payload.durationMs;
 
@@ -403,7 +403,8 @@ describe('the job API contract', () => {
       .set('Authorization', `Bearer ${mine}`)
       .expect(200);
 
-    expect(body.data.total).toBe(2);
+    expect(body.data.items).toHaveLength(2);
+    expect(body.data.nextCursor).toBeNull();
     expect(body.data.items.map((job: { id: string }) => job.id).sort()).toEqual(
       [first.body.data.id, second.body.data.id].sort(),
     );

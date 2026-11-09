@@ -137,7 +137,7 @@ describe('uploads', () => {
         await request(server)
           .get('/jobs')
           .set('Authorization', `Bearer ${token}`)
-      ).body.data.total as number;
+      ).body.data.items.length as number;
 
     // Uploaded, so it exists: only the ownership check can refuse it.
     it("refuses another account's uploaded file, creating no job", async () => {

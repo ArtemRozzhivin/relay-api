@@ -684,7 +684,7 @@ rows.
   ```
   _Distinguish "this data has problems" from "this is not the file you think it is"._
   ```
-- [ ] **B.6 · Cursor pagination** on `/jobs` and `/products` (D14).
+- [x] **B.6 · Cursor pagination** on `/jobs` and `/products` (D14).
   ```
   _A 20k-product catalog is where offset paging starts to hurt._
   ```

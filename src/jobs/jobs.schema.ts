@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { JobStatus } from '../generated/prisma/enums.js';
 import { DEAD_LETTER_CODES } from './job-error-codes.js';
 import { UPLOAD_KEY_PATTERN } from '../storage/object-keys.js';
+import { cursorParam, limitParam } from '../common/pagination/cursor.js';
 
 // The payload schemas tolerate unknown keys: the worker re-parses the stored
 // payload (§6.4), and a job written by a newer deploy can reach an older worker.
@@ -75,8 +76,14 @@ export const listJobsSchema = z
     // would otherwise have left jobs in that state unfilterable.
     status: z.enum(JobStatus).optional(),
     type: z.enum(JOB_TYPES).optional(),
-    limit: z.coerce.number().int().min(1).max(100).default(20),
-    offset: z.coerce.number().int().min(0).default(0),
+    limit: limitParam,
+    // The last job a page held, by the two values the list is ordered on.
+    cursor: cursorParam(
+      z.object({
+        createdAt: z.iso.datetime().pipe(z.coerce.date()),
+        id: z.uuid(),
+      }),
+    ).optional(),
   })
   .strict();
 
