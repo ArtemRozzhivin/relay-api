@@ -57,6 +57,9 @@ describe('A5b · a job the queue abandons still reaches a terminal state', () =>
     expect((abandoned.error as { code: string }).code).toBe(
       'DELIVERY_ABANDONED',
     );
+    // Waited for, not just counted: the worker logs after the write this test
+    // saw, and its output arrives through a pipe.
+    await harness.waitForLog(last, /the queue stopped redelivering it/);
     expect(last.count(/the queue stopped redelivering it/)).toBe(1);
 
     // An abandoned job must still be recoverable, and the 202 alone does not
