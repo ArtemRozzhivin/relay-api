@@ -40,9 +40,15 @@ describe('A3 · a worker killed mid-charge charges exactly once', () => {
     // deterministic: every job is provably mid-charge before the process dies,
     // so this can never pass without exercising a redelivery.
     await harness.waitForCount(account.id, { status: 'RUNNING' }, JOBS);
-
-    const ledgerAtKill = await harness.sideEffects(account.id);
-    expect(ledgerAtKill).toHaveLength(JOBS);
+    // Waited for, not just counted: a job is RUNNING from its claim, a moment
+    // before the handler writes its ledger row.
+    await harness.waitUntil(
+      async () =>
+        (await harness.sideEffects(account.id)).length === JOBS
+          ? true
+          : undefined,
+      { label: `${JOBS} ledger rows` },
+    );
 
     first.sigkill();
 

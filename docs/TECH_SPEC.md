@@ -750,6 +750,8 @@ Worth stating precisely, because the mental model most people have is wrong:
 - **A job can stall itself.** Blocking the event loop prevents lock renewal, so a CPU-bound
   processor is redelivered even though nothing crashed. This is why `MOCK` must `await sleep()`
   and never spin — otherwise reliability measurements reflect the fixture, not the system.
+  Filling libuv's threadpool does not (D10): a renewal is a command on an open socket, and only
+  DNS lookups, file access and `sharp`'s own work wait for a pool thread.
 - A stall-induced redelivery is **not** an error retry. It interacts with whichever attempt
   counter D7 makes authoritative, and the two counters will diverge the first time it happens.
 - **When `maxStalledCount` is exceeded, `process()` is never called.** The worker reads the
@@ -1399,7 +1401,7 @@ cases.
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
 | **A16** | **A hostile image URL reaches nothing private.** `http://localhost`, `http://169.254.169.254`, and a public DNS name resolving to a private address | All three rejected **after resolution, before connect**; the product fails, the batch does not | PC |
 | **A17** | **A permanent error does not burn the budget.** One batch: an image, a 404, a page, undecodable bytes, the metadata address | `attempts = 1` at `SUCCEEDED`; the four products `FAILED`, each with its reason; no backoff was waited (D31) | PC |
-| **A18** | **Image batches do not self-stall.** N concurrent batches at the chosen concurrency | Zero `stalled` events; resolves D10 with a measurement rather than an assumption | PC |
+| **A18** | **Image batches do not self-stall.** Five batches of 20 of the heaviest image the limits allow, at the worker's concurrency of 5, timed by a probe inside the real worker | Zero `stalled` events and every product `READY`; event-loop delay and Redis round trip under 1 s, against the 15 s a renewal may be late. A single 40 s main-thread freeze fails it with 5 stalls (D10) | PC |
 | **A19** | **LLM output is untrusted input.** Fake provider returns malformed JSON and an out-of-enum category | Nothing is written for those items; `enrichmentStatus = 'failed'` with a reason; the DB holds no value outside the taxonomy | PD |
 | **A20** | **Rate limits slow the queue, not the jobs.** Fake provider returns 429 with `Retry-After` | No job reaches `DEAD_LETTERED` because of a 429; the queue's throughput drops and recovers | PD |
 | **A21** | **Re-enrichment of unchanged products is free.** Run enrichment twice | Provider call count on the second run **= 0**; `estimatedCostUsd` unchanged | PD |
@@ -1424,7 +1426,7 @@ Specifying them now would produce prose that is wrong by the time it is used.
 |---|---|---|---|
 | **8 · Observability & hardening** | Prometheus `/metrics` from both processes: queue depth, duration histogram, failure rate, dead-letter count. Rate limiting, `trust proxy`, helmet, CORS allowlist, body limits. Dead-letter inspection and re-drive | Queue depth observably rises and drains under load; one job's full story is retrievable from logs by `correlationId` alone | Start of phase 8 |
 | **9 · Test harness & CI** | The shared harness, fixtures and CI — **not** the tests themselves, which are written with the code throughout (§14). A1–A7 become automated cases including process kill/restart | `npm run test:all` reproduces every reliability assertion with no manual steps; CI green from a clean checkout | **§15.1** |
-| **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a and D10 closed with measurements attached | Start of phase 10 |
+| **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a closed with measurements attached, D10's repeated on the target host | Start of phase 10 |
 | **11 · Deploy** | One VPS: Docker running API + worker, Caddy for auto-HTTPS, `ufw`, managed Postgres, restart policies, migrations as a release step. Multi-instance socket.io (D13) becomes real here | HTTPS on a real domain; a reboot restores both processes unattended; a restore from backup has been rehearsed | Start of phase 11 |
 
 **Note for phase 8:** `@nestjs/throttler` 6.5.0 declares peers stopping at Nest 11. Re-verify its
@@ -1511,7 +1513,7 @@ to settle it.
 | D8 | ~~Who emits the WS event; how it crosses the process boundary~~ | — | **DECIDED 2026-10-26** — the worker `PUBLISH`es a domain event to `relay:job-updated`; the API subscribes on a duplicated connection and fans out to `user:<userId>`. §9.3 |
 | D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
-| D10 | Worker concurrency tuning; sandboxed processors | Measured event-loop blocking in the worker | 10 |
+| D10 | ~~Worker concurrency tuning; sandboxed processors~~ | Measured event-loop blocking in the worker | **DECIDED 2026-11-09** — concurrency 5, renders in-process; image work leaves the event loop alone, measured below. Re-measured on the target host in phase 10 |
 | D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox |
 | D12 | Status cache in Redis | A **measured** slow `GET /jobs/:id`. Never before | — |
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
@@ -1527,7 +1529,7 @@ so they move:
 | # | Was | Now | Why the trigger arrives early |
 |---|---|---|---|
 | D6a | phase 10 | **Phase D** | `ai.enrich` needs a BullMQ `limiter` and low concurrency of its own. A limiter is per-queue, so an LLM queue separate from `relay-jobs` is forced by the rate limit, not by a starvation measurement |
-| D10 | phase 10 | **Phase C** | `sharp` is async but runs on the libuv threadpool (4 threads by default). Saturating it delays *all* async I/O in that process, including BullMQ lock renewal — so image batches can self-stall without ever blocking the JS event loop. §7.6's warning applies to threadpool starvation, not only to CPU-bound loops |
+| D10 | phase 10 | **Phase C** | `sharp` runs on the libuv threadpool (4 threads by default), so image batches are the first work that could starve the worker of something other than its event loop — measured in Phase C, below |
 | D11 | phase 8 | **Phase A** | §3.4 asks for bulk retry by filter in the same phase as the handler registry |
 | D14 | — | **Phase B** | §5.3 asks for cursor pagination on `/jobs` and `/products`; a 20 000-product catalog is the list where offset paging starts to hurt |
 | D15 | v2 | **now** | "job types beyond `MOCK`/`CHARGE`" was deferred until a real use case appeared. This proposal *is* that use case, and D21–D27 below are what it turns out to require |
@@ -1756,6 +1758,25 @@ thrown, and the attempt fails only once every product was tried: thrown at once,
 answers would stop the batch at the same product on every attempt and dead-letter the rest
 untouched.
 
+**D10 — image work does not stall the worker: concurrency stays 5, renders stay in-process.**
+First written as: `sharp` fills the 4-thread libuv pool, which delays all async I/O, BullMQ's lock
+renewal included. Measured, half of that holds. The pool does fill: five loops rendering the
+heaviest image the limits allow — a 35 MP PNG under a megabyte — make a lookup of `localhost` wait
+127–144 ms instead of about 1. But a renewal is one Redis command on an open socket, and sockets
+are polled by the event loop, never served by the pool: the Redis round trip stayed at 3–5 ms and
+the event loop's worst delay at 12–18 ms, against the 15 s a renewal may be late before the lock
+lapses. What a full pool does delay is the guard's lookup before each download, by a fraction of
+a second out of its 15 s. End to end (A18) — five batches of 20 such images through the real
+worker and real S3 — no run had a stall, the event loop's worst delay was 33 ms and Redis's
+14 ms. The pool's worst wait there ranged from 31 ms to 2.2 s across runs: over a slow
+connection a lookup waiting on the network holds a pool thread too, and the few downloads that
+reached their 15 s timeout were retried — the C.3 path, not a stall. What does
+stall the worker is its main thread blocked — a synchronous decoder, a CPU loop in JavaScript —
+and A18 fails on exactly that: one 40 s freeze gave 5 stalled jobs. So `WORKER_CONCURRENCY` stays
+5, no sandboxed processor, `UV_THREADPOOL_SIZE` at its default. Measured on a 12-core machine; a
+1–2 vCPU host shares its cores between libvips and the event loop, which this does not
+reproduce, so phase 10's load test repeats it on the target host.
+
 **Rule this register enforces:** write in detail only what a test in the next two phases could
 falsify. Everything else is a trigger, not a design.
 
@@ -1777,7 +1798,7 @@ All eleven phases are v1. Each closes on a demonstrable, runnable state. Broken 
 | 7 | Realtime | §9 | Client sees live status; auth on connect; **A7 passes** |
 | 8 | Observability & hardening | §12, §15 | Metrics from both processes; rate limiting; logs join across the process boundary |
 | 9 | Test harness & CI | §14, §15 | A1–A7 automated; CI green from a clean checkout |
-| 10 | Load | §14, §15 | **A9 passes**; D6a and D10 closed with measurements |
+| 10 | Load | §14, §15 | **A9 passes**; D6a closed with measurements; D10 re-measured on the target host |
 | 11 | Deploy | §3, §11, §15 | HTTPS on a real domain; reboot-safe; restore rehearsed |
 
 Phase 5 is the largest structural change; phase 6 carries the system's core risk. Both are
@@ -1812,6 +1833,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-09 | §7.6, §14, §16 — D10 **decided** from measurements: a full libuv threadpool delays DNS lookups by about 130 ms, not BullMQ's lock renewal, which stayed at 3–5 ms, because a renewal is a socket command the pool never serves. The reasoning that moved D10 into Phase C said otherwise and is corrected. Concurrency stays 5 with renders in-process. A18 automated with a probe loaded into the real worker, and shown to fail on a 40 s freeze. |
 | 2026-11-09 | §6.3c, §7.9, §14, D31 — an image that can never be made marks its product `FAILED` with the reason and the batch goes on; one that might pass later is passed over and retried after the rest. A17 restated to match — `attempts = 1` at `SUCCEEDED`, not at `DEAD_LETTERED` — and automated against the real guard and real S3. The guard's refusal no longer names the address a host resolved to, since the message now reaches the seller. |
 | 2026-11-09 | §4.7, §6.2, §6.3, §6.3c, §13.4 — `image.process`: a batch of up to 50 skus made into three WebP sizes under the source URL's hash, recorded `READY` only while that URL is still the product's. `Product` gains `imageStatus`, `imageSourceUrl` and `imageError`; `GET /products` shows each product's `image` with links signed per read. The bucket's lifecycle rules are scoped by prefix so product images do not expire. |
 | 2026-11-09 | §7.9 — requests to a user's URL go through a guard: public unicast addresses only, checked inside the connection's own lookup and again on every redirect, ports 80 and 443, a whole-download timeout and a counted byte cap. A16 automated, in the integration tier: the guard needs no process to attack. |

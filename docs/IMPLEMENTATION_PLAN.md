@@ -494,7 +494,8 @@ Each step is motivated by the failure of the one before it.
   ```
   _Pool exhaustion is the usual first ceiling._
   ```
-- [ ] **10.6 · Resolve D6a** (queue split) and **D10** (concurrency, sandboxed processors) from measurements.
+- [ ] **10.6 · Resolve D6a** (queue split) from measurements, and repeat **D10**'s (decided in PC on a
+  12-core machine) on the target host.
   ```
   _Both triggers are defined as measurements, not opinions._
   ```
@@ -510,7 +511,7 @@ Each step is motivated by the failure of the one before it.
 
 - [ ] The targets from 10.1 are met, or the gap is documented
 - [ ] **A9 passes**
-- [ ] D6a and D10 are closed with numbers attached
+- [ ] D6a is closed and D10 re-measured on the target host, with numbers attached
 
 ---
 
@@ -563,7 +564,7 @@ Each step is motivated by the failure of the one before it.
 ```
 M1 ─▶ M2 ─▶ M3 ─▶ M4 ─▶ M5 ─▶ M6 ─▶ M7 ─▶ M8 ─▶ M9 ─▶ M10 ─▶ M11
                         │      ▲                     │
-                        └──────┘                     └── D6a, D10 resolved here
+                        └──────┘                     └── D6a resolved, D10 re-measured here
                  M5 must be stable before M6 begins.
 ```
 
@@ -728,11 +729,11 @@ private.
   _First planned as a TerminalJobError that dead-letters the job: in a batch, that costs every
   other product its image for one bad URL._
   ```
-- [ ] **C.4 · Resolve D10** — measure BullMQ lock renewal while N image batches run.
+- [x] **C.4 · Resolve D10** — measure BullMQ lock renewal while N image batches run. Decided:
+  concurrency 5, renders in-process (D10).
   ```
-  _`sharp` is async but runs on the libuv threadpool. Saturating 4 threads delays all async I/O
-  in the process, lock renewal included, so a batch can self-stall without ever blocking the
-  event loop. Measure before choosing concurrency or a sandboxed processor._
+  _Planned on the belief that a full threadpool delays lock renewal. Measured, it delays DNS
+  lookups by about 130 ms and leaves the renewal — a socket command — at 3–5 ms._
   ```
 
 ### Done when
@@ -742,7 +743,8 @@ private.
 - [x] **A17 passes** — a permanent error consumes one attempt, not the whole budget: `SUCCEEDED`
   at `attempts = 1`, the bad products `FAILED` (assertion tier: the real worker's guard against
   real S3 URLs)
-- [ ] **A18 passes** — image batches at the chosen concurrency do not trigger stalled redeliveries
+- [x] **A18 passes** — image batches at the chosen concurrency do not trigger stalled redeliveries
+  (a probe loaded into the real worker; fails with 5 stalls on a 40 s freeze)
 
 ---
 
