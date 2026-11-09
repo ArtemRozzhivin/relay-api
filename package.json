@@ -49,6 +49,7 @@
     "csv-parse": "^7.0.3",
     "csv-stringify": "^6.9.0",
     "ioredis": "^6.0.0",
+    "ipaddr.js": "^2.5.0",
     "nestjs-pino": "^5.3.1",
     "pino": "^10.4.0",
     "pino-http": "^11.0.0",

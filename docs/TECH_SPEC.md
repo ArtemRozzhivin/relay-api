@@ -789,6 +789,37 @@ Three rules that are checkable in review:
    every listening client is permanently wrong (§9.3). The same ordering rule applies to cache
    invalidation: commit first, then publish.
 
+### 7.9 Requests to a URL a user supplied
+
+A product's `imageUrl` is the seller's, and the worker fetches it from inside our network. Left
+unguarded that is server-side request forgery: `http://169.254.169.254/latest/meta-data/` hands
+the attacker the cloud credentials of whatever host the worker runs on. Every such request goes
+through `GuardedDownloader` (`src/outbound/`), which allows only what the seller could reach
+themselves:
+
+- **`http` or `https`, port 80 or 443, no credentials in the URL.** A port is a choice of
+  service; allowing any would let a URL probe whatever else a public host runs.
+- **Public unicast addresses only — an allow-list.** Every other range has a name in `ipaddr.js`
+  (loopback, private, link-local, carrier-grade NAT, multicast, and the IPv6 forms that carry an
+  IPv4 address inside: mapped, NAT64, 6to4, Teredo), so none has to be remembered to be refused.
+- **The address is checked inside the connection's own DNS lookup**, on the addresses it will
+  connect to — every one of them, since a name answering one public and one private address
+  leaves the choice to the connection. Checking the name first and connecting after would resolve
+  it twice, and a name can answer public to the check and private to the connect (DNS rebinding).
+  For the same reason no socket is pooled: a reused one would skip the lookup.
+- **An address written as the host is checked separately.** Node does not run the lookup for an
+  IP literal, so without this check `http://10.0.0.1/` would connect. The URL parser has already
+  normalised `2130706433` and `0x7f.1` to `127.0.0.1`.
+- **Redirects are followed by hand, at most 3, and each is checked like the first URL** — a
+  redirect to the metadata service is the classic way past a guard that looks only at the URL it
+  was given.
+- **One timeout for the whole download, a byte cap counted as the bytes arrive** — a declared
+  length can be absent or a lie — and a content-type the caller names.
+
+Every failure says whether asking again could change it: a refused address, a 404, a 4xx other
+than 408 and 429, a host that does not exist or a certificate that does not verify are permanent;
+a timeout, a 5xx, a 408 or a 429 are not (§7.7).
+
 ---
 
 ## 8. Queue topology
@@ -1719,6 +1750,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-09 | §7.9 — requests to a user's URL go through a guard: public unicast addresses only, checked inside the connection's own lookup and again on every redirect, ports 80 and 443, a whole-download timeout and a counted byte cap. A16 automated, in the integration tier: the guard needs no process to attack. |
 | 2026-11-09 | §4.3, §6.2, D14 — **decided**: `/jobs` and the new `/products` page with an opaque keyset cursor; `offset` and `total` removed from `/jobs`. `Job.createdAt` narrowed to milliseconds so a cursor survives a JS `Date`, and the job list's indexes gain `id`. Measured: 6.3 ms by offset against 0.019 ms by cursor on the last page of 20 000 products. |
 | 2026-11-06 | §4.3, §6.2, §6.3b — the error report: every bad row to `reports/<userId>/<jobId>.csv` from a second read of the file, and `GET /jobs/:id/error-report` signing a link on each call. A file whose first 100 rows are mostly bad fails before anything is written, as `error.reason: 'IMPORT_MOSTLY_INVALID'` — `reason` added beside the engine's `code`. |
 | 2026-11-05 | §4.3, §6.2, §6.3b, D26 — `Job.checkpoint` added, written in the batch's own transaction under the lease; a handler commits through `JobContext.commit()` and reads `JobContext.checkpoint`. `import.csv` resumes after its last committed batch, refusing a file whose `ETag` changed. `POST /jobs/:id/retry?from=start` restarts instead. A14 automated. |

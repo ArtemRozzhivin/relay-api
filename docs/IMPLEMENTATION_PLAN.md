@@ -707,8 +707,8 @@ private.
 
 ### Tasks
 
-- [ ] **C.1 · Outbound request guard** — http/https only, **private and link-local ranges blocked
-  after DNS resolution**, timeout, max body size, content-type check.
+- [x] **C.1 · Outbound request guard** — http/https only, **private and link-local ranges blocked
+  after DNS resolution**, timeout, max body size, content-type check. §7.9.
   ```
   _Blocking by hostname is not enough: a name that resolves to 169.254.169.254 is the attack.
   Resolve first, check the address, then connect._
@@ -733,8 +733,8 @@ private.
 
 ### Done when
 
-- [ ] **A16 passes** — `http://localhost`, `http://169.254.169.254` and a DNS name resolving to a
-  private address are all rejected
+- [x] **A16 passes** — `http://localhost`, `http://169.254.169.254` and a DNS name resolving to a
+  private address are all rejected (integration tier: the guard needs no process to attack)
 - [ ] **A17 passes** — a permanent error consumes one attempt, not the whole budget
 - [ ] **A18 passes** — image batches at the chosen concurrency do not trigger stalled redeliveries
 
