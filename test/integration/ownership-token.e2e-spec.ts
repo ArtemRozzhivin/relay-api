@@ -105,6 +105,38 @@ describe('the ownership token across a re-drive', () => {
     });
   });
 
+  // Between the re-drive and its claim the row is QUEUED under the previous
+  // life's lease. A worker of that life, stalled and abandoned but alive,
+  // used to finish it there — and the re-drive's delivery was refused.
+  it("refuses the previous life's finish before the re-drive is claimed", async () => {
+    const job = await prisma.job.create({
+      data: {
+        userId,
+        type: 'MOCK',
+        payload: {},
+        idempotencyKey: `token-${randomUUID()}`,
+        correlationId: 'token',
+      },
+    });
+    const stalled = await transitions.claim(job.id);
+
+    await transitions.abandonStranded(job.id, stalled!.lease, {
+      code: 'DELIVERY_ABANDONED',
+    });
+    await transitions.redrive(job.id);
+
+    expect(
+      await transitions.deadLetter(job.id, stalled!.lease, { code: 'TEST' }),
+    ).toBeNull();
+    expect(
+      await transitions.succeed(job.id, stalled!.lease, { ok: true }),
+    ).toBeNull();
+    expect(await transitions.claim(job.id)).toMatchObject({
+      status: 'RUNNING',
+      attempts: 1,
+    });
+  });
+
   it('lets the current life finish', async () => {
     const { jobId, second } = await secondLife();
 

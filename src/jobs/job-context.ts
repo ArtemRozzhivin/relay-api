@@ -76,8 +76,8 @@ export interface JobContext {
    * in one transaction, so a later attempt can skip exactly the work that
    * committed.
    *
-   * The one place a handler is handed a database client, because atomicity
-   * needs it: `work` must make every write through `tx` and do nothing else
+   * One of the two places a handler is handed a database client, because
+   * atomicity needs it: `work` must make every write through `tx` and do nothing else
    * — no event, no HTTP call — since a rollback cannot take those back (A10).
    *
    * @param checkpoint builds the value to store from what `work` returned; it
@@ -90,6 +90,24 @@ export interface JobContext {
   commit<T>(
     work: (tx: Prisma.TransactionClient) => Promise<T>,
     checkpoint: (value: T) => Prisma.InputJsonValue,
+  ): Promise<T>;
+
+  /**
+   * Commits the job's one irreversible effect — a charge's ledger row — in a
+   * transaction that also marks the job as having it. From then on nothing
+   * cancels the job from outside: a cancel answers that it was asked, and the
+   * next delivery's handler finds the effect and finishes the job as a
+   * success. For a job whose work is a single effect, not batches.
+   *
+   * `work` writes through `tx` only, as for `commit`.
+   *
+   * @returns what `work` returned.
+   * @throws JobCancelledError when this attempt no longer owns the job; the
+   * effect was rolled back. Whatever `work` throws — a unique violation that
+   * proves an earlier attempt's effect, say — propagates unchanged.
+   */
+  commitEffect<T>(
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
   ): Promise<T>;
 
   /** Writes one line tagged with the job, the attempt and the request that submitted it. */

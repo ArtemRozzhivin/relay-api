@@ -378,10 +378,11 @@ export class JobsService {
         return cancelled;
       }
 
-      // A worker claimed it between the two writes. It will see the flag at
-      // the handler's first boundary, so the request is not lost — but the
-      // row just written is stale, and emitting it could arrive after the
-      // worker's RUNNING event and walk a client's view backwards.
+      // A worker claimed it between the two writes, or its effect has already
+      // committed and only its handler may finish it (§5.2). Either way the
+      // request is not lost — a handler sees the flag at its first boundary —
+      // but the row just written is stale, and emitting it could arrive after
+      // the worker's RUNNING event and walk a client's view backwards.
       return this.findOne(userId, jobId);
     }
 

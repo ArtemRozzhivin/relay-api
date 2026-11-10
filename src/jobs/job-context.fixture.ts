@@ -56,6 +56,13 @@ export const recordingContext = ({
 
       return value;
     },
+    commitEffect: async (work) => {
+      if (!client) {
+        throw new Error('This context has no database to commit through');
+      }
+
+      return client.$transaction((tx) => work(tx));
+    },
     log: (message) => {
       lines.push(message);
     },

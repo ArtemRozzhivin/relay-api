@@ -207,6 +207,75 @@ describe('cancellation transitions', () => {
     });
   });
 
+  // Once a charge's money has moved, a CANCELLED row would be a lie (§5.2):
+  // only the job's handler may finish it, and it finishes it as a success.
+  describe('a job whose effect has committed', () => {
+    // What the CHARGE handler does: its ledger row, through commitEffect.
+    const charge = (jobId: string, lease: number) =>
+      transitions.commitEffect(jobId, lease, (tx) =>
+        tx.sideEffect.create({
+          data: {
+            effectKey: `${jobId}:charge`,
+            jobId,
+            kind: 'charge',
+            detail: {},
+          },
+        }),
+      );
+
+    it('is not cancelled by the delivery that finds the request', async () => {
+      const jobId = await jobIn('RUNNING');
+
+      await charge(jobId, 1);
+      await transitions.requestCancel(jobId);
+
+      expect(await transitions.cancelBeforeClaim(jobId)).toBeNull();
+      expect(await row(jobId)).toMatchObject({
+        status: 'RUNNING',
+        effectCommitted: true,
+      });
+    });
+
+    it('is not cancelled by the API while it waits for a retry', async () => {
+      const jobId = await jobIn('RUNNING');
+
+      await charge(jobId, 1);
+      await transitions.requeueForRetry(jobId, 1, { code: 'ATTEMPT_FAILED' });
+      await transitions.requestCancel(jobId);
+
+      expect(await transitions.cancelQueued(jobId)).toBeNull();
+      expect(await row(jobId)).toMatchObject({
+        status: 'QUEUED',
+        cancelRequested: true,
+      });
+    });
+
+    // The redelivery cancelled it while the first attempt was stalled before
+    // its charge; that attempt then wakes up and reaches it.
+    it('is never charged by an attempt that has lost the job', async () => {
+      const jobId = await jobIn('RUNNING', { cancelRequested: true });
+
+      expect(await transitions.cancelBeforeClaim(jobId)).toMatchObject({
+        status: 'CANCELLED',
+      });
+      expect(await charge(jobId, 1)).toBeNull();
+      expect(await prisma.sideEffect.count({ where: { jobId } })).toBe(0);
+    });
+
+    it('cannot be made CANCELLED even by a write that skips the guard', async () => {
+      const jobId = await jobIn('RUNNING');
+
+      await charge(jobId, 1);
+
+      await expect(
+        prisma.job.update({
+          where: { id: jobId },
+          data: { status: 'CANCELLED' },
+        }),
+      ).rejects.toThrow('Job_effect_never_cancelled');
+    });
+  });
+
   it('a cancelled job cannot be claimed', async () => {
     expect(await transitions.claim(await jobIn('CANCELLED'))).toBeNull();
   });

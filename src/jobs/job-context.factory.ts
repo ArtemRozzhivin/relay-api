@@ -126,6 +126,20 @@ class RunningJobContext implements ManagedJobContext {
     return committed.value;
   }
 
+  async commitEffect<T>(work: (tx: Prisma.TransactionClient) => Promise<T>) {
+    const committed = await this.transitions.commitEffect(
+      this.jobId,
+      this.lease,
+      work,
+    );
+
+    if (!committed) {
+      throw new JobCancelledError();
+    }
+
+    return committed.value;
+  }
+
   async shouldStop() {
     return (
       this.stopping() ||
