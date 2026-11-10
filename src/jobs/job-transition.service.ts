@@ -240,6 +240,18 @@ export class JobTransitionService {
    * stopped. Requires the flag, so a handler that stops without being asked
    * cannot turn a job into `CANCELLED` that its owner never cancelled.
    */
+  // The worker is shutting down, not failing: the attempt stopped at a safe
+  // point, so it is handed back rather than counted against the budget, and
+  // the next worker resumes the job from what it committed.
+  release(jobId: string, lease: number) {
+    return this.move(
+      jobId,
+      ['RUNNING'],
+      { status: 'QUEUED', attempts: { decrement: 1 } },
+      { where: { lease } },
+    );
+  }
+
   cancel(jobId: string, lease: number) {
     return this.move(
       jobId,

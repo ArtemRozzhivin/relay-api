@@ -73,6 +73,12 @@ export class ProcessHandle {
     return this.child.exitCode ?? undefined;
   }
 
+  // Not exitCode alone: a Nest process re-raises the signal it shut down on,
+  // and a process ended by a signal has no exit code.
+  get exited() {
+    return this.child.exitCode !== null || this.child.signalCode !== null;
+  }
+
   count(pattern: string | RegExp) {
     const matches = this.output.match(
       typeof pattern === 'string'

@@ -316,6 +316,7 @@ to guard. Revisit if the status stream turns out to be unreadable without it (§
 | `RUNNING` | `RUNNING` | Worker | **See D7** — this is the redelivery-after-stall case |
 | `RUNNING` | `SUCCEEDED` | Worker | `WHERE id = ? AND status = 'RUNNING'` |
 | `RUNNING` | `QUEUED` | Worker | `WHERE id = ? AND status = 'RUNNING' AND attempts < maxAttempts` |
+| `RUNNING` | `QUEUED` | Worker, shutting down | `WHERE id = ? AND status = 'RUNNING' AND lease = ?`, sets `attempts = attempts - 1` — the handler stopped at a safe point because the worker is going away (§7.6a) |
 | `RUNNING` | `DEAD_LETTERED` | Worker | `WHERE id = ? AND status = 'RUNNING'` and (attempts exhausted OR terminal error) |
 | `DEAD_LETTERED` | `QUEUED` | API (re-drive) | `WHERE id = ? AND status = 'DEAD_LETTERED'`, resets `attempts = 0` and `cancelRequested = false` — never `lease` |
 | `QUEUED` | `CANCELLED` | API (cancel) | `WHERE id = ? AND status = 'QUEUED' AND cancelRequested` — nobody is running it, so the API may finish it |
@@ -780,6 +781,32 @@ Worth stating precisely, because the mental model most people have is wrong:
   path and the sweep its backstop rather than a racer. The write is pinned to the `startedAt` the
   sweep read, so a job claimed again in between is never finished on stale evidence. It also
   finishes a processor that returned without finishing its row, whose entry ends `completed`.
+
+### 7.6a Shutdown — a deploy hands running work back
+
+`SIGTERM` is a deploy, not a failure, and must cost a running job neither its work nor an attempt.
+
+- **The worker drains before anything it uses is closed.** Nest runs every module's
+  `onModuleDestroy` before any `onApplicationShutdown`, and `@nestjs/bullmq` closes its workers
+  in the second; the S3 client and Redis close in the first. So `JobsProcessor` closes the BullMQ
+  worker in its own `onModuleDestroy`, which runs first because its module is the root — Nest
+  destroys modules in the reverse of their init order. Draining any later, a job mid-upload loses
+  its S3 client and a retry is spent on a deploy.
+- **A running handler is told to stop at its next safe point.** From the signal on,
+  `shouldStop()` is true (D22), so an import stops after its committed batch and an image batch
+  after the product in hand. A drain that waited for whole jobs could outlast the orchestrator's
+  grace period — Docker's is 10 s — and end in `SIGKILL` and a stall.
+- **The stopped job goes back to the queue unspent.** The row moves `RUNNING → QUEUED` with
+  the attempt given back (`release`, §5.2), and the queue entry moves to delayed rather than
+  failing, which would spend one of the queue's attempts and wait out a backoff. The next worker
+  claims it and resumes from what was committed. A cancel requested meanwhile wins: the job ends
+  `CANCELLED`, not queued.
+- **A handler with no safe point runs to the end of its drain.** `CHARGE` has one effect and
+  calls no `shouldStop()`; if it outlasts the grace period it is killed and redelivered like any
+  crash, and the ledger dedupes the effect (§7.1).
+
+Measured by A5e: the drain takes under a second mid-batch, the product in hand reaches S3 after
+the signal, and the job finishes on the next worker at `attempts = 1`.
 
 ### 7.7 Error taxonomy
 
@@ -1395,6 +1422,7 @@ cases.
 | **A3c** | **A worker from a job's previous life must not write over its next.** Freeze a worker holding a job's first claim; let the job be abandoned, re-driven and claimed again — as attempt 1, since a re-drive resets the budget — then thaw the first | The frozen worker's finish is **refused** (its log says it no longer owns the job) while the new life is still `RUNNING`; the job ends `SUCCEEDED` with `attempts = 1` and `lease = 3`. Fails if the token is a counter a re-drive resets | 6 |
 | **A5b** | **A job the queue abandons still terminates.** Stall a job past `maxStalledCount` so `process()` is never called again | `status = 'DEAD_LETTERED'` with `error->>'code' = 'DELIVERY_ABANDONED'`, exactly 2 deliveries against a budget of 5, and a re-drive that is *observed to be delivered* — a `202` alone is not evidence (§7.5a) | 6 |
 | **A5c** | **A filtered bulk re-drive revives exactly the matching dead letters.** Dead-letter jobs under two error codes; re-drive one code with `limit` below the match count | Calls return `{ redriven, remaining }` until `remaining = 0`; every match ends `SUCCEEDED` with `attempts = 1`, its outbox row published **by the relay** (`Outbox.attempts = 1`); every non-match is untouched and has no outbox row | PA |
+| **A5e** | **A deploy hands a running job back.** `SIGTERM` to a worker mid-way through an image batch, then a second worker | The worker exits in about a second; the product in hand when the signal came reaches `READY`; the job is `QUEUED` at `attempts = 0`, then `SUCCEEDED` at `attempts = 1` on the second worker; the first worker's log holds no retry and no closed connection (§7.6a) | PC |
 | **A5d** | **An abandonment the `failed` event loses is still finalised.** A5b's two stalls, with the worker that hears the `failed` event dropping it | `status = 'DEAD_LETTERED'`, `error->>'code' = 'DELIVERY_ABANDONED'`, and the worker's log shows the sweep finished it **and not the event** — otherwise the event path passing would look the same | 6 |
 | **A4** | **Redelivery of a succeeded job is a no-op.** Force redelivery of a `SUCCEEDED` job | `SUCCEEDED → RUNNING` never occurs; `SideEffect` count unchanged; the guarded update returns count `0` | 6 |
 | **A5** | **A poison job dead-letters exactly once.** Submit a job that always fails; separately, queue one whose payload can never parse | `attempts = maxAttempts`; exactly one `DEAD_LETTERED` row; `error` populated; it never returns to `QUEUED` without an explicit re-drive. The unparseable one dead-letters on attempt 1 with `TERMINAL_FAILURE`, its budget unspent | 6 |
@@ -1597,7 +1625,8 @@ What the implementation settled:
   spite of the request, and a `202` would make the caller read the body to learn its cancel had
   no effect — for a charge, that the money moved.
 - **The capability is `shouldStop()`, not `isCancelRequested()`.** It is also true when the
-  attempt has lost the job, so a handler has one question to ask at a boundary rather than two.
+  attempt has lost the job, and while the worker shuts down (§7.6a), so a handler has one question
+  to ask at a boundary rather than three.
 
 **D23 — `userId` stays `NOT NULL`. Two different problems were being conflated.**
 Fan-out children (`ai.enrich`, `image.process`, `pipeline.finalize`) *do* have an owner: the user
@@ -1845,6 +1874,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-10 | §5.2, §7.6a, §14 — `SIGTERM` no longer breaks running jobs. The worker drained in `@nestjs/bullmq`'s `onApplicationShutdown`, after every `onModuleDestroy` had closed S3 and Redis, so every deploy cost a running import or image batch an attempt. It now drains first, tells handlers to stop at their next safe point, and hands the job back to the queue with its attempt given back. A5e automated. |
 | 2026-11-10 | §6.3b — an import row is capped at 1 000 fields as well as 64 KB of content. The content cap alone counted no empty field, so a line of bare commas grew one record without bound and could take the worker's memory with it. A cap per physical line was rejected: quoted line breaks split one row into short lines, and a file ending lines in `\r` alone has no `\n`. |
 | 2026-11-10 | §6.3b, §6.4, D14 — text bound for Postgres refuses U+0000 at the edge: a NUL in an import cell is one bad row with its reason instead of a batch failing on every attempt, and a NUL in a payload is a `400` instead of a `500` at the insert. A cursor's length limit is derived from its position's longest values, so a sku of control characters no longer yields a `nextCursor` the list refuses. One `SKU_MAX_LENGTH`; a header column named after an `Object` property is skipped rather than failing the file. |
 | 2026-11-09 | §7.6, §14, §16 — D10 **decided** from measurements: a full libuv threadpool delays DNS lookups by about 130 ms, not BullMQ's lock renewal, which stayed at 3–5 ms, because a renewal is a socket command the pool never serves. The reasoning that moved D10 into Phase C said otherwise and is corrected. Concurrency stays 5 with renders in-process. A18 automated with a probe loaded into the real worker, and shown to fail on a 40 s freeze. |

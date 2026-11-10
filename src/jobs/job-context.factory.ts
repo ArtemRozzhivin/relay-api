@@ -30,6 +30,9 @@ interface RunningJob {
   /** What the row already says, so a retry neither re-reports nor erases it. */
   progress: Prisma.JsonValue | null;
   checkpoint: Prisma.JsonValue | null;
+
+  /** Whether the worker running it is shutting down; never, by default. */
+  stopping?: () => boolean;
 }
 
 /**
@@ -82,6 +85,7 @@ class RunningJobContext implements ManagedJobContext {
     private readonly transitions: JobTransitionService,
     private readonly events: JobEventsPublisher,
     private readonly logger: Logger,
+    private readonly stopping: () => boolean,
   ) {}
 
   reportProgress(progress: JobProgress) {
@@ -123,7 +127,10 @@ class RunningJobContext implements ManagedJobContext {
   }
 
   async shouldStop() {
-    return !(await this.transitions.isWanted(this.jobId, this.lease));
+    return (
+      this.stopping() ||
+      !(await this.transitions.isWanted(this.jobId, this.lease))
+    );
   }
 
   log(message: string) {
@@ -255,6 +262,7 @@ export class JobContextFactory {
     correlationId,
     progress,
     checkpoint,
+    stopping = () => false,
   }: RunningJob): ManagedJobContext {
     const stored = readProgress(progress);
 
@@ -271,6 +279,7 @@ export class JobContextFactory {
       this.transitions,
       this.events,
       this.logger,
+      stopping,
     );
   }
 }

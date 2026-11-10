@@ -1,7 +1,7 @@
 import { Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
-import { UnrecoverableError, type Job as QueueJob } from 'bullmq';
+import { DelayedError, UnrecoverableError, type Job as QueueJob } from 'bullmq';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
 import { JobContextFactory } from '../jobs/job-context.factory.js';
@@ -19,6 +19,10 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   private readonly logger = new Logger(JobsProcessor.name);
   private readonly finalising = new Set<Promise<void>>();
 
+  // Set when shutdown begins: from then on, every running handler is told to
+  // stop at its next safe point.
+  private stopping = false;
+
   constructor(
     private readonly transitions: JobTransitionService,
     private readonly handlers: JobHandlerRegistry,
@@ -29,7 +33,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     super();
   }
 
-  async process(message: QueueJob<JobMessage>) {
+  async process(message: QueueJob<JobMessage>, token?: string) {
     const { jobId, correlationId } = message.data;
 
     // Before the claim, not after: a retry scheduled after the cancel request,
@@ -75,6 +79,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       correlationId,
       progress: claimed.progress,
       checkpoint: claimed.checkpoint,
+      stopping: () => this.stopping,
     });
 
     try {
@@ -110,13 +115,32 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           this.logger.log(
             `Job ${jobId} cancelled at a safe point on attempt ${attempt}`,
           );
-        } else {
-          // shouldStop() is also true for an attempt that lost the job; the
-          // attempt that holds it now is the one entitled to finish it.
-          this.logger.warn(
-            `Job ${jobId} stopped on attempt ${attempt}, which no longer owns it`,
-          );
+
+          return;
         }
+
+        const released = this.stopping
+          ? await this.transitions.release(jobId, lease)
+          : null;
+
+        if (released) {
+          await this.events.jobUpdated(released);
+          this.logger.log(
+            `Job ${jobId} handed back at a safe point for the next worker; attempt ${attempt} not counted`,
+          );
+
+          // Back to the queue without failing: a thrown error would spend one
+          // of the queue's attempts and wait out a backoff first.
+          await message.moveToDelayed(Date.now(), token);
+
+          throw new DelayedError();
+        }
+
+        // shouldStop() is also true for an attempt that lost the job; the
+        // attempt that holds it now is the one entitled to finish it.
+        this.logger.warn(
+          `Job ${jobId} stopped on attempt ${attempt}, which no longer owns it`,
+        );
 
         // Returned, not thrown: stopping when asked is the job doing what it
         // was told, so the queue records the delivery as complete rather than
@@ -231,7 +255,13 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     }
   }
 
+  // Drained here, not in @nestjs/bullmq's own onApplicationShutdown: Nest runs
+  // every module's onModuleDestroy first, and those close the S3 client and
+  // Redis that a running job is still using. This module is the root, so its
+  // hook runs before theirs.
   async onModuleDestroy() {
+    this.stopping = true;
+    await this.worker.close();
     await Promise.allSettled(this.finalising);
   }
 
