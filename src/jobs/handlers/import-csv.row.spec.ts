@@ -27,6 +27,19 @@ describe('readHeader', () => {
     ).toEqual(['sku', 'name', 'price', 'currency', 'imageUrl', undefined]);
   });
 
+  it('skips a column named after a property every object has', () => {
+    expect(
+      readHeader([
+        'sku',
+        'name',
+        'price',
+        'currency',
+        'Constructor',
+        '__proto__',
+      ]),
+    ).toEqual(['sku', 'name', 'price', 'currency', undefined, undefined]);
+  });
+
   it('refuses a file without a required column, naming it', () => {
     expect(() => readHeader(['sku', 'name', 'currency'])).toThrow(
       TerminalJobError,
@@ -80,6 +93,19 @@ describe('csvRowSchema', () => {
       expect(reason(row({ imageUrl }))).toMatch(/^imageUrl:/);
     },
   );
+
+  // Postgres cannot store it: one such cell made its whole batch fail, on
+  // every attempt, rather than becoming one bad row.
+  it.each([
+    ['sku', 'A\u00001'],
+    ['name', 'Mug\u0000'],
+    ['description', 'Big\u0000mug'],
+    ['imageUrl', 'https://example.com/a\u0000.jpg'],
+  ])("refuses a NUL character in %s, as that row's reason", (column, value) => {
+    expect(reason(row({ [column]: value }))).toBe(
+      `${column}: must not contain a NUL character`,
+    );
+  });
 
   it('keeps an http or https image address', () => {
     expect(

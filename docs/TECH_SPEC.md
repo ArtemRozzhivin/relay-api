@@ -486,7 +486,8 @@ mark; any other column is ignored, because a store export carries dozens.
 **What happens to it.** The file is read as a stream and written 500 valid rows per statement
 (§4.7, D30), so memory holds one batch however long the file is: while a batch is being written
 the parser asks for no more, the download pauses, and S3 waits. A **bad row** — a missing cell, a
-price that does not parse — is counted and skipped; it never fails the import. A **bad file**
+price that does not parse, a NUL character Postgres cannot store (§6.4) — is counted and skipped;
+it never fails the import. A **bad file**
 fails it at once as a terminal error, because no retry can fix it: a header without a required
 column, CSV that does not parse (one record is capped at 64 KB, so an unclosed quote cannot pull
 the rest of the file into memory), a key that is another account's, a file that no longer exists.
@@ -599,6 +600,11 @@ Nest 12's first-party `StandardSchemaValidationPipe` with Zod schemas, registere
   seconds later.
 - Path `:id` is validated as a UUID — a malformed id is a clean `400`, not a `500` from a
   Postgres cast error.
+- **Text bound for Postgres refuses U+0000** (`storableText`), the one character `text` and
+  `jsonb` cannot store. Let through, it fails the whole write it is part of: a submit answers
+  `500`, an import batch fails on every attempt until the job dead-letters. Refused at the edge it
+  is a `400`, or one bad row with its reason. The worker's re-parse can carry the same check,
+  since no stored value holds the character.
 - **The worker re-parses the stored payload** before running it, against the same per-type
   schema but **without `.strict()`**. The row it reads may have been written by a newer deploy,
   so an unknown field is dropped and ignored. Rejecting it would dead-letter every job in
@@ -1664,7 +1670,9 @@ The cursor carries the **values**, not a reference to a row. Prisma's own cursor
 skips it with `OFFSET 1`, so once that row leaves the filter — paging `?status=QUEUED` past a job
 that has since started — it skips a real row instead. Carrying the values through JavaScript is
 why `Job.createdAt` holds milliseconds (§4.3), and why `id` breaks ties, which a millisecond
-clock makes common. It is base64url JSON and deliberately unsigned: every list is filtered to the
+clock makes common. A cursor's length limit is computed from the longest values its position
+holds, with JSON's six-character escape of a control character as the worst case, so a list
+never refuses a cursor it issued. It is base64url JSON and deliberately unsigned: every list is filtered to the
 caller's rows on the server, so an edited cursor moves the caller only through their own data,
 and one that does not decode is a `400`. A page reads `limit + 1` rows; the extra one proves a
 next page without counting the rest. There is no `total`: a client that needs one asks for it
@@ -1833,6 +1841,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-10 | §6.3b, §6.4, D14 — text bound for Postgres refuses U+0000 at the edge: a NUL in an import cell is one bad row with its reason instead of a batch failing on every attempt, and a NUL in a payload is a `400` instead of a `500` at the insert. A cursor's length limit is derived from its position's longest values, so a sku of control characters no longer yields a `nextCursor` the list refuses. One `SKU_MAX_LENGTH`; a header column named after an `Object` property is skipped rather than failing the file. |
 | 2026-11-09 | §7.6, §14, §16 — D10 **decided** from measurements: a full libuv threadpool delays DNS lookups by about 130 ms, not BullMQ's lock renewal, which stayed at 3–5 ms, because a renewal is a socket command the pool never serves. The reasoning that moved D10 into Phase C said otherwise and is corrected. Concurrency stays 5 with renders in-process. A18 automated with a probe loaded into the real worker, and shown to fail on a 40 s freeze. |
 | 2026-11-09 | §6.3c, §7.9, §14, D31 — an image that can never be made marks its product `FAILED` with the reason and the batch goes on; one that might pass later is passed over and retried after the rest. A17 restated to match — `attempts = 1` at `SUCCEEDED`, not at `DEAD_LETTERED` — and automated against the real guard and real S3. The guard's refusal no longer names the address a host resolved to, since the message now reaches the seller. |
 | 2026-11-09 | §4.7, §6.2, §6.3, §6.3c, §13.4 — `image.process`: a batch of up to 50 skus made into three WebP sizes under the source URL's hash, recorded `READY` only while that URL is still the product's. `Product` gains `imageStatus`, `imageSourceUrl` and `imageError`; `GET /products` shows each product's `image` with links signed per read. The bucket's lifecycle rules are scoped by prefix so product images do not expire. |

@@ -3,6 +3,8 @@ import { JobStatus } from '../generated/prisma/enums.js';
 import { DEAD_LETTER_CODES } from './job-error-codes.js';
 import { UPLOAD_KEY_PATTERN } from '../storage/object-keys.js';
 import { cursorParam, limitParam } from '../common/pagination/cursor.js';
+import { storableText } from '../common/validation/storable-text.js';
+import { SKU_MAX_LENGTH } from '../products/products.schema.js';
 
 // The payload schemas tolerate unknown keys: the worker re-parses the stored
 // payload (§6.4), and a job written by a newer deploy can reach an older worker.
@@ -29,12 +31,15 @@ export const importCsvPayloadSchema = z.object({
 // 20 000 jobs, and not the whole catalog, where one slow image would hold up
 // every other. Which of the skus are the caller's is the handler's to find out.
 export const imageProcessPayloadSchema = z.object({
-  skus: z.array(z.string().trim().min(1).max(100)).min(1).max(50),
+  skus: z
+    .array(storableText().trim().min(1).max(SKU_MAX_LENGTH))
+    .min(1)
+    .max(50),
 });
 
 export const chargePayloadSchema = z.object({
   amountCents: z.coerce.number().int().positive(),
-  reference: z.string().min(1).max(200),
+  reference: storableText().min(1).max(200),
   delayMs: z.coerce.number().int().min(0).max(60_000).default(0),
 });
 
@@ -97,6 +102,8 @@ export const listJobsSchema = z
         createdAt: z.iso.datetime().pipe(z.coerce.date()),
         id: z.uuid(),
       }),
+      // An ISO instant and a uuid.
+      24 + 36,
     ).optional(),
   })
   .strict();

@@ -16,6 +16,7 @@ import {
 import {
   csvRowSchema,
   describeInvalidRow,
+  IMPORT_COLUMNS,
   readHeader,
 } from './import-csv.row.js';
 
@@ -40,16 +41,7 @@ const INVALID_SAMPLES = 10;
 // is written.
 const JUDGED_ROWS = 100;
 
-const REPORT_COLUMNS = [
-  'line',
-  'reason',
-  'sku',
-  'name',
-  'price',
-  'currency',
-  'description',
-  'imageUrl',
-];
+const REPORT_COLUMNS = ['line', 'reason', ...IMPORT_COLUMNS];
 
 // Every pass over a file reads it alike, so the report's line numbers are the
 // ones the import counted.
