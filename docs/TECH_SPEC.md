@@ -489,8 +489,12 @@ the parser asks for no more, the download pauses, and S3 waits. A **bad row** �
 price that does not parse, a NUL character Postgres cannot store (§6.4) — is counted and skipped;
 it never fails the import. A **bad file**
 fails it at once as a terminal error, because no retry can fix it: a header without a required
-column, CSV that does not parse (one record is capped at 64 KB, so an unclosed quote cannot pull
-the rest of the file into memory), a key that is another account's, a file that no longer exists.
+column, CSV that does not parse, a key that is another account's, a file that no longer exists. A
+row is capped at 64 KB of content and at 1 000 fields, both while it is still being read, so
+neither an unclosed quote nor a line of bare commas — empty fields have no content to count — can
+pull the file into memory. The fields are counted by the parser's per-field hook, which is why
+the header names the columns after parsing rather than through the parser's own `columns`
+option: that option skips the hook for every field past the header's last.
 Rows written before a bad file is discovered stay written.
 
 **Progress and cancellation.** After each batch the job reports `processed` — rows read so far,
@@ -1841,6 +1845,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-10 | §6.3b — an import row is capped at 1 000 fields as well as 64 KB of content. The content cap alone counted no empty field, so a line of bare commas grew one record without bound and could take the worker's memory with it. A cap per physical line was rejected: quoted line breaks split one row into short lines, and a file ending lines in `\r` alone has no `\n`. |
 | 2026-11-10 | §6.3b, §6.4, D14 — text bound for Postgres refuses U+0000 at the edge: a NUL in an import cell is one bad row with its reason instead of a batch failing on every attempt, and a NUL in a payload is a `400` instead of a `500` at the insert. A cursor's length limit is derived from its position's longest values, so a sku of control characters no longer yields a `nextCursor` the list refuses. One `SKU_MAX_LENGTH`; a header column named after an `Object` property is skipped rather than failing the file. |
 | 2026-11-09 | §7.6, §14, §16 — D10 **decided** from measurements: a full libuv threadpool delays DNS lookups by about 130 ms, not BullMQ's lock renewal, which stayed at 3–5 ms, because a renewal is a socket command the pool never serves. The reasoning that moved D10 into Phase C said otherwise and is corrected. Concurrency stays 5 with renders in-process. A18 automated with a probe loaded into the real worker, and shown to fail on a 40 s freeze. |
 | 2026-11-09 | §6.3c, §7.9, §14, D31 — an image that can never be made marks its product `FAILED` with the reason and the batch goes on; one that might pass later is passed over and retried after the rest. A17 restated to match — `attempts = 1` at `SUCCEEDED`, not at `DEAD_LETTERED` — and automated against the real guard and real S3. The guard's refusal no longer names the address a host resolved to, since the message now reaches the seller. |

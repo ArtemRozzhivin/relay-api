@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { pipeline } from 'node:stream/promises';
-import { CsvError, parse } from 'csv-parse';
+import { CsvError } from 'csv-parse';
 import { stringify } from 'csv-stringify';
 import { z } from 'zod';
 import { JobCancelledError, JobHandler } from '../job-handler.js';
@@ -17,17 +17,16 @@ import {
   csvRowSchema,
   describeInvalidRow,
   IMPORT_COLUMNS,
-  readHeader,
 } from './import-csv.row.js';
+import {
+  nameColumns,
+  parseFile,
+  type ParsedRecord,
+} from './import-csv.parse.js';
 
 // One transaction per batch: short enough to keep each one's row locks brief,
 // large enough that a 20 000-row file is 40 round trips rather than 20 000.
 const BATCH_SIZE = 500;
-
-// An unclosed quote turns the rest of the file into a single field. Capping a
-// record keeps that from pulling the whole file into memory, and fails it as
-// malformed instead.
-const MAX_RECORD_BYTES = 64 * 1024;
 
 // The result carries a few examples, not every bad row: a wrong file can have
 // thousands, and the result is a row in Postgres. The full list is the error
@@ -42,26 +41,6 @@ const INVALID_SAMPLES = 10;
 const JUDGED_ROWS = 100;
 
 const REPORT_COLUMNS = ['line', 'reason', ...IMPORT_COLUMNS];
-
-// Every pass over a file reads it alike, so the report's line numbers are the
-// ones the import counted.
-const parseFile = () =>
-  parse({
-    columns: readHeader,
-    info: true,
-    bom: true,
-    trim: true,
-    skip_empty_lines: true,
-    // A short or long row is a bad row, reported like any other — not a
-    // reason to abandon the whole file.
-    relax_column_count: true,
-    max_record_size: MAX_RECORD_BYTES,
-  });
-
-interface ParsedRecord {
-  record: Record<string, string>;
-  info: { lines: number };
-}
 
 const count = z.number().int().nonnegative();
 
@@ -154,6 +133,7 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       await pipeline(
         file,
         parseFile(),
+        nameColumns,
         // While this awaits a write it asks for no more records, so the parser
         // stops, the download pauses, and memory holds one batch however long
         // the file is.
@@ -281,6 +261,7 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       pipeline(
         body,
         parseFile(),
+        nameColumns,
         async function* (records: AsyncIterable<ParsedRecord>) {
           for await (const { record, info } of records) {
             const parsed = csvRowSchema.safeParse(record);
