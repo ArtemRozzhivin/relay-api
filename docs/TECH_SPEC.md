@@ -255,6 +255,9 @@ code it gives each item it sells), never by our `id`, so the SKU is the key an i
 | `priceCents` | `int` | Whole minor units, never a float. **DB** `CHECK (priceCents >= 0)` |
 | `currency` | `text` | ISO 4217. **DB** `CHECK (currency ~ '^[A-Z]{3}$')` |
 | `imageUrl` | `text?` | As written in the file — untrusted until phase C's outbound guard has checked it |
+| `imageStatus` | `text?` | `READY` or `FAILED`: what `image.process` concluded about `imageSourceUrl` (§6.3c). **DB** `CHECK` |
+| `imageSourceUrl` | `text?` | The `imageUrl` that conclusion is about. Set exactly when `imageStatus` is (**DB** `CHECK`). Once an import replaces `imageUrl`, the two differ and the image reads as not processed yet — nothing has to clear the old conclusion |
+| `imageError` | `text?` | Why the image at `imageSourceUrl` could not be used. **DB** `CHECK`: only when `FAILED` |
 | `createdAt` / `updatedAt` | `timestamptz(6)` | |
 
 **DB** `UNIQUE (userId, sku)` — per store, because two stores' `A-1` are unrelated. This is what
@@ -373,7 +376,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
-| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14) |
+| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) |
 | `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
@@ -432,6 +435,7 @@ that is not on the row, that stops being true and a stored-response table become
 | | `reference` | 1–200 chars | required |
 | | `delayMs` | `0`–`60000` | `0` |
 | `import.csv` | `key` | a key from `POST /uploads` (§6.3a), the caller's own, uploaded | required |
+| `image.process` | `skus` | 1–50 skus, each 1–100 chars; any the caller has no product for are reported, not refused | required |
 
 `maxAttempts` is on the body itself, not the payload: `1`–`20`, default `5`.
 
@@ -536,6 +540,50 @@ The file is reopened only if its `ETag` still matches: the upload slip is reusab
 expires, and a resume over different bytes under the same key would skip rows nobody imported, so
 a replaced file is a terminal error and `POST /jobs/:id/retry?from=start` imports it from the top.
 A resumed import reports its checkpoint as its first `processed`.
+
+### 6.3c `image.process` — a batch of product images
+
+The payload names up to 50 of the caller's skus: a batch, because one job per product makes a
+20 000-product catalog 20 000 jobs, and one job for the catalog lets a single slow image hold up
+the rest. For each product whose current `imageUrl` has no `READY` result yet, the worker
+downloads it through the guard (§7.9) — `jpeg`, `png`, `webp`, `gif` or `avif`, at most 10 MB, 15 s
+— and makes three WebP sizes with `sharp`: `thumb` 200, `medium` 600 and `large` 1200 pixels wide,
+upright by their EXIF orientation, never enlarged, without the source's metadata, which can carry
+where a photo was taken. A source over 40 megapixels is refused before it is decoded: a small file
+can declare enormous dimensions and take gigabytes to open.
+
+The sizes go to `products/<userId>/<productId>/<hash of the source URL>/<size>.webp`. The source
+URL is in the key so that a slow job still making a URL the seller has since replaced writes beside
+the new image rather than over it; the key is otherwise fixed, so a re-run overwrites its own
+files with the same bytes and needs no ledger. The files are written first and the product
+recorded `READY` second, and only while `imageUrl` still equals the URL that was processed — a
+crash between the two leaves files nothing points at yet, never a row pointing at missing files,
+and an import that replaced the URL meanwhile wins. A replaced URL's old files stay in the bucket.
+
+Between products the job reports `processed` out of `total` and honours a cancellation, so a
+stopped batch has recorded whole images only. A product already `READY` for its current URL is
+skipped, which is what lets a retry redo only the rest.
+
+An image that cannot be made marks its product, not the job (D31). A failure another try cannot
+change — a 404 or another 4xx, a host that does not exist, a refused address, a type that is not
+an image, bytes that do not decode, a source over the pixel limit — records the product `FAILED`
+with the reason, and the batch goes on. One that might pass later — a timeout, a 5xx, a 408 or a
+429 — leaves the product `PENDING` and the batch goes on as well; once every product has been
+tried, the attempt fails, so the job is retried and the retry skips what is `READY` (A17). A bad
+URL costs its own product one download, never the rest of the batch their images. A `FAILED`
+product is tried again by any later run that names it, a retry included: the seller may have
+fixed the file behind the same URL, and naming the sku again is how they ask.
+
+```jsonc
+// result
+{ "requested": 3, "processed": 1, "failed": 0, "superseded": 0, "alreadyReady": 1,
+  "withoutImage": 0, "notFound": ["X-9"] }
+```
+
+`superseded` counts products whose URL changed while the job worked on the old one. In
+`GET /products`, each product's `image` is `null` without an `imageUrl`, `{ "status": "PENDING" }`
+until its current URL is processed, `{ "status": "READY", "thumb", "medium", "large" }` with links
+signed for an hour on each read, or `{ "status": "FAILED", "error" }`.
 
 ### 6.4 Validation
 
@@ -702,6 +750,8 @@ Worth stating precisely, because the mental model most people have is wrong:
 - **A job can stall itself.** Blocking the event loop prevents lock renewal, so a CPU-bound
   processor is redelivered even though nothing crashed. This is why `MOCK` must `await sleep()`
   and never spin — otherwise reliability measurements reflect the fixture, not the system.
+  Filling libuv's threadpool does not (D10): a renewal is a command on an open socket, and only
+  DNS lookups, file access and `sharp`'s own work wait for a pool thread.
 - A stall-induced redelivery is **not** an error retry. It interacts with whichever attempt
   counter D7 makes authoritative, and the two counters will diverge the first time it happens.
 - **When `maxStalledCount` is exceeded, `process()` is never called.** The worker reads the
@@ -788,6 +838,39 @@ Three rules that are checkable in review:
 3. **Never emit a WebSocket event before commit.** Emit a state the DB then rolls back and
    every listening client is permanently wrong (§9.3). The same ordering rule applies to cache
    invalidation: commit first, then publish.
+
+### 7.9 Requests to a URL a user supplied
+
+A product's `imageUrl` is the seller's, and the worker fetches it from inside our network. Left
+unguarded that is server-side request forgery: `http://169.254.169.254/latest/meta-data/` hands
+the attacker the cloud credentials of whatever host the worker runs on. Every such request goes
+through `GuardedDownloader` (`src/outbound/`), which allows only what the seller could reach
+themselves:
+
+- **`http` or `https`, port 80 or 443, no credentials in the URL.** A port is a choice of
+  service; allowing any would let a URL probe whatever else a public host runs.
+- **Public unicast addresses only — an allow-list.** Every other range has a name in `ipaddr.js`
+  (loopback, private, link-local, carrier-grade NAT, multicast, and the IPv6 forms that carry an
+  IPv4 address inside: mapped, NAT64, 6to4, Teredo), so none has to be remembered to be refused.
+- **The address is checked inside the connection's own DNS lookup**, on the addresses it will
+  connect to — every one of them, since a name answering one public and one private address
+  leaves the choice to the connection. Checking the name first and connecting after would resolve
+  it twice, and a name can answer public to the check and private to the connect (DNS rebinding).
+  For the same reason no socket is pooled: a reused one would skip the lookup.
+- **An address written as the host is checked separately.** Node does not run the lookup for an
+  IP literal, so without this check `http://10.0.0.1/` would connect. The URL parser has already
+  normalised `2130706433` and `0x7f.1` to `127.0.0.1`.
+- **Redirects are followed by hand, at most 3, and each is checked like the first URL** — a
+  redirect to the metadata service is the classic way past a guard that looks only at the URL it
+  was given.
+- **One timeout for the whole download, a byte cap counted as the bytes arrive** — a declared
+  length can be absent or a lie — and a content-type the caller names.
+
+Every failure says whether asking again could change it: a refused address, a 404, a 4xx other
+than 408 and 429, a host that does not exist or a certificate that does not verify are permanent;
+a timeout, a 5xx, a 408 or a 429 are not (§7.7). A message names what was refused, never what a
+host name resolved to: it reaches the URL's owner as the product's `image.error` (§6.3c), and a
+resolved internal address would map the network for whoever asks.
 
 ---
 
@@ -1250,8 +1333,9 @@ readiness rather than container start. App and worker are the same image with di
 admin user (never the root user):
 
 1. A bucket in the chosen region: ACLs disabled, Block Public Access on, SSE-S3, versioning off,
-   and a lifecycle rule expiring current objects after 7 days and incomplete multipart uploads
-   after 1.
+   and lifecycle rules **scoped by prefix**, because `products/` holds product images that must
+   not expire: `uploads/` and `reports/` expire after 7 days, `fixtures/` (written by the tests)
+   after 1, and incomplete multipart uploads are aborted after 1 day across the bucket.
 2. An IAM user for the app — no console access, no group — with one inline policy:
 
    ```json
@@ -1316,8 +1400,8 @@ cases.
 | **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
 | **A16** | **A hostile image URL reaches nothing private.** `http://localhost`, `http://169.254.169.254`, and a public DNS name resolving to a private address | All three rejected **after resolution, before connect**; the product fails, the batch does not | PC |
-| **A17** | **A permanent error does not burn the budget.** A 404 image | `attempts = 1` at `DEAD_LETTERED`; no backoff was waited | PC |
-| **A18** | **Image batches do not self-stall.** N concurrent batches at the chosen concurrency | Zero `stalled` events; resolves D10 with a measurement rather than an assumption | PC |
+| **A17** | **A permanent error does not burn the budget.** One batch: an image, a 404, a page, undecodable bytes, the metadata address | `attempts = 1` at `SUCCEEDED`; the four products `FAILED`, each with its reason; no backoff was waited (D31) | PC |
+| **A18** | **Image batches do not self-stall.** Five batches of 20 of the heaviest image the limits allow, at the worker's concurrency of 5, timed by a probe inside the real worker | Zero `stalled` events and every product `READY`; event-loop delay and Redis round trip under 1 s, against the 15 s a renewal may be late. A single 40 s main-thread freeze fails it with 5 stalls (D10) | PC |
 | **A19** | **LLM output is untrusted input.** Fake provider returns malformed JSON and an out-of-enum category | Nothing is written for those items; `enrichmentStatus = 'failed'` with a reason; the DB holds no value outside the taxonomy | PD |
 | **A20** | **Rate limits slow the queue, not the jobs.** Fake provider returns 429 with `Retry-After` | No job reaches `DEAD_LETTERED` because of a 429; the queue's throughput drops and recovers | PD |
 | **A21** | **Re-enrichment of unchanged products is free.** Run enrichment twice | Provider call count on the second run **= 0**; `estimatedCostUsd` unchanged | PD |
@@ -1342,7 +1426,7 @@ Specifying them now would produce prose that is wrong by the time it is used.
 |---|---|---|---|
 | **8 · Observability & hardening** | Prometheus `/metrics` from both processes: queue depth, duration histogram, failure rate, dead-letter count. Rate limiting, `trust proxy`, helmet, CORS allowlist, body limits. Dead-letter inspection and re-drive | Queue depth observably rises and drains under load; one job's full story is retrievable from logs by `correlationId` alone | Start of phase 8 |
 | **9 · Test harness & CI** | The shared harness, fixtures and CI — **not** the tests themselves, which are written with the code throughout (§14). A1–A7 become automated cases including process kill/restart | `npm run test:all` reproduces every reliability assertion with no manual steps; CI green from a clean checkout | **§15.1** |
-| **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a and D10 closed with measurements attached | Start of phase 10 |
+| **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a closed with measurements attached, D10's repeated on the target host | Start of phase 10 |
 | **11 · Deploy** | One VPS: Docker running API + worker, Caddy for auto-HTTPS, `ufw`, managed Postgres, restart policies, migrations as a release step. Multi-instance socket.io (D13) becomes real here | HTTPS on a real domain; a reboot restores both processes unattended; a restore from backup has been rehearsed | Start of phase 11 |
 
 **Note for phase 8:** `@nestjs/throttler` 6.5.0 declares peers stopping at Nest 11. Re-verify its
@@ -1429,7 +1513,7 @@ to settle it.
 | D8 | ~~Who emits the WS event; how it crosses the process boundary~~ | — | **DECIDED 2026-10-26** — the worker `PUBLISH`es a domain event to `relay:job-updated`; the API subscribes on a duplicated connection and fans out to `user:<userId>`. §9.3 |
 | D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
-| D10 | Worker concurrency tuning; sandboxed processors | Measured event-loop blocking in the worker | 10 |
+| D10 | ~~Worker concurrency tuning; sandboxed processors~~ | Measured event-loop blocking in the worker | **DECIDED 2026-11-09** — concurrency 5, renders in-process; image work leaves the event loop alone, measured below. Re-measured on the target host in phase 10 |
 | D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox |
 | D12 | Status cache in Redis | A **measured** slow `GET /jobs/:id`. Never before | — |
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
@@ -1445,7 +1529,7 @@ so they move:
 | # | Was | Now | Why the trigger arrives early |
 |---|---|---|---|
 | D6a | phase 10 | **Phase D** | `ai.enrich` needs a BullMQ `limiter` and low concurrency of its own. A limiter is per-queue, so an LLM queue separate from `relay-jobs` is forced by the rate limit, not by a starvation measurement |
-| D10 | phase 10 | **Phase C** | `sharp` is async but runs on the libuv threadpool (4 threads by default). Saturating it delays *all* async I/O in that process, including BullMQ lock renewal — so image batches can self-stall without ever blocking the JS event loop. §7.6's warning applies to threadpool starvation, not only to CPU-bound loops |
+| D10 | phase 10 | **Phase C** | `sharp` runs on the libuv threadpool (4 threads by default), so image batches are the first work that could starve the worker of something other than its event loop — measured in Phase C, below |
 | D11 | phase 8 | **Phase A** | §3.4 asks for bulk retry by filter in the same phase as the handler registry |
 | D14 | — | **Phase B** | §5.3 asks for cursor pagination on `/jobs` and `/products`; a 20 000-product catalog is the list where offset paging starts to hurt |
 | D15 | v2 | **now** | "job types beyond `MOCK`/`CHARGE`" was deferred until a real use case appeared. This proposal *is* that use case, and D21–D27 below are what it turns out to require |
@@ -1463,6 +1547,7 @@ so they move:
 | D27 | ~~A second ledger for quota, or reuse `SideEffect`?~~ | Phase B's checkpoint and Phase I's quota would otherwise invent two | **DECIDED** — reuse `SideEffect`, `effectKey = '<jobId>:quota:<batchIndex>' |
 | D29 | ~~Object storage: an emulator or real S3, and a presigned PUT or POST?~~ | B.1 needs a bucket, and MinIO's community images are gone | **DECIDED 2026-11-04** — real S3 in every environment, a bucket and a least-privilege IAM user each; presigned **POST** |
 | D30 | ~~What does an import do to products already there, or missing from the file?~~ | B.2's upsert encodes the answer | **DECIDED 2026-11-04** — the newer file wins, nothing is deleted, currency is a required column |
+| D31 | ~~Does an image that cannot be made fail the job?~~ | C.3's handler and A17 encode the answer | **DECIDED 2026-11-09** — no: the product is `FAILED` and the job succeeds; a transient failure fails the attempt only after the rest are done |
 
 **D21 — `Job.type` becomes a string, with the registry as the authority.**
 An enum makes every new job type a migration, which defeats §3.1's whole point that adding a type
@@ -1663,6 +1748,35 @@ SKU twice in one batch is written once with its last values, the same answer it 
 two batches. `currency` is a required column of the file rather than a per-account default: a
 price without a currency is ambiguous, and a default is a guess the file never made.
 
+**D31 — an image that cannot be made is the product's state; the job still succeeds.**
+The plan's first reading had a 404 throw `TerminalJobError` and dead-letter the job. In a batch of
+50 that costs 49 products their images for one seller's typo, and a re-drive fails the same way.
+So a permanent failure is recorded on the product — `imageStatus = 'FAILED'` and `imageError` —
+and the job succeeds with `failed` counted in its result: the split D22 makes for an import, where
+bad rows are data in `result`, not a status. A transient failure is passed over rather than
+thrown, and the attempt fails only once every product was tried: thrown at once, a host that never
+answers would stop the batch at the same product on every attempt and dead-letter the rest
+untouched.
+
+**D10 — image work does not stall the worker: concurrency stays 5, renders stay in-process.**
+First written as: `sharp` fills the 4-thread libuv pool, which delays all async I/O, BullMQ's lock
+renewal included. Measured, half of that holds. The pool does fill: five loops rendering the
+heaviest image the limits allow — a 35 MP PNG under a megabyte — make a lookup of `localhost` wait
+127–144 ms instead of about 1. But a renewal is one Redis command on an open socket, and sockets
+are polled by the event loop, never served by the pool: the Redis round trip stayed at 3–5 ms and
+the event loop's worst delay at 12–18 ms, against the 15 s a renewal may be late before the lock
+lapses. What a full pool does delay is the guard's lookup before each download, by a fraction of
+a second out of its 15 s. End to end (A18) — five batches of 20 such images through the real
+worker and real S3 — no run had a stall, the event loop's worst delay was 33 ms and Redis's
+14 ms. The pool's worst wait there ranged from 31 ms to 2.2 s across runs: over a slow
+connection a lookup waiting on the network holds a pool thread too, and the few downloads that
+reached their 15 s timeout were retried — the C.3 path, not a stall. What does
+stall the worker is its main thread blocked — a synchronous decoder, a CPU loop in JavaScript —
+and A18 fails on exactly that: one 40 s freeze gave 5 stalled jobs. So `WORKER_CONCURRENCY` stays
+5, no sandboxed processor, `UV_THREADPOOL_SIZE` at its default. Measured on a 12-core machine; a
+1–2 vCPU host shares its cores between libvips and the event loop, which this does not
+reproduce, so phase 10's load test repeats it on the target host.
+
 **Rule this register enforces:** write in detail only what a test in the next two phases could
 falsify. Everything else is a trigger, not a design.
 
@@ -1684,7 +1798,7 @@ All eleven phases are v1. Each closes on a demonstrable, runnable state. Broken 
 | 7 | Realtime | §9 | Client sees live status; auth on connect; **A7 passes** |
 | 8 | Observability & hardening | §12, §15 | Metrics from both processes; rate limiting; logs join across the process boundary |
 | 9 | Test harness & CI | §14, §15 | A1–A7 automated; CI green from a clean checkout |
-| 10 | Load | §14, §15 | **A9 passes**; D6a and D10 closed with measurements |
+| 10 | Load | §14, §15 | **A9 passes**; D6a closed with measurements; D10 re-measured on the target host |
 | 11 | Deploy | §3, §11, §15 | HTTPS on a real domain; reboot-safe; restore rehearsed |
 
 Phase 5 is the largest structural change; phase 6 carries the system's core risk. Both are
@@ -1719,6 +1833,10 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-09 | §7.6, §14, §16 — D10 **decided** from measurements: a full libuv threadpool delays DNS lookups by about 130 ms, not BullMQ's lock renewal, which stayed at 3–5 ms, because a renewal is a socket command the pool never serves. The reasoning that moved D10 into Phase C said otherwise and is corrected. Concurrency stays 5 with renders in-process. A18 automated with a probe loaded into the real worker, and shown to fail on a 40 s freeze. |
+| 2026-11-09 | §6.3c, §7.9, §14, D31 — an image that can never be made marks its product `FAILED` with the reason and the batch goes on; one that might pass later is passed over and retried after the rest. A17 restated to match — `attempts = 1` at `SUCCEEDED`, not at `DEAD_LETTERED` — and automated against the real guard and real S3. The guard's refusal no longer names the address a host resolved to, since the message now reaches the seller. |
+| 2026-11-09 | §4.7, §6.2, §6.3, §6.3c, §13.4 — `image.process`: a batch of up to 50 skus made into three WebP sizes under the source URL's hash, recorded `READY` only while that URL is still the product's. `Product` gains `imageStatus`, `imageSourceUrl` and `imageError`; `GET /products` shows each product's `image` with links signed per read. The bucket's lifecycle rules are scoped by prefix so product images do not expire. |
+| 2026-11-09 | §7.9 — requests to a user's URL go through a guard: public unicast addresses only, checked inside the connection's own lookup and again on every redirect, ports 80 and 443, a whole-download timeout and a counted byte cap. A16 automated, in the integration tier: the guard needs no process to attack. |
 | 2026-11-09 | §4.3, §6.2, D14 — **decided**: `/jobs` and the new `/products` page with an opaque keyset cursor; `offset` and `total` removed from `/jobs`. `Job.createdAt` narrowed to milliseconds so a cursor survives a JS `Date`, and the job list's indexes gain `id`. Measured: 6.3 ms by offset against 0.019 ms by cursor on the last page of 20 000 products. |
 | 2026-11-06 | §4.3, §6.2, §6.3b — the error report: every bad row to `reports/<userId>/<jobId>.csv` from a second read of the file, and `GET /jobs/:id/error-report` signing a link on each call. A file whose first 100 rows are mostly bad fails before anything is written, as `error.reason: 'IMPORT_MOSTLY_INVALID'` — `reason` added beside the engine's `code`. |
 | 2026-11-05 | §4.3, §6.2, §6.3b, D26 — `Job.checkpoint` added, written in the batch's own transaction under the lease; a handler commits through `JobContext.commit()` and reads `JobContext.checkpoint`. `import.csv` resumes after its last committed batch, refusing a file whose `ETag` changed. `POST /jobs/:id/retry?from=start` restarts instead. A14 automated. |

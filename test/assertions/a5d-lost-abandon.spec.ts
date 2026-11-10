@@ -63,9 +63,12 @@ describe('A5d · an abandonment the failed event loses is still finalised', () =
     });
     // Scoped to this job: the worker sweeps every RUNNING row, and an earlier
     // file's job can be stranded in the same window for the same reason.
-    expect(
-      last.count(new RegExp(`Job ${jobId} dead-lettered by the sweep`)),
-    ).toBe(1);
+    // Waited for, not just counted: the worker logs after the write this test
+    // saw, and its output arrives through a pipe.
+    const swept = new RegExp(`Job ${jobId} dead-lettered by the sweep`);
+
+    await harness.waitForLog(last, swept);
+    expect(last.count(swept)).toBe(1);
     expect(
       last.count(new RegExp(`Job ${jobId} dead-lettered: the queue stopped`)),
     ).toBe(0);

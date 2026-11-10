@@ -25,6 +25,13 @@ export const importCsvPayloadSchema = z.object({
     .regex(UPLOAD_KEY_PATTERN, 'expected a key from POST /uploads'),
 });
 
+// A batch: not one product per job, which would make a 20 000-product catalog
+// 20 000 jobs, and not the whole catalog, where one slow image would hold up
+// every other. Which of the skus are the caller's is the handler's to find out.
+export const imageProcessPayloadSchema = z.object({
+  skus: z.array(z.string().trim().min(1).max(100)).min(1).max(50),
+});
+
 export const chargePayloadSchema = z.object({
   amountCents: z.coerce.number().int().positive(),
   reference: z.string().min(1).max(200),
@@ -52,6 +59,13 @@ export const submitJobSchema = z.discriminatedUnion('type', [
     .object({
       type: z.literal('import.csv'),
       payload: importCsvPayloadSchema.strict(),
+      maxAttempts: maxAttemptsSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('image.process'),
+      payload: imageProcessPayloadSchema.strict(),
       maxAttempts: maxAttemptsSchema,
     })
     .strict(),

@@ -28,7 +28,32 @@ describe('submitJobSchema', () => {
   });
 
   it('lists every type the union accepts', () => {
-    expect(JOB_TYPES).toEqual(['MOCK', 'CHARGE', 'import.csv']);
+    expect(JOB_TYPES).toEqual([
+      'MOCK',
+      'CHARGE',
+      'import.csv',
+      'image.process',
+    ]);
+  });
+});
+
+describe('the image.process payload', () => {
+  const submit = (skus: unknown) =>
+    submitJobSchema.safeParse({ type: 'image.process', payload: { skus } })
+      .success;
+
+  it('takes a batch of up to 50 skus', () => {
+    expect(submit(['A-1'])).toBe(true);
+    expect(submit(Array.from({ length: 50 }, (_, i) => `S-${i}`))).toBe(true);
+  });
+
+  it.each([
+    ['no skus', []],
+    ['more than 50', Array.from({ length: 51 }, (_, i) => `S-${i}`)],
+    ['a blank sku', ['  ']],
+    ['a sku longer than a product can have', ['x'.repeat(101)]],
+  ])('refuses %s', (_label, skus) => {
+    expect(submit(skus)).toBe(false);
   });
 });
 
