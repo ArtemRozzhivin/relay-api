@@ -1525,7 +1525,7 @@ cases.
 | **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change. *In PA the per-step effect is the progress report; the ledger-count form needs batched effects and is asserted with the CSV import (PB)* | PA |
 | **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic for the life of one submission. An operator re-drive clears it and the count starts again (D25) | PA |
 | **A12b** | **Progress is rate-limited, and the last value still lands.** Report 60 times across 3s, and 100 times as fast as the handler can (about 200 ms, inside one 500 ms window) | Events carrying `progress` are **> 1 and < 20**, not ~60; and the stored value equals the final report in both cases. The second case lands entirely inside one window, so only the processor's flush gets it out; a run slower than the window is reported skipped (inconclusive), since the window's timer may then have sent the last value | PA |
-| **A13** | **A large import does not grow with the file.** Import 20 000 rows | Peak RSS flat within a stated band; **name the band before running** or the result is unfalsifiable | PB |
+| **A13** | **A large import does not grow with the file.** In one worker, after a full-size warm-up, import 2 000 and then 20 000 rows of about 2 KB each (4 MB and 39 MB) | The worker's **live memory** — heap and buffers after a forced full collection, read by a probe loaded into it — peaks **less than 18 MB** higher for the large file: half the files' difference, so a worker holding even half of it fails. Measured +2.3 and +2.7 MB; a worker that buffers the file reads +62 MB | PB |
 | **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
 | **A16** | **A hostile image URL reaches nothing private.** `http://localhost`, `http://169.254.169.254`, and a public DNS name resolving to a private address | All three rejected **after resolution, before connect**; the product fails, the batch does not | PC |
@@ -1587,7 +1587,7 @@ reads from the job's own `startedAt` and `finishedAt`.
 the worker's env schema — and writes throwaway users and job rows; `test/support/http.ts` starts the
 app and registers an account over HTTP. Every spec deletes the users it made.
 
-Three traps found while building it, each of which had made a test lie:
+Four traps found while building it, each of which had made a test lie:
 
 - **Processes must be reaped, not merely signalled.** `child.killed` records that *a* signal was
   sent, not that the process died, so testing it suppressed the `SIGKILL` following a `SIGCONT`.
@@ -1601,6 +1601,13 @@ Three traps found while building it, each of which had made a test lie:
   read the instant a row changes can be short. Log assertions must be waited for — and where the
   database already proves the claim, the log assertion was removed instead: `attempts = 3` *is*
   the evidence of three deliveries.
+- **RSS measures garbage, not what a process holds.** A13 was first written against peak RSS, as
+  §14 had it, and failed its band: two runs of the same streaming import read +82 and +45 MB,
+  because V8 collects lazily and lets more garbage pile up over a longer run. What was still alive
+  after each full collection was flat. A13 now forces a collection before every reading, through a
+  probe the harness loads into the worker, so nothing in `src/` measures itself — and warms the
+  worker up at full size first, since its live memory climbs over the first several thousand rows
+  it ever processes before levelling off.
 
 **Coverage carries no threshold, by design.** The reliability paths execute in child processes
 where V8 coverage cannot observe them, so a percentage gate could only be satisfied by unit tests
@@ -1986,6 +1993,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-11 | §14, §15.1 — A13 automated. Its criterion moved from peak RSS to live memory: RSS counted garbage V8 had not yet collected and swung between +45 and +82 MB on identical runs, failing the band named for it. Live memory after a forced collection, with a full-size warm-up, reads +2–3 MB for 18 000 more rows against a band of 18 MB, and +62 MB for a worker that buffers the file. |
 | 2026-11-11 | Header, §2, §3, §4.3, §6, §6.2, §7.5, §8.2, §10.1, §11, §13.2, §13.4, §15, §15.1, §16, D6b, D15, D32 — an alignment pass. `Job.error` is `{ code, reason?, message, attempt? }` with `ATTEMPT_FAILED` while a retry is coming; nothing ever wrote `retryable`. `startedAt` is the latest claim. Routes have no `/api/v1` prefix. The queue options and backoff are the ones `jobOptions()` builds. §3, §10.1 and §13.2 gain S3, the upload and product modules, the sweeper and PB–PC's packages; §2 lists the real job types and D15 is closed by them. The Argon2id settings are documented as OWASP's minimum, not test-speed values. A bulk re-drive always resumes, and an import whose upload expired dies again. The bucket needs a CORS rule once a browser uploads (M11.8). **D32 decided:** caps on the work an account can put on S3 are planned now and built in phase 8 (M8.3). |
 | 2026-11-11 | §13.4, §14, §15.1 — CI hands the AWS keys only to the two test steps that reach S3, not to every step: `npm ci` runs every dependency's install script. §13.4 had said CI reads the region from secrets; `ci.yml` sets it. A12b's flush case reports itself inconclusive when the job ran longer than one progress window, where it had passed without proving the flush. Integration specs share their setup (`test/support/db.ts`, `test/support/http.ts`); copies had drifted, and only some validated their env or deleted their users. |
 | 2026-11-11 | D25 — the worker keeps reclaiming a progress value it cannot read until a write lands. It stopped once the first write was sent, so a database error on that one write froze the column for the rest of the attempt. |
