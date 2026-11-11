@@ -12,6 +12,10 @@ import {
 import { describeError } from '../common/errors/describe-error.js';
 import { nonOverlapping } from '../common/scheduling/non-overlapping.js';
 
+// At most 100 rows a second, and that is a pace, not a throughput limit: a
+// bulk re-drive writes thousands of outbox rows at once and relies on this to
+// release them as a ramp against a downstream that has only just recovered
+// (D11). The direct path carries normal submits, so raising it buys nothing.
 const BATCH_SIZE = 100;
 
 @Injectable()

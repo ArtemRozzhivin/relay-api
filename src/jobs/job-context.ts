@@ -21,7 +21,7 @@ export interface JobContext {
    * The attempt now running, counted against `maxAttempts` — for logs and
    * messages. Not the ownership token: that is a separate lease the context
    * carries on every write for the handler, so a worker the queue has given up
-   * on cannot overwrite the attempt that replaced it (D25).
+   * on cannot overwrite the attempt that replaced it (D7).
    */
   readonly attempt: number;
 

@@ -14,8 +14,9 @@ import { SKU_MAX_LENGTH } from '../products/products.schema.js';
 export const mockPayloadSchema = z.object({
   durationMs: z.coerce.number().int().min(0).max(60_000).default(10),
   failureRate: z.coerce.number().min(0).max(1).default(0),
-  // Splits the sleep into reporting intervals: a mock job is the only job that
-  // can exercise progress until the CSV import exists (PB).
+  // Splits the sleep into reporting intervals. Real jobs report too, but only a
+  // mock job reports at a rate and timing a test can choose, which A12 and A12b
+  // depend on.
   steps: z.coerce.number().int().min(1).max(100).default(1),
 });
 

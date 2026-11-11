@@ -48,8 +48,8 @@ export class MockJobHandler extends JobHandler<PayloadOf<'MOCK'>> {
       }
 
       // Deliberately not awaited: reporting without awaiting is part of the
-      // contract, and nothing else in the project exercises it. The processor's
-      // flush is what makes the final report land before the job is finished.
+      // contract, and A12b depends on it here — a burst of reports lands inside
+      // one window, and only the processor's flush gets the last one out.
       void context.reportProgress({ processed: step, total: payload.steps });
     }
 

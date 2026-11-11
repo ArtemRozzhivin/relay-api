@@ -186,7 +186,8 @@ describe('a progress write', () => {
     ).toBeNull();
   });
 
-  // The attempt a worker was handed by claim() is its ownership token (D25).
+  // A worker writes under the lease claim() handed it, and a later claim has
+  // moved the lease on (D7).
   it('is refused from an attempt that no longer owns the job', async () => {
     const jobId = await runningJob({ processed: 5 }, 2);
 
