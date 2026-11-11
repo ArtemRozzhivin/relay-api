@@ -108,12 +108,16 @@ export class ImageProcessJobHandler extends JobHandler<
           product.imageUrl,
         );
         processed += recorded ? 1 : 0;
-      } else if (made.permanent) {
+      } else if (made.permanent || context.lastAttempt) {
         recorded = await this.products.recordImageFailed(
           context.userId,
           product.id,
           product.imageUrl,
-          made.reason,
+          // One that might pass later is recorded as it stands when no retry
+          // is coming; left PENDING, nothing would ever finish it.
+          made.permanent
+            ? made.reason
+            : `Gave up after ${context.attempt} ${context.attempt === 1 ? 'attempt' : 'attempts'}: ${made.reason}`,
         );
         failed += recorded ? 1 : 0;
       } else {

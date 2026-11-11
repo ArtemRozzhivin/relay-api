@@ -23,6 +23,9 @@ interface RunningJob {
   userId: string;
   attempt: number;
 
+  /** Whether a failure of this attempt dead-letters the job; never, by default. */
+  lastAttempt?: boolean;
+
   /** The ownership token claim() handed this delivery; every write carries it. */
   lease: number;
   correlationId: string;
@@ -69,6 +72,7 @@ class RunningJobContext implements ManagedJobContext {
     readonly jobId: string,
     readonly userId: string,
     readonly attempt: number,
+    readonly lastAttempt: boolean,
     readonly checkpoint: Prisma.JsonValue | null,
     private readonly lease: number,
     private readonly correlationId: string,
@@ -272,6 +276,7 @@ export class JobContextFactory {
     jobId,
     userId,
     attempt,
+    lastAttempt = false,
     lease,
     correlationId,
     progress,
@@ -284,6 +289,7 @@ export class JobContextFactory {
       jobId,
       userId,
       attempt,
+      lastAttempt,
       checkpoint,
       lease,
       correlationId,

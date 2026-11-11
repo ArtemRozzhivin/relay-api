@@ -39,9 +39,11 @@ const hidden =
   "Internal error; the worker's log has it under correlationId req-1";
 
 // A processor whose handler throws `failure` on the attempt given, with every
-// error the processor asked a transition to write collected in `errors`.
+// error the processor asked a transition to write collected in `errors`, and
+// what it built each handler's context from in `contexts`.
 const failingOn = (attempt: number, failure: unknown) => {
   const errors: Prisma.InputJsonValue[] = [];
+  const contexts: { lastAttempt?: boolean }[] = [];
   const write = async (
     _jobId: string,
     _lease: number,
@@ -70,13 +72,17 @@ const failingOn = (attempt: number, failure: unknown) => {
       },
     } as unknown as JobHandlerRegistry,
     {
-      create: () => ({ flush: async () => {} }),
+      create: (job: { lastAttempt?: boolean }) => {
+        contexts.push(job);
+
+        return { flush: async () => {} };
+      },
     } as unknown as JobContextFactory,
     { jobUpdated: async () => {} } as unknown as JobEventsPublisher,
     { get: () => false } as unknown as ConfigService<WorkerEnv, true>,
   );
 
-  return { processor, errors };
+  return { processor, errors, contexts };
 };
 
 // The dead letter a handler's failure becomes: what the processor asked the
@@ -128,6 +134,25 @@ describe('JobsProcessor', () => {
       },
     ]);
   });
+
+  // The handler gives up on what it would leave for a retry by this answer, and
+  // the processor dead-letters by it: the two must never disagree.
+  it.each([
+    [4, false, 'ATTEMPT_FAILED'],
+    [5, true, 'ATTEMPTS_EXHAUSTED'],
+  ])(
+    'tells the handler whether attempt %i of 5 is the last',
+    async (attempt, last, code) => {
+      const { processor, errors, contexts } = failingOn(attempt, prismaFailure);
+
+      await processor.process(message).catch(() => undefined);
+
+      expect(contexts).toEqual([
+        expect.objectContaining({ lastAttempt: last }),
+      ]);
+      expect(errors).toEqual([expect.objectContaining({ code })]);
+    },
+  );
 
   describe("never shows a job's owner a message not written for them", () => {
     it('hides a failure that will be retried, and logs it', async () => {

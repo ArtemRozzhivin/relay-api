@@ -26,6 +26,13 @@ export interface JobContext {
   readonly attempt: number;
 
   /**
+   * Whether this is the last attempt the job's retry budget allows: if it
+   * fails, the job is dead-lettered. A handler that would leave work for a
+   * retry records it as failed instead, since no retry is coming.
+   */
+  readonly lastAttempt: boolean;
+
+  /**
    * Records how far along the job is, for a client to read from
    * `GET /jobs/:id`.
    *

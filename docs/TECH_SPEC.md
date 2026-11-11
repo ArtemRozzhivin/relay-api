@@ -581,7 +581,12 @@ the new image rather than over it; the key is otherwise fixed, so a re-run overw
 files with the same bytes and needs no ledger. The files are written first and the product
 recorded `READY` second, and only while `imageUrl` still equals the URL that was processed — a
 crash between the two leaves files nothing points at yet, never a row pointing at missing files,
-and an import that replaced the URL meanwhile wins. A replaced URL's old files stay in the bucket.
+and an import that replaced the URL meanwhile wins. A replaced URL's old files stay in the bucket
+for now. Deleting them when the new image is recorded is not safe: if the seller switches back to
+the old URL while a slow job is still finishing, that job's late delete removes the files the row
+points at again. A sweep that deletes a folder only when it is not the current URL's **and** has
+not been written for a day is planned instead (M8.8): a re-render rewrites the folder, so its age
+says no job is using it.
 
 Between products the job reports `processed` out of `total` and honours a cancellation, so a
 stopped batch has recorded whole images only. A product already `READY` for its current URL is
@@ -592,7 +597,9 @@ change — a 404 or another 4xx, a host that does not exist, a refused address, 
 an image, bytes that do not decode, a source over the pixel limit — records the product `FAILED`
 with the reason, and the batch goes on. One that might pass later — a timeout, a 5xx, a 408 or a
 429 — leaves the product `PENDING` and the batch goes on as well; once every product has been
-tried, the attempt fails, so the job is retried and the retry skips what is `READY` (A17). A bad
+tried, the attempt fails, so the job is retried and the retry skips what is `READY` (A17). On the
+job's last attempt no retry is coming, so such a product is recorded `FAILED` too, as `Gave up
+after 5 attempts: <reason>`, and the job succeeds; left `PENDING`, nothing would ever finish it. A bad
 URL costs its own product one download, never the rest of the batch their images. A `FAILED`
 product is tried again by any later run that names it, a retry included: the seller may have
 fixed the file behind the same URL, and naming the sku again is how they ask.
@@ -1411,7 +1418,9 @@ admin user (never the root user):
 1. A bucket in the chosen region: ACLs disabled, Block Public Access on, SSE-S3, versioning off,
    and lifecycle rules **scoped by prefix**, because `products/` holds product images that must
    not expire: `uploads/` and `reports/` expire after 7 days, `fixtures/` (written by the tests)
-   after 1, and incomplete multipart uploads are aborted after 1 day across the bucket.
+   after 1, and incomplete multipart uploads are aborted after 1 day across the bucket. The tests
+   that make product images delete their own account's `products/` folder when they finish
+   (`test/support/product-images.ts`), since no rule ever will.
 2. An IAM user for the app — no console access, no group — with one inline policy:
 
    ```json
@@ -1625,7 +1634,7 @@ so they move:
 | D27 | ~~A second ledger for quota, or reuse `SideEffect`?~~ | Phase B's checkpoint and Phase I's quota would otherwise invent two | **DECIDED** — reuse `SideEffect`, `effectKey = '<jobId>:quota:<batchIndex>' |
 | D29 | ~~Object storage: an emulator or real S3, and a presigned PUT or POST?~~ | B.1 needs a bucket, and MinIO's community images are gone | **DECIDED 2026-11-04** — real S3 in every environment, a bucket and a least-privilege IAM user each; presigned **POST** |
 | D30 | ~~What does an import do to products already there, or missing from the file?~~ | B.2's upsert encodes the answer | **DECIDED 2026-11-04** — the newer file wins, nothing is deleted, currency is a required column |
-| D31 | ~~Does an image that cannot be made fail the job?~~ | C.3's handler and A17 encode the answer | **DECIDED 2026-11-09** — no: the product is `FAILED` and the job succeeds; a transient failure fails the attempt only after the rest are done |
+| D31 | ~~Does an image that cannot be made fail the job?~~ | C.3's handler and A17 encode the answer | **DECIDED 2026-11-09** — no: the product is `FAILED` and the job succeeds; a transient failure fails the attempt only after the rest are done, and on the last attempt is recorded `FAILED` too |
 
 **D21 — `Job.type` becomes a string, with the registry as the authority.**
 An enum makes every new job type a migration, which defeats §3.1's whole point that adding a type
@@ -1810,8 +1819,9 @@ The plan named MinIO in compose as the local stand-in; its community edition was
 and its images are gone from Docker Hub, and LocalStack now requires an account token. So every
 environment uses real S3: a **dev bucket** (laptops and CI) and, at deployment, a **prod bucket**,
 each reachable only by its own IAM user whose policy names that bucket alone — a leaked dev key
-cannot reach prod. The dev bucket expires everything after 7 days, so tests never clean up by
-hand. What this costs is tests that need the network and credentials, accepted because what the
+cannot reach prod. The dev bucket expires uploads, reports and test fixtures by prefix, so tests
+never clean those up by hand; product images never expire, so the tests that make them delete
+them (§13.4). What this costs is tests that need the network and credentials, accepted because what the
 upload tests prove is S3 enforcing a signed policy, which no stand-in proves; `S3_ENDPOINT` keeps
 an emulator possible by configuration alone. **POST, not PUT:** a presigned PUT carries no size
 limit, so a client could store 5 GB on a link meant for 5 MB and the API would learn only
@@ -1837,7 +1847,8 @@ and the job succeeds with `failed` counted in its result: the split D22 makes fo
 bad rows are data in `result`, not a status. A transient failure is passed over rather than
 thrown, and the attempt fails only once every product was tried: thrown at once, a host that never
 answers would stop the batch at the same product on every attempt and dead-letter the rest
-untouched.
+untouched. On the job's last attempt it is recorded `FAILED` like a permanent one: no retry is
+coming, and a product left `PENDING` would wait for ever.
 
 **D10 — image work does not stall the worker: concurrency stays 5, renders stay in-process.**
 First written as: `sharp` fills the 4-thread libuv pool, which delays all async I/O, BullMQ's lock
@@ -1914,6 +1925,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-11 | §6.3c, §13.4, D29, D31 — on an `image.process` job's last attempt, an image that might pass later is recorded `FAILED` (`Gave up after N attempts: <reason>`) and the job succeeds: it had been left `PENDING` with nothing to ever finish it once the job dead-lettered. The processor decides "last attempt" once and hands it to the handler as `context.lastAttempt`. The tests that make product images now delete them: `products/` never expires, and D29 had said the dev bucket expires everything. A replaced URL's old files are still kept; deleting them when the new image is recorded can delete a live image, so an age-guarded sweep is planned (M8.8). |
 | 2026-11-10 | §4.7, §7.7, §7.9 — a job's `error.message` holds only words written for its owner: an `AppError`'s message as it is, anything else as an internal error with the correlation id, its text in the worker's log. Prisma's and S3's messages had reached clients, and S3's AccessDenied names the IAM principal. `RetryableJobError` keeps a retry's own message where it was written for the owner — an image batch's "N of M images could not be downloaded". A host name that does not exist gets the same answer as one that resolves privately, so `image.error` no longer tells which internal names exist. The product upsert writes in `sku` order: two imports into one store had deadlocked on each other. |
 | 2026-11-10 | §7.6 — the sweep also finishes a `QUEUED` job the queue has stopped delivering. A job whose every delivery failed before the claim, with Postgres unreachable, was left `QUEUED` for ever: `abandon()` refuses a row no attempt claimed, and the sweep read `RUNNING` rows only. Such a row is now dead-lettered `DELIVERY_ABANDONED` once its outbox row is published and its entry is gone or long finished, under a write pinned to the delivery the sweep read, so a job re-driven in between is never finished. The sweep pages by `id > last`: Prisma's cursor skipped the row after any page whose last row the sweep had just finished. §7.6 said the write was pinned to `startedAt`; it is the lease. |
 | 2026-11-10 | §4.3, §5.2, §6.2, §14 — a charge whose money moved can no longer end `CANCELLED`. The two cancels that run no handler checked only `cancelRequested`, so a cancel after the charge, followed by a redelivery or a retry, finished the job `CANCELLED` beside its ledger row. The charge now commits through `context.commitEffect`, under the lease, marking `Job.effectCommitted` in the same transaction; both cancels refuse a marked job, and a `CHECK` refuses the combination. `succeed` and `deadLetter` accept only `RUNNING`: a stale worker could finish a job re-driven since. §5.2's table rewritten from the code, with every worker write under the lease. A3d automated. |

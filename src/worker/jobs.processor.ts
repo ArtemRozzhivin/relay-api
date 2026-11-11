@@ -75,6 +75,9 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     // carries. A re-drive resets the first and never the second.
     const attempt = claimed.attempts;
     const lease = claimed.lease;
+    // Decided once, here: the handler is told whether a failure now ends the
+    // job, and the catch below dead-letters by the same answer.
+    const lastAttempt = attempt >= claimed.maxAttempts;
 
     await this.events.jobUpdated(claimed);
 
@@ -86,6 +89,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       jobId,
       userId: claimed.userId,
       attempt,
+      lastAttempt,
       lease,
       correlationId,
       progress: claimed.progress,
@@ -165,9 +169,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       const isTerminal =
         cause instanceof TerminalJobError ||
         cause instanceof UnrecoverableError;
-      const isExhausted = attempt >= claimed.maxAttempts;
 
-      if (isTerminal || isExhausted) {
+      if (isTerminal || lastAttempt) {
         const dead = await this.transitions.deadLetter(jobId, lease, {
           code: (isTerminal
             ? 'TERMINAL_FAILURE'

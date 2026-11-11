@@ -9,6 +9,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
 import { heaviestImage } from '../support/heaviest-image.js';
+import { deleteProductImages } from '../support/product-images.js';
 
 const PRODUCTS = 40;
 
@@ -45,8 +46,12 @@ describe('A5e · SIGTERM hands a running job back without spending an attempt', 
   });
 
   afterAll(async () => {
-    await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+    // After the processes stop, so no worker writes an image behind it.
     await harness.stop();
+    await Promise.all([
+      s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
+      deleteProductImages(s3, bucket, account.id),
+    ]);
   });
 
   it('finishes the product in hand, re-queues the job, and the next worker completes it', async () => {

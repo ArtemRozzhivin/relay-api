@@ -10,6 +10,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
 import { heaviestImage } from '../support/heaviest-image.js';
+import { deleteProductImages } from '../support/product-images.js';
 
 // One batch per job the worker runs at once: its default concurrency.
 const BATCHES = 5;
@@ -57,8 +58,12 @@ describe('A18 · image batches at the chosen concurrency do not self-stall', () 
   });
 
   afterAll(async () => {
-    await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+    // After the processes stop, so no worker writes an image behind it.
     await harness.stop();
+    await Promise.all([
+      s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
+      deleteProductImages(s3, bucket, account.id),
+    ]);
   });
 
   it('renews every lock in time and redelivers nothing', async () => {

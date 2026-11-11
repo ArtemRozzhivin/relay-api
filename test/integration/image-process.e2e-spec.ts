@@ -12,7 +12,10 @@ import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { StorageModule } from '../../src/storage/storage.module.js';
 import { StorageService } from '../../src/storage/storage.service.js';
-import { productImageKey } from '../../src/storage/object-keys.js';
+import {
+  productImageKey,
+  productImagesPrefix,
+} from '../../src/storage/object-keys.js';
 import { ProductsModule } from '../../src/products/products.module.js';
 import { ProductsService } from '../../src/products/products.service.js';
 import { OutboundModule } from '../../src/outbound/outbound.module.js';
@@ -22,6 +25,7 @@ import { JobCancelledError } from '../../src/jobs/job-handler.js';
 import { RetryableJobError } from '../../src/common/errors/app-error.js';
 import { recordingContext } from '../../src/jobs/job-context.fixture.js';
 import { workerEnvSchema } from '../../src/config/env.schema.js';
+import { deleteProductImages } from '../support/product-images.js';
 
 const png = (width: number, height: number) =>
   sharp({
@@ -34,6 +38,8 @@ const png = (width: number, height: number) =>
 // bucket — with images served from this test's own server, which only the
 // test's downloader may reach.
 describe('the image.process handler', () => {
+  const s3 = new S3Client({ region: process.env.AWS_REGION });
+  const bucket = process.env.S3_BUCKET!;
   let prisma: PrismaService;
   let storage: StorageService;
   let products: ProductsService;
@@ -81,7 +87,7 @@ describe('the image.process handler', () => {
   const run = (
     userId: string,
     skus: string[],
-    options: { stopAfterChecks?: number } = {},
+    options: Parameters<typeof recordingContext>[0] = {},
   ) => {
     const recorded = recordingContext({ userId, ...options });
 
@@ -213,6 +219,9 @@ describe('the image.process handler', () => {
   });
 
   afterAll(async () => {
+    await Promise.all(
+      users.map((userId) => deleteProductImages(s3, bucket, userId)),
+    );
     await prisma.user.deleteMany({ where: { id: { in: users } } });
     await prisma.$disconnect();
     server.closeAllConnections();
@@ -312,10 +321,10 @@ describe('the image.process handler', () => {
     const cup = await product(userId, 'CUP', `${base}${path}`);
     const filesOf = async () =>
       (
-        await new S3Client({ region: process.env.AWS_REGION }).send(
+        await s3.send(
           new ListObjectsV2Command({
-            Bucket: process.env.S3_BUCKET,
-            Prefix: `products/${userId}/${cup.id}/`,
+            Bucket: bucket,
+            Prefix: `${productImagesPrefix(userId)}${cup.id}/`,
           }),
         )
       ).KeyCount;
@@ -520,6 +529,33 @@ describe('the image.process handler', () => {
         alreadyReady: 1,
       });
       expect(hits.get(up)).toBe(1);
+    });
+
+    // No retry is coming after the last attempt, so nothing would ever finish a
+    // product left PENDING there.
+    it('records a host still down on the last attempt as FAILED, and succeeds', async () => {
+      const userId = await store();
+      const down = `/small.png?still-down=${userId}`;
+      const up = `/small.png?still-up=${userId}`;
+
+      images.set(down, images.get('/small.png')!);
+      images.set(up, images.get('/small.png')!);
+      answers.set(down, { status: 503 });
+      await product(userId, 'A-DOWN', `${base}${down}`);
+      await product(userId, 'B-UP', `${base}${up}`);
+
+      expect(
+        await run(userId, ['A-DOWN', 'B-UP'], { attempt: 5, lastAttempt: true })
+          .result,
+      ).toMatchObject({ processed: 1, failed: 1 });
+      expect(
+        await prisma.product.findFirstOrThrow({
+          where: { userId, sku: 'A-DOWN' },
+        }),
+      ).toMatchObject({
+        imageStatus: 'FAILED',
+        imageError: 'Gave up after 5 attempts: The server answered 503',
+      });
     });
 
     it('tries a FAILED product again, for a file fixed behind the same URL', async () => {

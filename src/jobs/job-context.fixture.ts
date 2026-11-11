@@ -11,12 +11,16 @@ import type { JobProgress } from './job-progress.js';
 export const recordingContext = ({
   stopAfterChecks = Infinity,
   userId = 'a-user',
+  attempt = 1,
+  lastAttempt = false,
   checkpoint = null,
   client,
 }: {
   /** How many `shouldStop()` calls answer false before one answers true. */
   stopAfterChecks?: number;
   userId?: string;
+  attempt?: number;
+  lastAttempt?: boolean;
 
   /** What the context reports an earlier attempt committed. */
   checkpoint?: Prisma.JsonValue | null;
@@ -35,7 +39,8 @@ export const recordingContext = ({
   const context: JobContext = {
     jobId: 'a-job',
     userId,
-    attempt: 1,
+    attempt,
+    lastAttempt,
     checkpoint,
     reportProgress: async (progress) => {
       reports.push(progress);
