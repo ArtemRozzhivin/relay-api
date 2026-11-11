@@ -3,6 +3,7 @@ import http, { type IncomingMessage } from 'node:http';
 import https from 'node:https';
 import { isIP, type LookupFunction } from 'node:net';
 import { isPublicAddress } from './public-address.js';
+import { describeError } from '../common/errors/describe-error.js';
 
 /**
  * Why a download produced no file. `permanent` says whether asking again
@@ -311,7 +312,7 @@ export class GuardedDownloader {
     }
 
     return new DownloadFailedError(
-      `Could not download: ${error instanceof Error ? error.message : String(error)}`,
+      `Could not download: ${describeError(error)}`,
       false,
     );
   }

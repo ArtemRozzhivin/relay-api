@@ -8,12 +8,7 @@ import {
   toStoredProgress,
   type JobProgress,
 } from './job-progress.js';
-
-const TERMINAL: readonly JobStatus[] = [
-  'SUCCEEDED',
-  'DEAD_LETTERED',
-  'CANCELLED',
-];
+import type { AttemptFailedError, DeadLetterError } from './job-error-codes.js';
 
 const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
 
@@ -52,10 +47,6 @@ interface MoveOptions {
 @Injectable()
 export class JobTransitionService {
   constructor(private readonly prisma: PrismaService) {}
-
-  isTerminal(status: JobStatus) {
-    return TERMINAL.includes(status);
-  }
 
   private async move(
     jobId: string,
@@ -104,7 +95,7 @@ export class JobTransitionService {
     );
   }
 
-  requeueForRetry(jobId: string, lease: number, error: Prisma.InputJsonValue) {
+  requeueForRetry(jobId: string, lease: number, error: AttemptFailedError) {
     return this.move(
       jobId,
       ['RUNNING'],
@@ -113,7 +104,7 @@ export class JobTransitionService {
     );
   }
 
-  deadLetter(jobId: string, lease: number, error: Prisma.InputJsonValue) {
+  deadLetter(jobId: string, lease: number, error: DeadLetterError) {
     return this.move(
       jobId,
       ['RUNNING'],
@@ -130,7 +121,7 @@ export class JobTransitionService {
   // write, a window of milliseconds. A job no attempt ever claimed — every
   // delivery failed before the claim, with Postgres unreachable, say — is
   // refused too, and left to the sweep (§7.6).
-  abandon(jobId: string, error: Prisma.InputJsonValue) {
+  abandon(jobId: string, error: DeadLetterError) {
     return this.move(
       jobId,
       NOT_FINISHED,
@@ -147,7 +138,7 @@ export class JobTransitionService {
   abandonStranded(
     jobId: string,
     seen: { status: JobStatus; lease: number; outboxId: bigint },
-    error: Prisma.InputJsonValue,
+    error: DeadLetterError,
   ) {
     return this.move(
       jobId,

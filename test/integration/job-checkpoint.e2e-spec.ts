@@ -152,7 +152,10 @@ describe('the checkpoint transaction', () => {
         async () => 0,
         () => ({ records: 1000 }),
       );
-      await transitions.deadLetter(jobId, lease, { code: 'TEST' });
+      await transitions.deadLetter(jobId, lease, {
+        code: 'TERMINAL_FAILURE',
+        message: 'test',
+      });
 
       return jobId;
     };

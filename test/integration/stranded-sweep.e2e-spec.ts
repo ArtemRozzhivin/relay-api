@@ -238,7 +238,10 @@ describe('the stranded-job sweep', () => {
     // What the failed event does once Postgres is back, and why the sweep has
     // to: with nothing claimed there is no attempt to vouch for the write.
     expect(
-      await transitions.abandon(job.id, { code: 'DELIVERY_ABANDONED' }),
+      await transitions.abandon(job.id, {
+        code: 'DELIVERY_ABANDONED',
+        message: 'test',
+      }),
     ).toBeNull();
 
     expect(await sweeper.finishIfStranded(job, later())).toMatchObject({

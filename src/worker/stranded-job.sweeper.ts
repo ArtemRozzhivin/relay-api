@@ -11,9 +11,10 @@ import { PrismaService } from '../prisma/prisma.service.js';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, messageId, type JobMessage } from '../jobs/job-queue.js';
-import type { DeadLetterCode } from '../jobs/job-error-codes.js';
 import type { JobStatus } from '../generated/prisma/enums.js';
 import type { WorkerEnv } from '../config/env.schema.js';
+import { describeError } from '../common/errors/describe-error.js';
+import { nonOverlapping } from '../common/scheduling/non-overlapping.js';
 
 const BATCH_SIZE = 100;
 
@@ -52,7 +53,12 @@ export class StrandedJobSweeper
 {
   private readonly logger = new Logger(StrandedJobSweeper.name);
   private timer?: NodeJS.Timeout;
-  private running = false;
+
+  private readonly sweepOnce = nonOverlapping(
+    () => this.sweep(),
+    (error) =>
+      this.logger.error(`Stranded-job sweep failed: ${describeError(error)}`),
+  );
 
   constructor(
     private readonly prisma: PrismaService,
@@ -62,34 +68,18 @@ export class StrandedJobSweeper
     @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
   ) {}
 
+  // A plain timer rather than @Interval: SchedulerRegistry clears its timers
+  // in beforeApplicationShutdown, after Prisma has disconnected, so a sweep
+  // could start against a closed client. This one stops with the module.
   onApplicationBootstrap() {
     this.timer = setInterval(
-      () => void this.tick(),
+      () => void this.sweepOnce(),
       this.config.get('RELAY_SWEEP_INTERVAL_MS', { infer: true }),
     );
   }
 
   onModuleDestroy() {
     clearInterval(this.timer);
-  }
-
-  private async tick() {
-    // A sweep slower than the interval must not overlap the next one.
-    if (this.running) {
-      return;
-    }
-
-    this.running = true;
-
-    try {
-      await this.sweep();
-    } catch (error) {
-      this.logger.error(
-        `Stranded-job sweep failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    } finally {
-      this.running = false;
-    }
   }
 
   /** Checks every unfinished row, a page at a time, so none is starved. */
@@ -175,7 +165,7 @@ export class StrandedJobSweeper
       job.id,
       { status: job.status, lease: job.lease, outboxId: job.outboxId },
       {
-        code: 'DELIVERY_ABANDONED' satisfies DeadLetterCode,
+        code: 'DELIVERY_ABANDONED',
         message: `The queue no longer delivers this job (its entry is ${found})`,
       },
     );

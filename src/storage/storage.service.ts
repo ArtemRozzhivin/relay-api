@@ -36,6 +36,12 @@ export interface UploadSlip {
   expiresAt: Date;
 }
 
+/** A signed link that downloads one object until `expiresAt`. */
+export interface DownloadLink {
+  url: string;
+  expiresAt: Date;
+}
+
 @Injectable()
 export class StorageService implements OnModuleInit, OnModuleDestroy {
   private readonly client: S3Client;
@@ -195,11 +201,20 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** A link that downloads one object until it expires. */
-  signDownload(key: string, expiresInSeconds: number) {
-    return getSignedUrl(
+  async signDownload(
+    key: string,
+    expiresInSeconds: number,
+  ): Promise<DownloadLink> {
+    // Taken before signing, like an upload slip's, so the time a client is
+    // told is never later than the one S3 holds the link to.
+    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
+
+    const url = await getSignedUrl(
       this.client,
       new GetObjectCommand({ Bucket: this.bucket, Key: key }),
       { expiresIn: expiresInSeconds },
     );
+
+    return { url, expiresAt };
   }
 }

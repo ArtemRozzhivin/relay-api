@@ -9,8 +9,8 @@ import { JobCancelledError } from '../jobs/job-handler.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { AppError, TerminalJobError } from '../common/errors/app-error.js';
-import type { DeadLetterCode } from '../jobs/job-error-codes.js';
 import type { WorkerEnv } from '../config/env.schema.js';
+import { describeError } from '../common/errors/describe-error.js';
 
 // The HTTP filter's rule, applied to a job's error: only an AppError's message
 // was written for the job's owner. Anything else — Prisma, S3, a socket — can
@@ -163,7 +163,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         return;
       }
 
-      const detail = cause instanceof Error ? cause.message : String(cause);
+      const detail = describeError(cause);
       const reason = ownerMessage(cause, correlationId);
 
       const isTerminal =
@@ -172,9 +172,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
       if (isTerminal || lastAttempt) {
         const dead = await this.transitions.deadLetter(jobId, lease, {
-          code: (isTerminal
-            ? 'TERMINAL_FAILURE'
-            : 'ATTEMPTS_EXHAUSTED') satisfies DeadLetterCode,
+          code: isTerminal ? 'TERMINAL_FAILURE' : 'ATTEMPTS_EXHAUSTED',
           ...(cause instanceof TerminalJobError && cause.reason
             ? { reason: cause.reason }
             : {}),
@@ -250,7 +248,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   private async finalise(jobId: string, correlationId: string, error: Error) {
     try {
       const abandoned = await this.transitions.abandon(jobId, {
-        code: 'DELIVERY_ABANDONED' satisfies DeadLetterCode,
+        code: 'DELIVERY_ABANDONED',
         // Either BullMQ's own — a stall past the limit — or one process()
         // threw with a message already made safe. Anything else is what
         // process() threw before it could catch it: a refused claim, say.
@@ -269,9 +267,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       }
     } catch (cause) {
       this.logger.error(
-        `Job ${jobId} was abandoned by the queue and could not be finalised: ${
-          cause instanceof Error ? cause.message : String(cause)
-        }`,
+        `Job ${jobId} was abandoned by the queue and could not be finalised: ${describeError(cause)}`,
       );
     }
   }

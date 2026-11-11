@@ -18,3 +18,24 @@ export const DEAD_LETTER_CODES = [
 ] as const;
 
 export type DeadLetterCode = (typeof DEAD_LETTER_CODES)[number];
+
+/**
+ * `Job.error` on a dead letter. `message` is written for the job's owner;
+ * `reason` is a handler's own name for a terminal failure (`TerminalJobError`).
+ */
+export type DeadLetterError = {
+  code: DeadLetterCode;
+  message: string;
+  attempt?: number;
+  reason?: string;
+};
+
+/**
+ * `Job.error` on a job the queue will try again: why its last attempt failed.
+ * Not a dead-letter code — a bulk re-drive never matches it.
+ */
+export type AttemptFailedError = {
+  code: 'ATTEMPT_FAILED';
+  message: string;
+  attempt: number;
+};

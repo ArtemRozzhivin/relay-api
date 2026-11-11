@@ -3,6 +3,7 @@ import type { Redis } from 'ioredis';
 import { REDIS_CLIENT } from '../redis/redis.module.js';
 import type { Job } from '../generated/prisma/client.js';
 import { JOB_EVENTS_CHANNEL, toJobUpdatedEvent } from './job-events.js';
+import { describeError } from '../common/errors/describe-error.js';
 
 @Injectable()
 export class JobEventsPublisher {
@@ -22,9 +23,7 @@ export class JobEventsPublisher {
       // Delivery is at-most-once by design; a client reconciles with
       // GET /jobs/:id on reconnect, so a failed publish must never fail a job.
       this.logger.warn(
-        `Could not publish job.updated for ${job.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `Could not publish job.updated for ${job.id}: ${describeError(error)}`,
       );
     }
   }

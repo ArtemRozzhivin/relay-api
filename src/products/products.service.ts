@@ -142,13 +142,14 @@ export class ProductsService {
       image = { status: 'FAILED', error: imageError };
     } else {
       const links = await Promise.all(
-        IMAGE_SIZES.map(async ({ name }) => [
-          name,
-          await this.storage.signDownload(
+        IMAGE_SIZES.map(async ({ name }) => {
+          const { url } = await this.storage.signDownload(
             productImageKey(product.userId, product.id, imageSourceUrl, name),
             IMAGE_LINK_SECONDS,
-          ),
-        ]),
+          );
+
+          return [name, url];
+        }),
       );
 
       image = {

@@ -16,7 +16,13 @@ import { errorReportKey, uploadPrefix } from '../storage/object-keys.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
 import { Prisma, type Job } from '../generated/prisma/client.js';
-import { JOBS_QUEUE, messageId, type JobMessage } from './job-queue.js';
+import {
+  JOBS_QUEUE,
+  jobOptions,
+  messageId,
+  type JobMessage,
+  type OutboxMessage,
+} from './job-queue.js';
 import type {
   BulkRedriveInput,
   ListJobsQuery,
@@ -25,6 +31,7 @@ import type {
 import type { ApiEnv } from '../config/env.schema.js';
 import { requestHash } from './request-hash.js';
 import { toPage } from '../common/pagination/cursor.js';
+import { describeError } from '../common/errors/describe-error.js';
 
 // Fetched when the seller clicks, so a short life costs nothing: a link that
 // leaks from a browser history is dead within minutes.
@@ -37,7 +44,11 @@ const outboxEntry = (job: Job, correlationId: string) => ({
   jobId: job.id,
   queue: JOBS_QUEUE,
   jobName: job.type,
-  payload: { jobId: job.id, correlationId, maxAttempts: job.maxAttempts },
+  payload: {
+    jobId: job.id,
+    correlationId,
+    maxAttempts: job.maxAttempts,
+  } satisfies OutboxMessage,
 });
 
 // The caller's dead letters matching a bulk re-drive filter. Every filter is
@@ -157,15 +168,7 @@ export class JobsService {
 
     const { job, outboxId } = committed;
 
-    await this.enqueue(
-      job.id,
-      outboxId,
-      job.type,
-      job.maxAttempts,
-      correlationId,
-    );
-    await this.markPublished(outboxId);
-    await this.events.jobUpdated(job);
+    await this.publishNow(job, outboxId, correlationId);
 
     return { job, replayed: false };
   }
@@ -203,33 +206,26 @@ export class JobsService {
     }
   }
 
-  private async enqueue(
-    jobId: string,
-    outboxId: bigint,
-    type: string,
-    maxAttempts: number,
-    correlationId: string,
-  ) {
+  // The direct path (§4.5): enqueued at once rather than on the relay's next
+  // tick. Should anything here fail, the outbox row stays unpublished and the
+  // relay delivers it instead.
+  private async publishNow(job: Job, outboxId: bigint, correlationId: string) {
     await this.queue.add(
-      type,
-      { jobId, correlationId },
-      {
-        jobId: messageId(jobId, outboxId),
-        attempts: maxAttempts,
-        backoff: { type: 'exponential', delay: 1000, jitter: 1 },
-        removeOnComplete: { age: 3600, count: 1000 },
-        removeOnFail: { age: 86_400 },
-      },
+      job.type,
+      { jobId: job.id, correlationId },
+      jobOptions(job.id, outboxId, job.maxAttempts),
     );
 
-    this.logger.log(`Enqueued job ${jobId} (${type})`);
-  }
+    this.logger.log(`Enqueued job ${job.id} (${job.type})`);
 
-  private async markPublished(outboxId: bigint) {
+    // `publishedAt: null` in the filter: the relay may have published this
+    // row in the meantime, and its stamp is the one to keep.
     await this.prisma.outbox.updateMany({
       where: { id: outboxId, publishedAt: null },
       data: { publishedAt: new Date() },
     });
+
+    await this.events.jobUpdated(job);
   }
 
   /**
@@ -271,15 +267,7 @@ export class JobsService {
 
     const { job, outboxId } = requeued;
 
-    await this.enqueue(
-      job.id,
-      outboxId,
-      job.type,
-      job.maxAttempts,
-      correlationId,
-    );
-    await this.markPublished(outboxId);
-    await this.events.jobUpdated(job);
+    await this.publishNow(job, outboxId, correlationId);
 
     return job;
   }
@@ -427,9 +415,7 @@ export class JobsService {
       await this.queue.remove(messageId(jobId, outbox.id));
     } catch (error) {
       this.logger.warn(
-        `Could not remove cancelled job ${jobId} from the queue: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `Could not remove cancelled job ${jobId} from the queue: ${describeError(error)}`,
       );
     }
   }
@@ -468,12 +454,7 @@ export class JobsService {
       throw new ErrorReportNotFoundError();
     }
 
-    // Taken before signing, like an upload slip's, so the time a client is
-    // told is never later than the one S3 holds the link to.
-    const expiresAt = new Date(Date.now() + REPORT_LINK_SECONDS * 1000);
-    const url = await this.storage.signDownload(key, REPORT_LINK_SECONDS);
-
-    return { url, expiresAt };
+    return this.storage.signDownload(key, REPORT_LINK_SECONDS);
   }
 
   /**

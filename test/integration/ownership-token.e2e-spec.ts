@@ -33,7 +33,10 @@ describe('the ownership token across a re-drive', () => {
     });
 
     const first = await transitions.claim(job.id);
-    await transitions.deadLetter(job.id, first!.lease, { code: 'TEST' });
+    await transitions.deadLetter(job.id, first!.lease, {
+      code: 'TERMINAL_FAILURE',
+      message: 'test',
+    });
     await transitions.redrive(job.id);
     const second = await transitions.claim(job.id);
 
@@ -92,10 +95,17 @@ describe('the ownership token across a re-drive', () => {
     ).toBeNull();
     expect(await transitions.succeed(jobId, stale, { ok: true })).toBeNull();
     expect(
-      await transitions.requeueForRetry(jobId, stale, { code: 'TEST' }),
+      await transitions.requeueForRetry(jobId, stale, {
+        code: 'ATTEMPT_FAILED',
+        message: 'test',
+        attempt: 1,
+      }),
     ).toBeNull();
     expect(
-      await transitions.deadLetter(jobId, stale, { code: 'TEST' }),
+      await transitions.deadLetter(jobId, stale, {
+        code: 'TERMINAL_FAILURE',
+        message: 'test',
+      }),
     ).toBeNull();
 
     expect(await row(jobId)).toMatchObject({
@@ -120,11 +130,17 @@ describe('the ownership token across a re-drive', () => {
     });
     const stalled = await transitions.claim(job.id);
 
-    await transitions.abandon(job.id, { code: 'DELIVERY_ABANDONED' });
+    await transitions.abandon(job.id, {
+      code: 'DELIVERY_ABANDONED',
+      message: 'test',
+    });
     await transitions.redrive(job.id);
 
     expect(
-      await transitions.deadLetter(job.id, stalled!.lease, { code: 'TEST' }),
+      await transitions.deadLetter(job.id, stalled!.lease, {
+        code: 'TERMINAL_FAILURE',
+        message: 'test',
+      }),
     ).toBeNull();
     expect(
       await transitions.succeed(job.id, stalled!.lease, { ok: true }),

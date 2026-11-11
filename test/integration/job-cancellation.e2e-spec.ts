@@ -240,7 +240,11 @@ describe('cancellation transitions', () => {
       const jobId = await jobIn('RUNNING');
 
       await charge(jobId, 1);
-      await transitions.requeueForRetry(jobId, 1, { code: 'ATTEMPT_FAILED' });
+      await transitions.requeueForRetry(jobId, 1, {
+        code: 'ATTEMPT_FAILED',
+        message: 'test',
+        attempt: 1,
+      });
       await transitions.requestCancel(jobId);
 
       expect(await transitions.cancelQueued(jobId)).toBeNull();

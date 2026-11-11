@@ -326,7 +326,7 @@ describe('the guarded download', () => {
       downloadAs: 'fixture.png',
     });
 
-    const url = await storage.signDownload(key, 60);
+    const { url } = await storage.signDownload(key, 60);
 
     expect(await new GuardedDownloader().download(url, limits)).toEqual({
       body: IMAGE,

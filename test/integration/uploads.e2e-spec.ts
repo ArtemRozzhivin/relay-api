@@ -86,9 +86,8 @@ describe('uploads', () => {
     const uploaded = await send(body.data, csv);
     expect(uploaded.status).toBe(204);
 
-    const downloaded = await fetch(
-      await storage.signDownload(body.data.key, 60),
-    );
+    const { url } = await storage.signDownload(body.data.key, 60);
+    const downloaded = await fetch(url);
     expect(downloaded.status).toBe(200);
     expect(await downloaded.text()).toBe(csv);
   });

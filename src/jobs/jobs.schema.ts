@@ -89,6 +89,14 @@ export const JOB_TYPES: readonly JobType[] = submitJobSchema.options.map(
   (option) => option.shape.type.value,
 );
 
+// Every instant a client sends, read one way. A timezone is required, not
+// assumed: "re-drive what died between 02:00 and
+// 03:00" is off by hours if the server and the operator disagree on which 02:00.
+// z.coerce.date() would also accept "1" and read it as the year 2001.
+const instant = z.iso
+  .datetime({ offset: true })
+  .transform((value) => new Date(value));
+
 export const listJobsSchema = z
   .object({
     // From the generated enum rather than a literal list: adding CANCELLED
@@ -99,7 +107,7 @@ export const listJobsSchema = z
     // The last job a page held, by the two values the list is ordered on.
     cursor: cursorParam(
       z.object({
-        createdAt: z.iso.datetime().pipe(z.coerce.date()),
+        createdAt: instant,
         id: z.uuid(),
       }),
       // An ISO instant and a uuid.
@@ -107,13 +115,6 @@ export const listJobsSchema = z
     ).optional(),
   })
   .strict();
-
-// A timezone is required, not assumed: "re-drive what died between 02:00 and
-// 03:00" is off by hours if the server and the operator disagree on which 02:00.
-// z.coerce.date() would also accept "1" and read it as the year 2001.
-const instant = z.iso
-  .datetime({ offset: true })
-  .transform((value) => new Date(value));
 
 export const bulkRedriveSchema = z
   .object({
