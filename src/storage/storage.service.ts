@@ -94,6 +94,8 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
   /**
    * Whether an object exists. Only a 404 answers `false`: a permissions or
    * network failure is not an absent file, and must not be reported as one.
+   * S3 answers 404 for a missing key only to a principal allowed
+   * `s3:ListBucket`; to any other it answers 403, which this throws (§13.4).
    */
   async exists(key: string) {
     try {
@@ -148,6 +150,7 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
 
       return { body, etag: ETag };
     } catch (error) {
+      // Like exists(): NoSuchKey needs s3:ListBucket, or a missing key is a 403.
       if (error instanceof NoSuchKey) {
         return 'missing';
       }

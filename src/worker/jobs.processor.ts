@@ -8,9 +8,20 @@ import { JobContextFactory } from '../jobs/job-context.factory.js';
 import { JobCancelledError } from '../jobs/job-handler.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
-import { TerminalJobError } from '../common/errors/app-error.js';
+import { AppError, TerminalJobError } from '../common/errors/app-error.js';
 import type { DeadLetterCode } from '../jobs/job-error-codes.js';
 import type { WorkerEnv } from '../config/env.schema.js';
+
+// The HTTP filter's rule, applied to a job's error: only an AppError's message
+// was written for the job's owner. Anything else — Prisma, S3, a socket — can
+// name a table, the principal a bucket refused, or an internal address, so the
+// owner is told only that it happened and where to point, and the worker's log
+// keeps what. The correlation id is the submit's request id, which the owner
+// already holds.
+const ownerMessage = (error: unknown, correlationId: string) =>
+  error instanceof AppError
+    ? error.message
+    : `Internal error; the worker's log has it under correlationId ${correlationId}`;
 
 @Processor(JOBS_QUEUE, {
   concurrency: Number(process.env.WORKER_CONCURRENCY ?? 5),
@@ -148,7 +159,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         return;
       }
 
-      const reason = cause instanceof Error ? cause.message : String(cause);
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      const reason = ownerMessage(cause, correlationId);
 
       const isTerminal =
         cause instanceof TerminalJobError ||
@@ -171,7 +183,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           await this.events.jobUpdated(dead);
 
           this.logger.error(
-            `Job ${jobId} dead-lettered after ${attempt} attempt(s): ${reason}`,
+            `Job ${jobId} dead-lettered after ${attempt} attempt(s): ${detail}`,
           );
         } else {
           this.logger.warn(
@@ -196,7 +208,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         await this.events.jobUpdated(requeued);
 
         this.logger.warn(
-          `Job ${jobId} attempt ${attempt}/${claimed.maxAttempts} failed, will retry: ${reason}`,
+          `Job ${jobId} attempt ${attempt}/${claimed.maxAttempts} failed, will retry: ${detail}`,
         );
       }
 
@@ -211,9 +223,9 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   // the one signal that distinguishes "will retry" from "gave up".
   @OnWorkerEvent('failed')
   onFailed(message: QueueJob<JobMessage> | undefined, error: Error) {
-    const jobId = message?.data?.jobId;
+    const { jobId, correlationId } = message?.data ?? {};
 
-    if (!jobId || !message?.finishedOn) {
+    if (!jobId || !correlationId || !message?.finishedOn) {
       return;
     }
 
@@ -226,17 +238,23 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     // Registered as a bare event listener, so nothing holds this promise or
     // waits for it on shutdown; tracking it is what makes onModuleDestroy able
     // to finish a dead-letter that is in flight when SIGTERM arrives.
-    const task = this.finalise(jobId, error);
+    const task = this.finalise(jobId, correlationId, error);
 
     this.finalising.add(task);
     void task.finally(() => this.finalising.delete(task));
   }
 
-  private async finalise(jobId: string, error: Error) {
+  private async finalise(jobId: string, correlationId: string, error: Error) {
     try {
       const abandoned = await this.transitions.abandon(jobId, {
         code: 'DELIVERY_ABANDONED' satisfies DeadLetterCode,
-        message: error.message,
+        // Either BullMQ's own — a stall past the limit — or one process()
+        // threw with a message already made safe. Anything else is what
+        // process() threw before it could catch it: a refused claim, say.
+        message:
+          error instanceof UnrecoverableError
+            ? error.message
+            : ownerMessage(error, correlationId),
       });
 
       if (abandoned) {

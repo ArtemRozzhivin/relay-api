@@ -172,6 +172,39 @@ describe('the product upsert', () => {
     expect(await products.upsertBatch(await store(), [])).toBe(0);
   });
 
+  // Two imports into one store, holding the same skus in opposite orders. The
+  // store already has them, so each write locks rows the other is writing.
+  it('writes two overlapping batches at once without deadlocking', async () => {
+    const userId = await store();
+    const skus = Array.from(
+      { length: 2000 },
+      (_, n) => `SKU-${String(n).padStart(4, '0')}`,
+    );
+
+    await products.upsertBatch(
+      userId,
+      skus.map((sku) => row(sku)),
+    );
+
+    // Several rounds: a single one can finish before the other starts.
+    for (let round = 1; round <= 5; round += 1) {
+      await Promise.all([
+        products.upsertBatch(
+          userId,
+          skus.map((sku) => row(sku, { priceCents: round })),
+        ),
+        products.upsertBatch(
+          userId,
+          [...skus].reverse().map((sku) => row(sku, { priceCents: round })),
+        ),
+      ]);
+    }
+
+    expect(
+      await prisma.product.count({ where: { userId, priceCents: 5 } }),
+    ).toBe(skus.length);
+  });
+
   // The floor under the import's own validation: a row that slipped past it is
   // refused by Postgres, and the batch with it.
   it.each([

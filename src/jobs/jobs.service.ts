@@ -88,6 +88,18 @@ export class JobsService {
     @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
   ) {}
 
+  /**
+   * Accepts a job once per `(userId, idempotencyKey)`: the row and its outbox
+   * row commit together, then the job is enqueued directly, with the relay as
+   * the backstop should that enqueue never happen (§7.2).
+   *
+   * @returns the job, and whether it is a replay: an earlier request with the
+   * same key and body already created it, and nothing new was enqueued.
+   * @throws IdempotencyKeyReusedError (422) when the key was first used with a
+   * different body.
+   * @throws UploadNotFoundError (422) when an `import.csv` names a key that is
+   * not one of the caller's uploads, or no longer exists.
+   */
   async submit({ userId, idempotencyKey, correlationId, input }: SubmitArgs) {
     await this.checkUpload(userId, idempotencyKey, input);
 
@@ -221,8 +233,13 @@ export class JobsService {
   }
 
   /**
+   * Gives a dead-lettered job a fresh retry budget and a new delivery.
+   *
    * @param fromStart discards the job's checkpoint, so it does its work again
    * from the beginning; by default it resumes where it got to (D26).
+   * @throws JobNotFoundError (404) when the job does not exist or is another
+   * tenant's.
+   * @throws JobNotDeadLetteredError (409) when the job is not dead-lettered.
    */
   async redrive(
     userId: string,

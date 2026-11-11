@@ -116,6 +116,18 @@ export class TerminalJobError extends AppError {
   }
 }
 
+/**
+ * A handler's failure that another attempt might not repeat — a host that
+ * timed out, say — with a message written for the job's owner. A plain `Error`
+ * is retried the same way, but its message is never shown: it may be Prisma's,
+ * S3's or a socket's, and name what the owner should not see.
+ */
+export class RetryableJobError extends AppError {
+  // Never answered over HTTP; were it thrown there, a 500 is what it would be.
+  readonly kind = 'INTERNAL' as const;
+  readonly code = 'JOB_ATTEMPT_FAILED';
+}
+
 export class JobNotDeadLetteredError extends AppError {
   readonly kind = 'CONFLICT' as const;
   readonly code = 'JOB_NOT_DEAD_LETTERED';

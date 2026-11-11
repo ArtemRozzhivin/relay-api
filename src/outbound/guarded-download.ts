@@ -54,6 +54,16 @@ const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 // often it is asked.
 const TRANSIENT_STATUSES = new Set([408, 429]);
 
+// One answer for a name that resolves privately and a name that does not
+// exist: told apart, they would let a seller list which internal names exist
+// by asking for each. Without the address either: naming what an internal host
+// resolves to maps the network for whoever asks.
+const notPublic = (hostname: string) =>
+  new DownloadFailedError(
+    `${hostname} does not resolve to a public address`,
+    true,
+  );
+
 // A port is a choice of service. Allowing any would let a seller's URL probe
 // whatever else a public host runs.
 const WEB_PORTS = ['', '80', '443'];
@@ -117,7 +127,7 @@ export class GuardedDownloader {
         return await this.read(response, status, limits);
       }
     } catch (error) {
-      throw this.classify(error, signal);
+      throw this.classify(error, signal, url);
     }
   }
 
@@ -179,17 +189,7 @@ export class GuardedDownloader {
       const refused = found.find(({ address }) => !this.isAllowed(address));
 
       if (refused || found.length === 0) {
-        done(
-          // Without the address: this message reaches the URL's owner, and
-          // naming what an internal host resolves to maps the network for
-          // whoever asks.
-          new DownloadFailedError(
-            `${hostname} does not resolve to a public address`,
-            true,
-          ),
-          '',
-          0,
-        );
+        done(notPublic(hostname), '', 0);
 
         return;
       }
@@ -287,7 +287,7 @@ export class GuardedDownloader {
     return { body: Buffer.concat(chunks), contentType };
   }
 
-  private classify(error: unknown, signal: AbortSignal) {
+  private classify(error: unknown, signal: AbortSignal, url: URL) {
     if (error instanceof DownloadFailedError) {
       return error;
     }
@@ -301,7 +301,7 @@ export class GuardedDownloader {
     // A name that does not exist will not exist on the next attempt either;
     // EAI_AGAIN, a resolver that did not answer, might.
     if (code === 'ENOTFOUND') {
-      return new DownloadFailedError('The host does not exist', true);
+      return notPublic(url.hostname);
     }
 
     // A certificate that does not verify is a fact about the server, not a

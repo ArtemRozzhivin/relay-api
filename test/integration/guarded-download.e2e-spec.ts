@@ -246,6 +246,47 @@ describe('the guarded download', () => {
       );
     });
 
+    // Told apart, the two answers would let a seller list which internal names
+    // exist, one URL at a time.
+    it('answers a name that does not exist as it answers a private one', async () => {
+      const url = 'http://db.internal.example.com/a.png';
+      const resolvingTo = (
+        answer: (hostname: string) => [Error | null, LookupAddress[]],
+      ) =>
+        ((
+          hostname: string,
+          _options: object,
+          done: (error: Error | null, found: LookupAddress[]) => void,
+        ) =>
+          done(
+            ...answer(hostname),
+          )) as unknown as typeof import('node:dns').lookup;
+
+      const missing = await failure(
+        new GuardedDownloader({
+          // As getaddrinfo reports a name nobody has registered.
+          lookup: resolvingTo((hostname) => [
+            Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), {
+              code: 'ENOTFOUND',
+              hostname,
+            }),
+            [],
+          ]),
+        }).download(url, limits),
+      );
+      const internal = await failure(
+        new GuardedDownloader({
+          lookup: resolvingTo(() => [
+            null,
+            [{ address: '10.0.0.5', family: 4 }],
+          ]),
+        }).download(url, limits),
+      );
+
+      expect(missing.message).toBe(internal.message);
+      expect(missing.permanent).toBe(true);
+    });
+
     it.each([
       ['ftp://example.com/a.png', /ftp: is not http or https/],
       ['file:///etc/passwd', /file: is not http or https/],

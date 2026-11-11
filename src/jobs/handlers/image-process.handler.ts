@@ -12,6 +12,7 @@ import { StorageService } from '../../storage/storage.service.js';
 import { productImageKey } from '../../storage/object-keys.js';
 import { ProductsService } from '../../products/products.service.js';
 import { renderSizes } from '../../images/image-variants.js';
+import { RetryableJobError } from '../../common/errors/app-error.js';
 
 // What a seller uploads and sharp decodes. Not SVG: it is a document that can
 // refer to other files, and rendering one runs a parser on the seller's input.
@@ -136,10 +137,10 @@ export class ImageProcessJobHandler extends JobHandler<
       }
     }
 
-    // A plain error, so the job is retried: the next attempt skips what this
-    // one made and tries only these again.
+    // Retried like any failure: the next attempt skips what this one made and
+    // tries only these again. A RetryableJobError, so its owner reads why.
     if (retrying > 0) {
-      throw new Error(
+      throw new RetryableJobError(
         `${retrying} of ${todo.length} images could not be downloaded this time (${firstRetryReason})`,
       );
     }

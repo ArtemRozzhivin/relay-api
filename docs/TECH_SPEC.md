@@ -264,7 +264,10 @@ code it gives each item it sells), never by our `id`, so the SKU is the key an i
 **DB** `UNIQUE (userId, sku)` — per store, because two stores' `A-1` are unrelated. This is what
 makes a replayed batch harmless (A14): the import writes each batch with **one**
 `INSERT … ON CONFLICT ("userId", sku) DO UPDATE`, so a batch written twice leaves the table as one
-write did, and the import never needs to know whether it ran before. The CHECKs are the floor under
+write did, and the import never needs to know whether it ran before. The rows go in `sku` order:
+each is locked as it is written, so two imports into one store writing the same skus in different
+orders would otherwise each hold a row the other waits for (`40P01`); in one order the second
+simply waits. The CHECKs are the floor under
 the import's own row validation, not a substitute for it. Later phases add their own columns —
 image variants (C), enrichment (D) — in their own migrations.
 
@@ -839,13 +842,22 @@ The worker classifies every failure into exactly one of three:
 
 | Class | Example | Worker behaviour |
 |---|---|---|
-| **Transient** | DB connection blip, mock random failure | Throw a plain `Error` → BullMQ retries with backoff |
-| **Terminal** | Payload fails a business rule, user deleted, unknown job type | Throw **`UnrecoverableError`** → no further retries, straight to `DEAD_LETTERED` |
+| **Transient** | DB connection blip, mock random failure, an image host that is down | Throw a plain `Error`, or a `RetryableJobError` when its message is written for the job's owner → BullMQ retries with backoff |
+| **Terminal** | Payload fails a business rule, user deleted, unknown job type | Throw `TerminalJobError`; the processor dead-letters the job and throws **`UnrecoverableError`** → no further retries |
 | **Poison** | Repeated transient failures that exhaust `maxAttempts` | Falls through to `DEAD_LETTERED` on the last attempt |
 
 Without this taxonomy, a validation bug burns all five attempts over 31 seconds and lands in the
 dead letter with a useless error message. (`UnrecoverableError` replaces the removed
 `Job#discard()` from BullMQ v5.)
+
+**What a job's owner reads.** `error.message` reaches the owner through `GET /jobs/:id` and the
+socket, so it follows the HTTP filter's rule: only an `AppError`'s message — words written for the
+owner, as `TerminalJobError`'s and `RetryableJobError`'s are — is stored as it is. Anything else
+(Prisma naming a table, S3 naming the principal it refused, a socket naming an internal address) is
+stored as `Internal error; the worker's log has it under correlationId <id>`, and the worker logs
+the text. The correlation id is the submit's request id, which the owner already holds. A `failed`
+event's message is stored only when it is an `UnrecoverableError`: BullMQ's own (a stall past the
+limit) or the processor's, already made safe.
 
 > **DECISION — D5 · The ordering of "persist" and "enqueue"**
 >
@@ -932,7 +944,9 @@ Every failure says whether asking again could change it: a refused address, a 40
 than 408 and 429, a host that does not exist or a certificate that does not verify are permanent;
 a timeout, a 5xx, a 408 or a 429 are not (§7.7). A message names what was refused, never what a
 host name resolved to: it reaches the URL's owner as the product's `image.error` (§6.3c), and a
-resolved internal address would map the network for whoever asks.
+resolved internal address would map the network for whoever asks. For the same reason a name that
+does not exist is answered exactly as one that resolves privately: told apart, the two would let a
+seller list which internal names exist, one URL at a time.
 
 ---
 
@@ -1900,6 +1914,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-10 | §4.7, §7.7, §7.9 — a job's `error.message` holds only words written for its owner: an `AppError`'s message as it is, anything else as an internal error with the correlation id, its text in the worker's log. Prisma's and S3's messages had reached clients, and S3's AccessDenied names the IAM principal. `RetryableJobError` keeps a retry's own message where it was written for the owner — an image batch's "N of M images could not be downloaded". A host name that does not exist gets the same answer as one that resolves privately, so `image.error` no longer tells which internal names exist. The product upsert writes in `sku` order: two imports into one store had deadlocked on each other. |
 | 2026-11-10 | §7.6 — the sweep also finishes a `QUEUED` job the queue has stopped delivering. A job whose every delivery failed before the claim, with Postgres unreachable, was left `QUEUED` for ever: `abandon()` refuses a row no attempt claimed, and the sweep read `RUNNING` rows only. Such a row is now dead-lettered `DELIVERY_ABANDONED` once its outbox row is published and its entry is gone or long finished, under a write pinned to the delivery the sweep read, so a job re-driven in between is never finished. The sweep pages by `id > last`: Prisma's cursor skipped the row after any page whose last row the sweep had just finished. §7.6 said the write was pinned to `startedAt`; it is the lease. |
 | 2026-11-10 | §4.3, §5.2, §6.2, §14 — a charge whose money moved can no longer end `CANCELLED`. The two cancels that run no handler checked only `cancelRequested`, so a cancel after the charge, followed by a redelivery or a retry, finished the job `CANCELLED` beside its ledger row. The charge now commits through `context.commitEffect`, under the lease, marking `Job.effectCommitted` in the same transaction; both cancels refuse a marked job, and a `CHECK` refuses the combination. `succeed` and `deadLetter` accept only `RUNNING`: a stale worker could finish a job re-driven since. §5.2's table rewritten from the code, with every worker write under the lease. A3d automated. |
 | 2026-11-10 | §5.2, §7.6a, §14 — `SIGTERM` no longer breaks running jobs. The worker drained in `@nestjs/bullmq`'s `onApplicationShutdown`, after every `onModuleDestroy` had closed S3 and Redis, so every deploy cost a running import or image batch an attempt. It now drains first, tells handlers to stop at their next safe point, and hands the job back to the queue with its attempt given back. A5e automated. |

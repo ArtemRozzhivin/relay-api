@@ -19,6 +19,7 @@ import { OutboundModule } from '../../src/outbound/outbound.module.js';
 import { GuardedDownloader } from '../../src/outbound/guarded-download.js';
 import { ImageProcessJobHandler } from '../../src/jobs/handlers/image-process.handler.js';
 import { JobCancelledError } from '../../src/jobs/job-handler.js';
+import { RetryableJobError } from '../../src/common/errors/app-error.js';
 import { recordingContext } from '../../src/jobs/job-context.fixture.js';
 import { workerEnvSchema } from '../../src/config/env.schema.js';
 
@@ -504,6 +505,8 @@ describe('the image.process handler', () => {
       await expect(first.result).rejects.toThrow(
         '1 of 2 images could not be downloaded this time (The server answered 503)',
       );
+      // Not a plain Error: the owner is shown this message, not "Internal error".
+      await expect(first.result).rejects.toBeInstanceOf(RetryableJobError);
       expect(first.reports.at(-1)).toEqual({ processed: 2, total: 2 });
       expect(await statuses(userId)).toEqual([
         ['A-DOWN', null],
