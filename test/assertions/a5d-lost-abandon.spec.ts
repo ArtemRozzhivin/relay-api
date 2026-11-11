@@ -61,8 +61,8 @@ describe('A5d · an abandonment the failed event loses is still finalised', () =
       code: 'DELIVERY_ABANDONED',
       message: expect.stringContaining('failed'),
     });
-    // Scoped to this job: the worker sweeps every RUNNING row, and an earlier
-    // file's job can be stranded in the same window for the same reason.
+    // Scoped to this job: the worker sweeps every unfinished row, and an
+    // earlier file's job can be stranded in the same window for the same reason.
     // Waited for, not just counted: the worker logs after the write this test
     // saw, and its output arrives through a pipe.
     const swept = new RegExp(`Job ${jobId} dead-lettered by the sweep`);

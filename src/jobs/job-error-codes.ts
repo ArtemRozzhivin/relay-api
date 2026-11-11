@@ -10,8 +10,10 @@ export const DEAD_LETTER_CODES = [
   'TERMINAL_FAILURE',
   // Every attempt the job was allowed failed.
   'ATTEMPTS_EXHAUSTED',
-  // The queue gave up redelivering a job whose worker kept disappearing,
-  // without ever calling the handler (§7.6).
+  // The queue stopped delivering the job before any attempt finished it: its
+  // workers kept disappearing, or every delivery failed before the claim
+  // (§7.6). Earlier deliveries may have run the handler, so its effects may
+  // already have landed.
   'DELIVERY_ABANDONED',
 ] as const;
 

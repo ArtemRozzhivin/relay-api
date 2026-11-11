@@ -319,7 +319,7 @@ to guard. Revisit if the status stream turns out to be unreadable without it (§
 | `RUNNING` | `QUEUED` | Worker, shutting down (`release`) | `WHERE id = ? AND status = 'RUNNING' AND lease = ?`, sets `attempts = attempts - 1` — the handler stopped at a safe point because the worker is going away (§7.6a) |
 | `RUNNING` | `DEAD_LETTERED` | Worker | `WHERE id = ? AND status = 'RUNNING' AND lease = ?` — a terminal error or the budget spent |
 | `QUEUED`, `RUNNING` | `DEAD_LETTERED` | Worker, the queue gave up (`abandon`) | `WHERE id = ? AND status IN ('QUEUED','RUNNING') AND attempts > 0` — no lease: the queue failed the job outside any attempt (§7.6). `attempts > 0` keeps it off a job re-driven since |
-| `RUNNING` | `DEAD_LETTERED` | Worker, the sweep (`abandonStranded`) | `WHERE id = ? AND status = 'RUNNING' AND lease = ?`, the lease the sweep read (§7.6) |
+| `QUEUED`, `RUNNING` | `DEAD_LETTERED` | Worker, the sweep (`abandonStranded`) | `WHERE id = ? AND status = ? AND lease = ? AND NOT EXISTS (a newer outbox row)` — the status, lease and delivery the sweep read, so a job claimed or re-driven since is left alone (§7.6) |
 | `DEAD_LETTERED` | `QUEUED` | API (re-drive) | `WHERE id = ? AND status = 'DEAD_LETTERED'`, resets `attempts = 0`, `cancelRequested = false`, `progress`, `result`, `error` — never `lease`, never `effectCommitted`; `checkpoint` only with `?from=start` (D26) |
 | `QUEUED` | `CANCELLED` | API (cancel) | `WHERE id = ? AND status = 'QUEUED' AND cancelRequested AND NOT effectCommitted` — nobody is running it, so the API may finish it |
 | `QUEUED`, `RUNNING` | `CANCELLED` | Worker, **before** claiming | `WHERE id = ? AND status IN ('QUEUED','RUNNING') AND cancelRequested AND NOT effectCommitted` — a retry or a redelivery that arrives after the request runs no handler |
@@ -792,9 +792,20 @@ Worth stating precisely, because the mental model most people have is wrong:
   latest queue entry is missing, or finished more than 30 s ago, is dead-lettered
   `DELIVERY_ABANDONED`. It asks the queue, not a clock — a long job is legitimately `RUNNING` for
   hours — and leaves waiting, delayed and active entries alone. The 30 s keeps the event the normal
-  path and the sweep its backstop rather than a racer. The write is pinned to the `startedAt` the
-  sweep read, so a job claimed again in between is never finished on stale evidence. It also
-  finishes a processor that returned without finishing its row, whose entry ends `completed`.
+  path and the sweep its backstop rather than a racer. The write is pinned to the status, the
+  `lease` and the delivery (no newer outbox row) the sweep read, so a job claimed or re-driven in
+  between is never finished on stale evidence. It also finishes a processor that returned without
+  finishing its row, whose entry ends `completed`.
+- **A job no attempt ever claimed is the sweep's too.** With Postgres unreachable, the check
+  before the claim throws on every delivery, and the queue fails the entry with the row still
+  `QUEUED` at `attempts = 0`. `abandon()` refuses that row: it stands `attempts > 0` in for the
+  ownership token it does not have. So the sweep reads `QUEUED` rows as well, once their latest
+  outbox row is published — before that they wait for the relay, not the queue. They are
+  dead-lettered rather than re-enqueued: an enqueue would hide what went wrong (a Redis that lost
+  its data would be refilled silently) and could loop on a cause that persists, while a dead letter
+  is visible and one re-drive by `errorCode` brings them all back. The sweep costs one Redis read
+  per unfinished job per tick, and pages by `id > last` rather than an offset, since the last row
+  of a page is often the one it has just finished.
 
 ### 7.6a Shutdown — a deploy hands running work back
 
@@ -1889,6 +1900,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-10 | §7.6 — the sweep also finishes a `QUEUED` job the queue has stopped delivering. A job whose every delivery failed before the claim, with Postgres unreachable, was left `QUEUED` for ever: `abandon()` refuses a row no attempt claimed, and the sweep read `RUNNING` rows only. Such a row is now dead-lettered `DELIVERY_ABANDONED` once its outbox row is published and its entry is gone or long finished, under a write pinned to the delivery the sweep read, so a job re-driven in between is never finished. The sweep pages by `id > last`: Prisma's cursor skipped the row after any page whose last row the sweep had just finished. §7.6 said the write was pinned to `startedAt`; it is the lease. |
 | 2026-11-10 | §4.3, §5.2, §6.2, §14 — a charge whose money moved can no longer end `CANCELLED`. The two cancels that run no handler checked only `cancelRequested`, so a cancel after the charge, followed by a redelivery or a retry, finished the job `CANCELLED` beside its ledger row. The charge now commits through `context.commitEffect`, under the lease, marking `Job.effectCommitted` in the same transaction; both cancels refuse a marked job, and a `CHECK` refuses the combination. `succeed` and `deadLetter` accept only `RUNNING`: a stale worker could finish a job re-driven since. §5.2's table rewritten from the code, with every worker write under the lease. A3d automated. |
 | 2026-11-10 | §5.2, §7.6a, §14 — `SIGTERM` no longer breaks running jobs. The worker drained in `@nestjs/bullmq`'s `onApplicationShutdown`, after every `onModuleDestroy` had closed S3 and Redis, so every deploy cost a running import or image batch an attempt. It now drains first, tells handlers to stop at their next safe point, and hands the job back to the queue with its attempt given back. A5e automated. |
 | 2026-11-10 | §6.3b — an import row is capped at 1 000 fields as well as 64 KB of content. The content cap alone counted no empty field, so a line of bare commas grew one record without bound and could take the worker's memory with it. A cap per physical line was rejected: quoted line breaks split one row into short lines, and a file ending lines in `\r` alone has no `\n`. |

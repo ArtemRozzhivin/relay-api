@@ -120,9 +120,7 @@ describe('the ownership token across a re-drive', () => {
     });
     const stalled = await transitions.claim(job.id);
 
-    await transitions.abandonStranded(job.id, stalled!.lease, {
-      code: 'DELIVERY_ABANDONED',
-    });
+    await transitions.abandon(job.id, { code: 'DELIVERY_ABANDONED' });
     await transitions.redrive(job.id);
 
     expect(

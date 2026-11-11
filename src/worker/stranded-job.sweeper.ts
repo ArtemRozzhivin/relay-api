@@ -12,33 +12,39 @@ import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, messageId, type JobMessage } from '../jobs/job-queue.js';
 import type { DeadLetterCode } from '../jobs/job-error-codes.js';
+import type { JobStatus } from '../generated/prisma/enums.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 
 const BATCH_SIZE = 100;
 
-// How long a finished queue entry may sit beside a RUNNING row before the sweep
-// acts on it. The 'failed' event finalises an abandoned job within
+// How long a finished queue entry may sit beside an unfinished row before the
+// sweep acts on it. The 'failed' event finalises an abandoned job within
 // milliseconds; waiting this long keeps the sweep the backstop rather than a
 // racer that wins and leaves the event's own write refused.
 const STRANDED_AFTER_MS = 30_000;
 
-/** A `RUNNING` row, and the outbox row whose queue entry delivered it. */
+/**
+ * A `RUNNING` or `QUEUED` row, and the outbox row whose queue entry delivers
+ * it.
+ */
 export interface SweepCandidate {
   id: string;
+  status: JobStatus;
   lease: number;
   outboxId: bigint;
 }
 
 /**
- * Dead-letters jobs whose row says `RUNNING` while the queue has stopped
- * delivering them.
+ * Dead-letters jobs whose row says `RUNNING` or `QUEUED` while the queue has
+ * stopped delivering them.
  *
  * The `failed` event normally does this (§7.6), but it is heard once, in
  * memory, by one worker: if that worker dies, or Postgres refuses the write at
- * that moment, nothing else ever would, and the row stays `RUNNING` for ever —
- * past a re-drive, which only accepts dead letters. The sweep asks the queue
- * rather than a clock: a long job is legitimately `RUNNING` for hours, and only
- * the queue knows whether anyone still holds it.
+ * that moment, nothing else ever would, and the row stays unfinished for ever
+ * — past a re-drive, which only accepts dead letters. And it refuses a job no
+ * attempt ever claimed, which is left `QUEUED`. The sweep asks the queue rather
+ * than a clock: a long job is legitimately `RUNNING` for hours, a backlog keeps
+ * one `QUEUED` as long, and only the queue knows whether it still delivers it.
  */
 @Injectable()
 export class StrandedJobSweeper
@@ -86,32 +92,49 @@ export class StrandedJobSweeper
     }
   }
 
-  /** Checks every `RUNNING` row, a page at a time, so none is starved. */
+  /** Checks every unfinished row, a page at a time, so none is starved. */
   async sweep(now = Date.now()) {
-    let cursor: string | undefined;
+    let after: string | undefined;
 
     for (;;) {
       const page = await this.prisma.job.findMany({
-        where: { status: 'RUNNING' },
+        where: {
+          status: { in: ['RUNNING', 'QUEUED'] },
+          // Not Prisma's `cursor`, which reads from the cursor row and skips
+          // it with OFFSET 1: once the sweep has finished a page's last row,
+          // that row is out of the filter, and the offset skips the next one.
+          ...(after === undefined ? {} : { id: { gt: after } }),
+        },
         orderBy: { id: 'asc' },
         take: BATCH_SIZE,
-        ...(cursor === undefined ? {} : { cursor: { id: cursor }, skip: 1 }),
         select: {
           id: true,
+          status: true,
           lease: true,
           // The newest row is the delivery of this life: a re-drive is a new
           // row and so a new queue entry (§7.5a).
-          outbox: { orderBy: { id: 'desc' }, take: 1, select: { id: true } },
+          outbox: {
+            orderBy: { id: 'desc' },
+            take: 1,
+            select: { id: true, publishedAt: true },
+          },
         },
       });
 
-      for (const { id, lease, outbox } of page) {
+      for (const { id, status, lease, outbox } of page) {
         const [latest] = outbox;
 
         // Every delivery has an outbox row; without one there is no entry to
-        // ask about, and guessing would finish a job someone may hold.
-        if (latest) {
-          await this.finishIfStranded({ id, lease, outboxId: latest.id }, now);
+        // ask about, and guessing would finish a job someone may hold. A
+        // QUEUED job whose outbox row is unpublished waits for the relay, not
+        // the queue. A RUNNING one was delivered whatever its row says: the
+        // direct path marks the row published only after the worker may
+        // already have claimed it.
+        if (latest && (status === 'RUNNING' || latest.publishedAt !== null)) {
+          await this.finishIfStranded(
+            { id, status, lease, outboxId: latest.id },
+            now,
+          );
         }
       }
 
@@ -119,7 +142,7 @@ export class StrandedJobSweeper
         return;
       }
 
-      cursor = page.at(-1)?.id;
+      after = page.at(-1)?.id;
     }
   }
 
@@ -150,7 +173,7 @@ export class StrandedJobSweeper
 
     const abandoned = await this.transitions.abandonStranded(
       job.id,
-      job.lease,
+      { status: job.status, lease: job.lease, outboxId: job.outboxId },
       {
         code: 'DELIVERY_ABANDONED' satisfies DeadLetterCode,
         message: `The queue no longer delivers this job (its entry is ${found})`,
@@ -161,7 +184,7 @@ export class StrandedJobSweeper
       await this.events.jobUpdated(abandoned);
 
       this.logger.error(
-        `Job ${job.id} dead-lettered by the sweep: still RUNNING, but its queue entry is ${found}`,
+        `Job ${job.id} dead-lettered by the sweep: still ${job.status}, but its queue entry is ${found}`,
       );
     }
 

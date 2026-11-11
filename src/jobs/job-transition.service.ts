@@ -127,7 +127,9 @@ export class JobTransitionService {
   // to 0, so this cannot overwrite a job an operator has just re-driven. It
   // could overwrite one a worker has also claimed since — which needs a
   // re-drive and a claim to land between the queue failing the job and this
-  // write, a window of milliseconds.
+  // write, a window of milliseconds. A job no attempt ever claimed — every
+  // delivery failed before the claim, with Postgres unreachable, say — is
+  // refused too, and left to the sweep (§7.6).
   abandon(jobId: string, error: Prisma.InputJsonValue) {
     return this.move(
       jobId,
@@ -137,15 +139,26 @@ export class JobTransitionService {
     );
   }
 
-  // The sweep found a RUNNING row whose queue entry is finished or gone (§7.6).
-  // The lease pins the delivery it inspected, so a job claimed again since the
-  // sweep read it is not finished on stale evidence.
-  abandonStranded(jobId: string, lease: number, error: Prisma.InputJsonValue) {
+  // The sweep found an unfinished row whose queue entry is finished or gone
+  // (§7.6). The write is pinned to everything the sweep read, so nothing is
+  // finished on stale evidence: the status; the lease, which any claim since
+  // has moved on; and the delivery, because a re-drive puts a row back to
+  // QUEUED under the same lease, with a newer outbox row of its own.
+  abandonStranded(
+    jobId: string,
+    seen: { status: JobStatus; lease: number; outboxId: bigint },
+    error: Prisma.InputJsonValue,
+  ) {
     return this.move(
       jobId,
-      ['RUNNING'],
+      [seen.status],
       { status: 'DEAD_LETTERED', error, finishedAt: new Date() },
-      { where: { lease } },
+      {
+        where: {
+          lease: seen.lease,
+          outbox: { none: { id: { gt: seen.outboxId } } },
+        },
+      },
     );
   }
 
