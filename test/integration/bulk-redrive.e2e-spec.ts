@@ -1,14 +1,14 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
-import { AppModule } from '../../src/app.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
 import type { JobStatus } from '../../src/generated/prisma/enums.js';
 import type { DeadLetterCode } from '../../src/jobs/job-error-codes.js';
+import { registerAndLogin, startApp } from '../support/http.js';
+import { deleteUsers, seedJob } from '../support/db.js';
 
 // Each filter becomes part of a WHERE clause over many rows at once, and one
 // of them is a Prisma JSON-path filter — the kind that compiles and then
@@ -18,24 +18,14 @@ describe('bulk re-drive', () => {
   let app: INestApplication;
   let server: Server;
   let prisma: PrismaService;
+  const users: string[] = [];
 
   const tenant = async (label: string) => {
-    const email = `bulk-${label}-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 8)}@example.com`;
+    const account = await registerAndLogin(server, `bulk-${label}`);
 
-    await request(server)
-      .post('/auth/register')
-      .send({ email, password: 'password123' })
-      .expect(201);
+    users.push(account.userId);
 
-    const { body } = await request(server)
-      .post('/auth/login')
-      .send({ email, password: 'password123' });
-
-    const { id } = await prisma.user.findUniqueOrThrow({ where: { email } });
-
-    return { token: body.data.accessToken as string, userId: id };
+    return account;
   };
 
   // Rows are written directly: what is under test is which rows the filter
@@ -49,18 +39,14 @@ describe('bulk re-drive', () => {
       finishedAt = new Date('2026-10-28T02:30:00Z'),
     } = {},
   ) => {
-    const created = await prisma.job.create({
-      data: {
-        userId,
-        type,
-        payload: { durationMs: 10 },
-        status,
-        attempts: 3,
-        idempotencyKey: `bulk-${Math.random()}`,
-        correlationId: 'test',
-        error: { code, message: 'it died', attempt: 3 },
-        finishedAt,
-      },
+    const created = await seedJob(prisma, {
+      userId,
+      type,
+      payload: { durationMs: 10 },
+      status,
+      attempts: 3,
+      error: { code, message: 'it died', attempt: 3 },
+      finishedAt,
     });
 
     return created.id;
@@ -76,17 +62,12 @@ describe('bulk re-drive', () => {
     (await prisma.job.findUniqueOrThrow({ where: { id: jobId } })).status;
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
-
-    app = moduleRef.createNestApplication();
-    await app.listen(0);
-    server = app.getHttpServer();
+    ({ app, server } = await startApp());
     prisma = app.get(PrismaService);
   });
 
   afterAll(async () => {
+    await deleteUsers(prisma, users);
     await app.close();
   });
 

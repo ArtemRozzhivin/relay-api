@@ -70,6 +70,9 @@ model Job {
   /// after it (D26). Written in the batch's own transaction; never sent to a client.
   checkpoint      Json?
   cancelRequested Boolean   @default(false)
+  /// Set in the transaction that commits the job's one irreversible effect; the
+  /// job can then only be finished by its handler, never cancelled (§5.2). **DB** `CHECK`
+  effectCommitted Boolean   @default(false)
   correlationId   String
   /// Milliseconds, not microseconds: the list's cursor carries it through a JS Date (D14).
   createdAt       DateTime  @default(now()) @db.Timestamptz(3)

@@ -189,6 +189,33 @@ describe('JobContextFactory', () => {
       expect(reclaims).toEqual([true, false]);
     });
 
+    // A write that failed left the unreadable value in place, so the next one
+    // would be refused by the same NULL comparison, and so would every one
+    // after it.
+    it('keeps reclaiming until a write lands', async () => {
+      const reclaims: boolean[] = [];
+      let calls = 0;
+      const harness = build(
+        async (jobId, attempt, progress, options) => {
+          reclaims.push(options?.reclaim === true);
+          calls += 1;
+
+          if (calls === 1) {
+            throw new Error('connection terminated');
+          }
+
+          return accepts(jobId, attempt, progress);
+        },
+        { progress: { phase: 'extract' } },
+      );
+
+      await report(harness, { processed: 1 });
+      await report(harness, { processed: 2 });
+      await report(harness, { processed: 3 });
+
+      expect(reclaims).toEqual([true, true, false]);
+    });
+
     it('does not reclaim a column that was simply never written', async () => {
       const reclaims: boolean[] = [];
       const harness = build(async (jobId, attempt, progress, options) => {

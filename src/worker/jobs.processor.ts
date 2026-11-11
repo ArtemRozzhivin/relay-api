@@ -1,16 +1,27 @@
 import { Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
-import { UnrecoverableError, type Job as QueueJob } from 'bullmq';
+import { DelayedError, UnrecoverableError, type Job as QueueJob } from 'bullmq';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
 import { JobContextFactory } from '../jobs/job-context.factory.js';
 import { JobCancelledError } from '../jobs/job-handler.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
-import { TerminalJobError } from '../common/errors/app-error.js';
-import type { DeadLetterCode } from '../jobs/job-error-codes.js';
+import { AppError, TerminalJobError } from '../common/errors/app-error.js';
 import type { WorkerEnv } from '../config/env.schema.js';
+import { describeError } from '../common/errors/describe-error.js';
+
+// The HTTP filter's rule, applied to a job's error: only an AppError's message
+// was written for the job's owner. Anything else — Prisma, S3, a socket — can
+// name a table, the principal a bucket refused, or an internal address, so the
+// owner is told only that it happened and where to point, and the worker's log
+// keeps what. The correlation id is the submit's request id, which the owner
+// already holds.
+const ownerMessage = (error: unknown, correlationId: string) =>
+  error instanceof AppError
+    ? error.message
+    : `Internal error; the worker's log has it under correlationId ${correlationId}`;
 
 @Processor(JOBS_QUEUE, {
   concurrency: Number(process.env.WORKER_CONCURRENCY ?? 5),
@@ -18,6 +29,10 @@ import type { WorkerEnv } from '../config/env.schema.js';
 export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   private readonly logger = new Logger(JobsProcessor.name);
   private readonly finalising = new Set<Promise<void>>();
+
+  // Set when shutdown begins: from then on, every running handler is told to
+  // stop at its next safe point.
+  private stopping = false;
 
   constructor(
     private readonly transitions: JobTransitionService,
@@ -29,7 +44,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     super();
   }
 
-  async process(message: QueueJob<JobMessage>) {
+  async process(message: QueueJob<JobMessage>, token?: string) {
     const { jobId, correlationId } = message.data;
 
     // Before the claim, not after: a retry scheduled after the cancel request,
@@ -60,6 +75,9 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     // carries. A re-drive resets the first and never the second.
     const attempt = claimed.attempts;
     const lease = claimed.lease;
+    // Decided once, here: the handler is told whether a failure now ends the
+    // job, and the catch below dead-letters by the same answer.
+    const lastAttempt = attempt >= claimed.maxAttempts;
 
     await this.events.jobUpdated(claimed);
 
@@ -71,10 +89,12 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       jobId,
       userId: claimed.userId,
       attempt,
+      lastAttempt,
       lease,
       correlationId,
       progress: claimed.progress,
       checkpoint: claimed.checkpoint,
+      stopping: () => this.stopping,
     });
 
     try {
@@ -110,13 +130,32 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           this.logger.log(
             `Job ${jobId} cancelled at a safe point on attempt ${attempt}`,
           );
-        } else {
-          // shouldStop() is also true for an attempt that lost the job; the
-          // attempt that holds it now is the one entitled to finish it.
-          this.logger.warn(
-            `Job ${jobId} stopped on attempt ${attempt}, which no longer owns it`,
-          );
+
+          return;
         }
+
+        const released = this.stopping
+          ? await this.transitions.release(jobId, lease)
+          : null;
+
+        if (released) {
+          await this.events.jobUpdated(released);
+          this.logger.log(
+            `Job ${jobId} handed back at a safe point for the next worker; attempt ${attempt} not counted`,
+          );
+
+          // Back to the queue without failing: a thrown error would spend one
+          // of the queue's attempts and wait out a backoff first.
+          await message.moveToDelayed(Date.now(), token);
+
+          throw new DelayedError();
+        }
+
+        // shouldStop() is also true for an attempt that lost the job; the
+        // attempt that holds it now is the one entitled to finish it.
+        this.logger.warn(
+          `Job ${jobId} stopped on attempt ${attempt}, which no longer owns it`,
+        );
 
         // Returned, not thrown: stopping when asked is the job doing what it
         // was told, so the queue records the delivery as complete rather than
@@ -124,18 +163,16 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         return;
       }
 
-      const reason = cause instanceof Error ? cause.message : String(cause);
+      const detail = describeError(cause);
+      const reason = ownerMessage(cause, correlationId);
 
       const isTerminal =
         cause instanceof TerminalJobError ||
         cause instanceof UnrecoverableError;
-      const isExhausted = attempt >= claimed.maxAttempts;
 
-      if (isTerminal || isExhausted) {
+      if (isTerminal || lastAttempt) {
         const dead = await this.transitions.deadLetter(jobId, lease, {
-          code: (isTerminal
-            ? 'TERMINAL_FAILURE'
-            : 'ATTEMPTS_EXHAUSTED') satisfies DeadLetterCode,
+          code: isTerminal ? 'TERMINAL_FAILURE' : 'ATTEMPTS_EXHAUSTED',
           ...(cause instanceof TerminalJobError && cause.reason
             ? { reason: cause.reason }
             : {}),
@@ -147,7 +184,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           await this.events.jobUpdated(dead);
 
           this.logger.error(
-            `Job ${jobId} dead-lettered after ${attempt} attempt(s): ${reason}`,
+            `Job ${jobId} dead-lettered after ${attempt} attempt(s): ${detail}`,
           );
         } else {
           this.logger.warn(
@@ -172,7 +209,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         await this.events.jobUpdated(requeued);
 
         this.logger.warn(
-          `Job ${jobId} attempt ${attempt}/${claimed.maxAttempts} failed, will retry: ${reason}`,
+          `Job ${jobId} attempt ${attempt}/${claimed.maxAttempts} failed, will retry: ${detail}`,
         );
       }
 
@@ -187,9 +224,9 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   // the one signal that distinguishes "will retry" from "gave up".
   @OnWorkerEvent('failed')
   onFailed(message: QueueJob<JobMessage> | undefined, error: Error) {
-    const jobId = message?.data?.jobId;
+    const { jobId, correlationId } = message?.data ?? {};
 
-    if (!jobId || !message?.finishedOn) {
+    if (!jobId || !correlationId || !message?.finishedOn) {
       return;
     }
 
@@ -202,17 +239,23 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     // Registered as a bare event listener, so nothing holds this promise or
     // waits for it on shutdown; tracking it is what makes onModuleDestroy able
     // to finish a dead-letter that is in flight when SIGTERM arrives.
-    const task = this.finalise(jobId, error);
+    const task = this.finalise(jobId, correlationId, error);
 
     this.finalising.add(task);
     void task.finally(() => this.finalising.delete(task));
   }
 
-  private async finalise(jobId: string, error: Error) {
+  private async finalise(jobId: string, correlationId: string, error: Error) {
     try {
       const abandoned = await this.transitions.abandon(jobId, {
-        code: 'DELIVERY_ABANDONED' satisfies DeadLetterCode,
-        message: error.message,
+        code: 'DELIVERY_ABANDONED',
+        // Either BullMQ's own — a stall past the limit — or one process()
+        // threw with a message already made safe. Anything else is what
+        // process() threw before it could catch it: a refused claim, say.
+        message:
+          error instanceof UnrecoverableError
+            ? error.message
+            : ownerMessage(error, correlationId),
       });
 
       if (abandoned) {
@@ -224,14 +267,18 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       }
     } catch (cause) {
       this.logger.error(
-        `Job ${jobId} was abandoned by the queue and could not be finalised: ${
-          cause instanceof Error ? cause.message : String(cause)
-        }`,
+        `Job ${jobId} was abandoned by the queue and could not be finalised: ${describeError(cause)}`,
       );
     }
   }
 
+  // Drained here, not in @nestjs/bullmq's own onApplicationShutdown: Nest runs
+  // every module's onModuleDestroy first, and those close the S3 client and
+  // Redis that a running job is still using. This module is the root, so its
+  // hook runs before theirs.
   async onModuleDestroy() {
+    this.stopping = true;
+    await this.worker.close();
     await Promise.allSettled(this.finalising);
   }
 

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { cursorParam, toPage } from './cursor.js';
 
-const position = cursorParam(z.object({ sku: z.string() }));
+const position = cursorParam(z.object({ sku: z.string() }), 100);
 
 describe('toPage', () => {
   const skuOf = (sku: string) => ({ sku });

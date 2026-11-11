@@ -5,11 +5,9 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Readable } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { StorageModule } from '../../src/storage/storage.module.js';
 import { StorageService } from '../../src/storage/storage.service.js';
-import { workerEnvSchema } from '../../src/config/env.schema.js';
+import { createTestModule } from '../support/db.js';
 import {
   DownloadFailedError,
   GuardedDownloader,
@@ -246,6 +244,47 @@ describe('the guarded download', () => {
       );
     });
 
+    // Told apart, the two answers would let a seller list which internal names
+    // exist, one URL at a time.
+    it('answers a name that does not exist as it answers a private one', async () => {
+      const url = 'http://db.internal.example.com/a.png';
+      const resolvingTo = (
+        answer: (hostname: string) => [Error | null, LookupAddress[]],
+      ) =>
+        ((
+          hostname: string,
+          _options: object,
+          done: (error: Error | null, found: LookupAddress[]) => void,
+        ) =>
+          done(
+            ...answer(hostname),
+          )) as unknown as typeof import('node:dns').lookup;
+
+      const missing = await failure(
+        new GuardedDownloader({
+          // As getaddrinfo reports a name nobody has registered.
+          lookup: resolvingTo((hostname) => [
+            Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), {
+              code: 'ENOTFOUND',
+              hostname,
+            }),
+            [],
+          ]),
+        }).download(url, limits),
+      );
+      const internal = await failure(
+        new GuardedDownloader({
+          lookup: resolvingTo(() => [
+            null,
+            [{ address: '10.0.0.5', family: 4 }],
+          ]),
+        }).download(url, limits),
+      );
+
+      expect(missing.message).toBe(internal.message);
+      expect(missing.permanent).toBe(true);
+    });
+
     it.each([
       ['ftp://example.com/a.png', /ftp: is not http or https/],
       ['file:///etc/passwd', /file: is not http or https/],
@@ -263,19 +302,7 @@ describe('the guarded download', () => {
   // The whole real path once: public DNS, TLS, and the lookup that checks the
   // addresses it connects to.
   it('downloads from a real public host under the real rule', async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-          validationSchema: workerEnvSchema,
-        }),
-        StorageModule,
-      ],
-    }).compile();
-
-    await moduleRef.init();
+    const moduleRef = await createTestModule({ imports: [StorageModule] });
 
     const storage = moduleRef.get(StorageService);
     const key = `fixtures/${randomUUID()}.png`;
@@ -285,7 +312,7 @@ describe('the guarded download', () => {
       downloadAs: 'fixture.png',
     });
 
-    const url = await storage.signDownload(key, 60);
+    const { url } = await storage.signDownload(key, 60);
 
     expect(await new GuardedDownloader().download(url, limits)).toEqual({
       body: IMAGE,

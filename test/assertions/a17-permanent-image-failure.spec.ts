@@ -9,6 +9,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import sharp from 'sharp';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
+import { deleteProductImages } from '../support/product-images.js';
 
 const FIXTURES = ['photo.png', 'page.html', 'broken.png'];
 
@@ -61,14 +62,16 @@ describe('A17 · a permanent image failure costs one attempt, not the budget', (
   });
 
   afterAll(async () => {
-    await Promise.all(
-      FIXTURES.map((name) =>
+    // After the processes stop, so no worker writes an image behind it.
+    await harness.stop();
+    await Promise.all([
+      ...FIXTURES.map((name) =>
         s3.send(
           new DeleteObjectCommand({ Bucket: bucket, Key: `${folder}/${name}` }),
         ),
       ),
-    );
-    await harness.stop();
+      deleteProductImages(s3, bucket, account.id),
+    ]);
   });
 
   it('marks each unusable image FAILED and succeeds on the first attempt', async () => {

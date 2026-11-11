@@ -1,26 +1,32 @@
 import 'dotenv/config';
-import { randomUUID } from 'node:crypto';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { crc32 } from 'node:zlib';
 import { ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import sharp from 'sharp';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { StorageModule } from '../../src/storage/storage.module.js';
 import { StorageService } from '../../src/storage/storage.service.js';
-import { productImageKey } from '../../src/storage/object-keys.js';
+import {
+  productImageKey,
+  productImagesPrefix,
+} from '../../src/storage/object-keys.js';
 import { ProductsModule } from '../../src/products/products.module.js';
 import { ProductsService } from '../../src/products/products.service.js';
 import { OutboundModule } from '../../src/outbound/outbound.module.js';
 import { GuardedDownloader } from '../../src/outbound/guarded-download.js';
 import { ImageProcessJobHandler } from '../../src/jobs/handlers/image-process.handler.js';
 import { JobCancelledError } from '../../src/jobs/job-handler.js';
+import { RetryableJobError } from '../../src/common/errors/app-error.js';
 import { recordingContext } from '../../src/jobs/job-context.fixture.js';
-import { workerEnvSchema } from '../../src/config/env.schema.js';
+import { deleteProductImages } from '../support/product-images.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+} from '../support/db.js';
 
 const png = (width: number, height: number) =>
   sharp({
@@ -33,6 +39,8 @@ const png = (width: number, height: number) =>
 // bucket — with images served from this test's own server, which only the
 // test's downloader may reach.
 describe('the image.process handler', () => {
+  const s3 = new S3Client({ region: process.env.AWS_REGION });
+  const bucket = process.env.S3_BUCKET!;
   let prisma: PrismaService;
   let storage: StorageService;
   let products: ProductsService;
@@ -53,16 +61,11 @@ describe('the image.process handler', () => {
   const onRequest = new Map<string, () => Promise<void>>();
 
   const store = async () => {
-    const user = await prisma.user.create({
-      data: {
-        email: `images-${randomUUID()}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
+    const userId = await createThrowawayUser(prisma, 'images');
 
-    users.push(user.id);
+    users.push(userId);
 
-    return user.id;
+    return userId;
   };
 
   const product = (userId: string, sku: string, imageUrl: string | null) =>
@@ -80,7 +83,7 @@ describe('the image.process handler', () => {
   const run = (
     userId: string,
     skus: string[],
-    options: { stopAfterChecks?: number } = {},
+    options: Parameters<typeof recordingContext>[0] = {},
   ) => {
     const recorded = recordingContext({ userId, ...options });
 
@@ -179,31 +182,19 @@ describe('the image.process handler', () => {
 
     base = `http://127.0.0.1:${port}`;
 
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-          validationSchema: workerEnvSchema,
-        }),
-        PrismaModule,
-        StorageModule,
-        ProductsModule,
-        OutboundModule,
-      ],
-      providers: [ImageProcessJobHandler],
-    })
-      .overrideProvider(GuardedDownloader)
-      .useValue(
-        new GuardedDownloader({
-          isAllowed: (address) => address === '127.0.0.1',
-          ports: ['', String(port)],
-        }),
-      )
-      .compile();
-
-    await moduleRef.init();
+    const moduleRef = await createTestModule(
+      {
+        imports: [PrismaModule, StorageModule, ProductsModule, OutboundModule],
+        providers: [ImageProcessJobHandler],
+      },
+      (builder) =>
+        builder.overrideProvider(GuardedDownloader).useValue(
+          new GuardedDownloader({
+            isAllowed: (address) => address === '127.0.0.1',
+            ports: ['', String(port)],
+          }),
+        ),
+    );
 
     prisma = moduleRef.get(PrismaService);
     storage = moduleRef.get(StorageService);
@@ -212,7 +203,10 @@ describe('the image.process handler', () => {
   });
 
   afterAll(async () => {
-    await prisma.user.deleteMany({ where: { id: { in: users } } });
+    await Promise.all(
+      users.map((userId) => deleteProductImages(s3, bucket, userId)),
+    );
+    await deleteUsers(prisma, users);
     await prisma.$disconnect();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
@@ -311,10 +305,10 @@ describe('the image.process handler', () => {
     const cup = await product(userId, 'CUP', `${base}${path}`);
     const filesOf = async () =>
       (
-        await new S3Client({ region: process.env.AWS_REGION }).send(
+        await s3.send(
           new ListObjectsV2Command({
-            Bucket: process.env.S3_BUCKET,
-            Prefix: `products/${userId}/${cup.id}/`,
+            Bucket: bucket,
+            Prefix: `${productImagesPrefix(userId)}${cup.id}/`,
           }),
         )
       ).KeyCount;
@@ -504,6 +498,8 @@ describe('the image.process handler', () => {
       await expect(first.result).rejects.toThrow(
         '1 of 2 images could not be downloaded this time (The server answered 503)',
       );
+      // Not a plain Error: the owner is shown this message, not "Internal error".
+      await expect(first.result).rejects.toBeInstanceOf(RetryableJobError);
       expect(first.reports.at(-1)).toEqual({ processed: 2, total: 2 });
       expect(await statuses(userId)).toEqual([
         ['A-DOWN', null],
@@ -517,6 +513,33 @@ describe('the image.process handler', () => {
         alreadyReady: 1,
       });
       expect(hits.get(up)).toBe(1);
+    });
+
+    // No retry is coming after the last attempt, so nothing would ever finish a
+    // product left PENDING there.
+    it('records a host still down on the last attempt as FAILED, and succeeds', async () => {
+      const userId = await store();
+      const down = `/small.png?still-down=${userId}`;
+      const up = `/small.png?still-up=${userId}`;
+
+      images.set(down, images.get('/small.png')!);
+      images.set(up, images.get('/small.png')!);
+      answers.set(down, { status: 503 });
+      await product(userId, 'A-DOWN', `${base}${down}`);
+      await product(userId, 'B-UP', `${base}${up}`);
+
+      expect(
+        await run(userId, ['A-DOWN', 'B-UP'], { attempt: 5, lastAttempt: true })
+          .result,
+      ).toMatchObject({ processed: 1, failed: 1 });
+      expect(
+        await prisma.product.findFirstOrThrow({
+          where: { userId, sku: 'A-DOWN' },
+        }),
+      ).toMatchObject({
+        imageStatus: 'FAILED',
+        imageError: 'Gave up after 5 attempts: The server answered 503',
+      });
     });
 
     it('tries a FAILED product again, for a file fixed behind the same URL', async () => {

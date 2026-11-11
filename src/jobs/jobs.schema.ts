@@ -3,6 +3,8 @@ import { JobStatus } from '../generated/prisma/enums.js';
 import { DEAD_LETTER_CODES } from './job-error-codes.js';
 import { UPLOAD_KEY_PATTERN } from '../storage/object-keys.js';
 import { cursorParam, limitParam } from '../common/pagination/cursor.js';
+import { storableText } from '../common/validation/storable-text.js';
+import { SKU_MAX_LENGTH } from '../products/products.schema.js';
 
 // The payload schemas tolerate unknown keys: the worker re-parses the stored
 // payload (§6.4), and a job written by a newer deploy can reach an older worker.
@@ -12,8 +14,9 @@ import { cursorParam, limitParam } from '../common/pagination/cursor.js';
 export const mockPayloadSchema = z.object({
   durationMs: z.coerce.number().int().min(0).max(60_000).default(10),
   failureRate: z.coerce.number().min(0).max(1).default(0),
-  // Splits the sleep into reporting intervals: a mock job is the only job that
-  // can exercise progress until the CSV import exists (PB).
+  // Splits the sleep into reporting intervals. Real jobs report too, but only a
+  // mock job reports at a rate and timing a test can choose, which A12 and A12b
+  // depend on.
   steps: z.coerce.number().int().min(1).max(100).default(1),
 });
 
@@ -29,12 +32,15 @@ export const importCsvPayloadSchema = z.object({
 // 20 000 jobs, and not the whole catalog, where one slow image would hold up
 // every other. Which of the skus are the caller's is the handler's to find out.
 export const imageProcessPayloadSchema = z.object({
-  skus: z.array(z.string().trim().min(1).max(100)).min(1).max(50),
+  skus: z
+    .array(storableText().trim().min(1).max(SKU_MAX_LENGTH))
+    .min(1)
+    .max(50),
 });
 
 export const chargePayloadSchema = z.object({
   amountCents: z.coerce.number().int().positive(),
-  reference: z.string().min(1).max(200),
+  reference: storableText().min(1).max(200),
   delayMs: z.coerce.number().int().min(0).max(60_000).default(0),
 });
 
@@ -84,6 +90,14 @@ export const JOB_TYPES: readonly JobType[] = submitJobSchema.options.map(
   (option) => option.shape.type.value,
 );
 
+// Every instant a client sends, read one way. A timezone is required, not
+// assumed: "re-drive what died between 02:00 and
+// 03:00" is off by hours if the server and the operator disagree on which 02:00.
+// z.coerce.date() would also accept "1" and read it as the year 2001.
+const instant = z.iso
+  .datetime({ offset: true })
+  .transform((value) => new Date(value));
+
 export const listJobsSchema = z
   .object({
     // From the generated enum rather than a literal list: adding CANCELLED
@@ -94,19 +108,14 @@ export const listJobsSchema = z
     // The last job a page held, by the two values the list is ordered on.
     cursor: cursorParam(
       z.object({
-        createdAt: z.iso.datetime().pipe(z.coerce.date()),
+        createdAt: instant,
         id: z.uuid(),
       }),
+      // An ISO instant and a uuid.
+      24 + 36,
     ).optional(),
   })
   .strict();
-
-// A timezone is required, not assumed: "re-drive what died between 02:00 and
-// 03:00" is off by hours if the server and the operator disagree on which 02:00.
-// z.coerce.date() would also accept "1" and read it as the year 2001.
-const instant = z.iso
-  .datetime({ offset: true })
-  .transform((value) => new Date(value));
 
 export const bulkRedriveSchema = z
   .object({

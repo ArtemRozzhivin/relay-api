@@ -5,6 +5,7 @@ import { JobEventsPublisher } from './job-events.publisher.js';
 import type { JobContext } from './job-context.js';
 import { JobCancelledError } from './job-handler.js';
 import { readProgress, type JobProgress } from './job-progress.js';
+import { describeError } from '../common/errors/describe-error.js';
 
 // Below any real count, so a handler's first report of `processed: 0` — the one
 // that publishes the total before any work lands — is not mistaken for a repeat.
@@ -16,12 +17,15 @@ const NOTHING_REPORTED = -1;
 // a second at best and is read ten times. 500ms keeps a bar visibly alive at 2Hz
 // while collapsing a tight loop into almost nothing. The final report is exempt,
 // which is what flush() is for.
-const REPORT_WINDOW_MS = 500;
+export const REPORT_WINDOW_MS = 500;
 
 interface RunningJob {
   jobId: string;
   userId: string;
   attempt: number;
+
+  /** Whether a failure of this attempt dead-letters the job; never, by default. */
+  lastAttempt?: boolean;
 
   /** The ownership token claim() handed this delivery; every write carries it. */
   lease: number;
@@ -30,6 +34,9 @@ interface RunningJob {
   /** What the row already says, so a retry neither re-reports nor erases it. */
   progress: Prisma.JsonValue | null;
   checkpoint: Prisma.JsonValue | null;
+
+  /** Whether the worker running it is shutting down; never, by default. */
+  stopping?: () => boolean;
 }
 
 /**
@@ -43,6 +50,28 @@ export interface ManagedJobContext extends JobContext {
 }
 
 class RunningJobContext implements ManagedJobContext {
+  readonly jobId: string;
+  readonly userId: string;
+  readonly attempt: number;
+  readonly lastAttempt: boolean;
+  readonly checkpoint: Prisma.JsonValue | null;
+  private readonly lease: number;
+  private readonly correlationId: string;
+  private readonly stopping: () => boolean;
+
+  // The highest count accepted so far, and the last `total`/`message` seen —
+  // both seeded from the claimed row. The seed spares the database the writes
+  // a retry would redo, and keeps a report that omits `total` from erasing the
+  // one an earlier batch published, since a write replaces the whole column.
+  private reported: number;
+  private carried: Partial<JobProgress>;
+
+  // Set when the claimed row held a progress value this version cannot read,
+  // which a write must say so it is not refused by a comparison against a
+  // value that is not a number. Cleared only once a write lands: one that
+  // failed changed nothing, so the next must say it again.
+  private reclaim: boolean;
+
   // The write in flight, if any. Never more than one: the SQL predicate rejects
   // a *stale* attempt but cannot order two writes from the live one, and a
   // second write sent while the first is slow is how a backlog starts — each
@@ -62,27 +91,29 @@ class RunningJobContext implements ManagedJobContext {
 
   private window?: NodeJS.Timeout;
 
+  // The job as one named object: attempt and lease are both numbers, and as
+  // positional parameters a swap of the two would still compile.
   constructor(
-    readonly jobId: string,
-    readonly userId: string,
-    readonly attempt: number,
-    readonly checkpoint: Prisma.JsonValue | null,
-    private readonly lease: number,
-    private readonly correlationId: string,
-    // The highest count accepted so far, and the last `total`/`message` seen —
-    // both seeded from the claimed row. The seed spares the database the writes
-    // a retry would redo, and keeps a report that omits `total` from erasing the
-    // one an earlier batch published, since a write replaces the whole column.
-    private reported: number,
-    private carried: Partial<JobProgress>,
-    // Set when the claimed row held a progress value this version cannot read,
-    // which the first write must say so it is not refused by a comparison
-    // against a value that is not a number. Cleared once that write is queued.
-    private reclaim: boolean,
+    job: Required<RunningJob>,
     private readonly transitions: JobTransitionService,
     private readonly events: JobEventsPublisher,
     private readonly logger: Logger,
-  ) {}
+  ) {
+    this.jobId = job.jobId;
+    this.userId = job.userId;
+    this.attempt = job.attempt;
+    this.lastAttempt = job.lastAttempt;
+    this.checkpoint = job.checkpoint;
+    this.lease = job.lease;
+    this.correlationId = job.correlationId;
+    this.stopping = job.stopping;
+
+    const stored = readProgress(job.progress);
+
+    this.reported = stored.processed ?? NOTHING_REPORTED;
+    this.carried = stored;
+    this.reclaim = job.progress !== null && stored.processed === undefined;
+  }
 
   reportProgress(progress: JobProgress) {
     if (progress.processed >= this.reported) {
@@ -122,8 +153,25 @@ class RunningJobContext implements ManagedJobContext {
     return committed.value;
   }
 
+  async commitEffect<T>(work: (tx: Prisma.TransactionClient) => Promise<T>) {
+    const committed = await this.transitions.commitEffect(
+      this.jobId,
+      this.lease,
+      work,
+    );
+
+    if (!committed) {
+      throw new JobCancelledError();
+    }
+
+    return committed.value;
+  }
+
   async shouldStop() {
-    return !(await this.transitions.isWanted(this.jobId, this.lease));
+    return (
+      this.stopping() ||
+      !(await this.transitions.isWanted(this.jobId, this.lease))
+    );
   }
 
   log(message: string) {
@@ -156,13 +204,10 @@ class RunningJobContext implements ManagedJobContext {
   }
 
   private send(progress: JobProgress) {
-    const reclaim = this.reclaim;
-
-    this.reclaim = false;
     this.inFlight = true;
 
     // write() never rejects, so the window is sure to open.
-    this.pending = this.write(progress, reclaim).finally(() => {
+    this.pending = this.write(progress).finally(() => {
       this.inFlight = false;
 
       if (!this.draining) {
@@ -200,13 +245,13 @@ class RunningJobContext implements ManagedJobContext {
   // Never rejects. Progress is presentational (D25), so losing a write must not
   // fail the job — and a handler may report without awaiting, where a rejection
   // would become an unhandled rejection and take the whole worker down.
-  private async write(progress: JobProgress, reclaim: boolean) {
+  private async write(progress: JobProgress) {
     try {
       const written = await this.transitions.reportProgress(
         this.jobId,
         this.lease,
         progress,
-        { reclaim },
+        { reclaim: this.reclaim },
       );
 
       if (!written) {
@@ -222,15 +267,16 @@ class RunningJobContext implements ManagedJobContext {
         return;
       }
 
+      // The column now holds a value this version wrote.
+      this.reclaim = false;
+
       // Built from the row the write returned, never from what the handler
       // reported: an event that describes a state the database does not hold
       // cannot be un-sent (§9.2a).
       await this.events.jobUpdated(written);
     } catch (error) {
       this.logger.warn(
-        `${this.prefix} could not write progress: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `${this.prefix} could not write progress: ${describeError(error)}`,
       );
     }
   }
@@ -248,26 +294,12 @@ export class JobContextFactory {
   ) {}
 
   create({
-    jobId,
-    userId,
-    attempt,
-    lease,
-    correlationId,
-    progress,
-    checkpoint,
+    lastAttempt = false,
+    stopping = () => false,
+    ...job
   }: RunningJob): ManagedJobContext {
-    const stored = readProgress(progress);
-
     return new RunningJobContext(
-      jobId,
-      userId,
-      attempt,
-      checkpoint,
-      lease,
-      correlationId,
-      stored.processed ?? NOTHING_REPORTED,
-      stored,
-      progress !== null && stored.processed === undefined,
+      { ...job, lastAttempt, stopping },
       this.transitions,
       this.events,
       this.logger,

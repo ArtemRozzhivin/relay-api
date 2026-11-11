@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { PrismaService } from '../../prisma/prisma.service.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { JobHandler } from '../job-handler.js';
 import type { JobContext } from '../job-context.js';
@@ -12,10 +11,6 @@ export class ChargeJobHandler extends JobHandler<PayloadOf<'CHARGE'>> {
 
   protected readonly payloadSchema = chargePayloadSchema;
 
-  constructor(private readonly prisma: PrismaService) {
-    super();
-  }
-
   protected async execute(context: JobContext, payload: PayloadOf<'CHARGE'>) {
     // Keyed on the job id, not on the client's idempotency key: a redelivery
     // of this job has to find the same row, while two different jobs must
@@ -24,17 +19,22 @@ export class ChargeJobHandler extends JobHandler<PayloadOf<'CHARGE'>> {
     const effectKey = `${context.jobId}:charge`;
 
     try {
-      await this.prisma.sideEffect.create({
-        data: {
-          effectKey,
-          jobId: context.jobId,
-          kind: 'charge',
-          detail: {
-            amountCents: payload.amountCents,
-            reference: payload.reference,
+      // Through commitEffect, not a bare insert: the row is written only while
+      // this attempt still owns the job, and the job is marked in the same
+      // transaction, so no cancel can finish it once the money has moved.
+      await context.commitEffect((tx) =>
+        tx.sideEffect.create({
+          data: {
+            effectKey,
+            jobId: context.jobId,
+            kind: 'charge',
+            detail: {
+              amountCents: payload.amountCents,
+              reference: payload.reference,
+            },
           },
-        },
-      });
+        }),
+      );
     } catch (error) {
       // The unique index is the guard, not a SELECT before the insert: a
       // concurrent redelivery would pass that read and charge twice. Losing

@@ -1,12 +1,15 @@
 import 'dotenv/config';
-import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import type { Prisma } from '../../src/generated/prisma/client.js';
 import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+  seedJob,
+} from '../support/db.js';
 
 // A checkpoint is only worth resuming from if it describes exactly the work
 // that committed: never more, or a resume skips rows nobody wrote; never less
@@ -17,15 +20,7 @@ describe('the checkpoint transaction', () => {
   let userId: string;
 
   const claimedJob = async () => {
-    const job = await prisma.job.create({
-      data: {
-        userId,
-        type: 'import.csv',
-        payload: {},
-        idempotencyKey: `checkpoint-${randomUUID()}`,
-        correlationId: 'checkpoint',
-      },
-    });
+    const job = await seedJob(prisma, { userId, type: 'import.csv' });
     const claimed = await transitions.claim(job.id);
 
     return { jobId: job.id, lease: claimed!.lease };
@@ -49,35 +44,19 @@ describe('the checkpoint transaction', () => {
     (await prisma.job.findUniqueOrThrow({ where: { id: jobId } })).checkpoint;
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-        }),
-        PrismaModule,
-      ],
+    const moduleRef = await createTestModule({
+      imports: [PrismaModule],
       providers: [JobTransitionService],
-    }).compile();
-
-    await moduleRef.init();
+    });
 
     prisma = moduleRef.get(PrismaService);
     transitions = moduleRef.get(JobTransitionService);
 
-    const user = await prisma.user.create({
-      data: {
-        email: `checkpoint-${randomUUID()}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
-
-    userId = user.id;
+    userId = await createThrowawayUser(prisma, 'checkpoint');
   });
 
   afterAll(async () => {
-    await prisma.user.delete({ where: { id: userId } });
+    await deleteUsers(prisma, [userId]);
     await prisma.$disconnect();
   });
 
@@ -152,7 +131,10 @@ describe('the checkpoint transaction', () => {
         async () => 0,
         () => ({ records: 1000 }),
       );
-      await transitions.deadLetter(jobId, lease, { code: 'TEST' });
+      await transitions.deadLetter(jobId, lease, {
+        code: 'TERMINAL_FAILURE',
+        message: 'test',
+      });
 
       return jobId;
     };

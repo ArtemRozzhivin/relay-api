@@ -8,12 +8,7 @@ import {
   toStoredProgress,
   type JobProgress,
 } from './job-progress.js';
-
-const TERMINAL: readonly JobStatus[] = [
-  'SUCCEEDED',
-  'DEAD_LETTERED',
-  'CANCELLED',
-];
+import type { AttemptFailedError, DeadLetterError } from './job-error-codes.js';
 
 const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
 
@@ -53,10 +48,6 @@ interface MoveOptions {
 export class JobTransitionService {
   constructor(private readonly prisma: PrismaService) {}
 
-  isTerminal(status: JobStatus) {
-    return TERMINAL.includes(status);
-  }
-
   private async move(
     jobId: string,
     from: JobStatus[],
@@ -86,10 +77,14 @@ export class JobTransitionService {
   // any later claim has moved it on — in this life or a re-driven one, since
   // nothing resets it. A worker whose lease is stale lost the job while it was
   // still running, and must not write over whoever holds it now.
+  //
+  // RUNNING only. A QUEUED row this lease still matches has been re-driven
+  // since, and the re-drive's own delivery will run it: a stale worker
+  // finishing it would refuse that delivery its claim.
   succeed(jobId: string, lease: number, result: Prisma.InputJsonValue) {
     return this.move(
       jobId,
-      NOT_FINISHED,
+      ['RUNNING'],
       {
         status: 'SUCCEEDED',
         result,
@@ -100,7 +95,7 @@ export class JobTransitionService {
     );
   }
 
-  requeueForRetry(jobId: string, lease: number, error: Prisma.InputJsonValue) {
+  requeueForRetry(jobId: string, lease: number, error: AttemptFailedError) {
     return this.move(
       jobId,
       ['RUNNING'],
@@ -109,10 +104,10 @@ export class JobTransitionService {
     );
   }
 
-  deadLetter(jobId: string, lease: number, error: Prisma.InputJsonValue) {
+  deadLetter(jobId: string, lease: number, error: DeadLetterError) {
     return this.move(
       jobId,
-      NOT_FINISHED,
+      ['RUNNING'],
       { status: 'DEAD_LETTERED', error, finishedAt: new Date() },
       { where: { lease } },
     );
@@ -123,8 +118,10 @@ export class JobTransitionService {
   // to 0, so this cannot overwrite a job an operator has just re-driven. It
   // could overwrite one a worker has also claimed since — which needs a
   // re-drive and a claim to land between the queue failing the job and this
-  // write, a window of milliseconds.
-  abandon(jobId: string, error: Prisma.InputJsonValue) {
+  // write, a window of milliseconds. A job no attempt ever claimed — every
+  // delivery failed before the claim, with Postgres unreachable, say — is
+  // refused too, and left to the sweep (§7.6).
+  abandon(jobId: string, error: DeadLetterError) {
     return this.move(
       jobId,
       NOT_FINISHED,
@@ -133,15 +130,26 @@ export class JobTransitionService {
     );
   }
 
-  // The sweep found a RUNNING row whose queue entry is finished or gone (§7.6).
-  // The lease pins the delivery it inspected, so a job claimed again since the
-  // sweep read it is not finished on stale evidence.
-  abandonStranded(jobId: string, lease: number, error: Prisma.InputJsonValue) {
+  // The sweep found an unfinished row whose queue entry is finished or gone
+  // (§7.6). The write is pinned to everything the sweep read, so nothing is
+  // finished on stale evidence: the status; the lease, which any claim since
+  // has moved on; and the delivery, because a re-drive puts a row back to
+  // QUEUED under the same lease, with a newer outbox row of its own.
+  abandonStranded(
+    jobId: string,
+    seen: { status: JobStatus; lease: number; outboxId: bigint },
+    error: DeadLetterError,
+  ) {
     return this.move(
       jobId,
-      ['RUNNING'],
+      [seen.status],
       { status: 'DEAD_LETTERED', error, finishedAt: new Date() },
-      { where: { lease } },
+      {
+        where: {
+          lease: seen.lease,
+          outbox: { none: { id: { gt: seen.outboxId } } },
+        },
+      },
     );
   }
 
@@ -206,14 +214,16 @@ export class JobTransitionService {
   /**
    * Finishes a cancellation nobody is running: `QUEUED` only. A `RUNNING` job is
    * never cancelled from outside, because its handler may be mid-effect and only
-   * the worker can see when it has reached a point where stopping is safe.
+   * the worker can see when it has reached a point where stopping is safe. Nor
+   * is a job whose effect has committed — waiting for a retry after the charge
+   * went through, say — which only its handler may finish, as a success.
    */
   cancelQueued(jobId: string) {
     return this.move(
       jobId,
       ['QUEUED'],
       { status: 'CANCELLED', finishedAt: new Date() },
-      { where: { cancelRequested: true } },
+      { where: { cancelRequested: true, effectCommitted: false } },
     );
   }
 
@@ -222,16 +232,31 @@ export class JobTransitionService {
    * retry scheduled after the request, or by a redelivery after the worker that
    * was running it died — neither should run the handler again.
    *
-   * No attempt token: nothing has been claimed yet. The flag is the guard, and
-   * a re-drive clears it, so this cannot cancel a job an operator has just
-   * re-driven.
+   * No lease: this delivery has claimed nothing, and an earlier attempt that
+   * did is gone or has lost the job. The flag is the guard, and a re-drive
+   * clears it, so this cannot cancel a job an operator has just re-driven. A
+   * job whose effect has committed is refused: no handler runs here to see it,
+   * and the delivery goes on to claim it, where the handler finds the effect
+   * and finishes the job as the success it is.
    */
   cancelBeforeClaim(jobId: string) {
     return this.move(
       jobId,
       NOT_FINISHED,
       { status: 'CANCELLED', finishedAt: new Date() },
-      { where: { cancelRequested: true } },
+      { where: { cancelRequested: true, effectCommitted: false } },
+    );
+  }
+
+  // The worker is shutting down, not failing: the attempt stopped at a safe
+  // point, so it is handed back rather than counted against the budget, and
+  // the next worker resumes the job from what it committed.
+  release(jobId: string, lease: number) {
+    return this.move(
+      jobId,
+      ['RUNNING'],
+      { status: 'QUEUED', attempts: { decrement: 1 } },
+      { where: { lease } },
     );
   }
 
@@ -280,11 +305,46 @@ export class JobTransitionService {
    * @returns `{ value }` holding what `work` returned, or `null` when this
    * attempt no longer owns the job and nothing was written.
    */
-  async commitCheckpoint<T>(
+  commitCheckpoint<T>(
     jobId: string,
     lease: number,
     work: (tx: Prisma.TransactionClient) => Promise<T>,
     checkpoint: (value: T) => Prisma.InputJsonValue,
+  ) {
+    return this.commitWith(jobId, lease, work, (value) => ({
+      checkpoint: checkpoint(value),
+    }));
+  }
+
+  /**
+   * Runs `work` — the job's one irreversible effect — and marks the job
+   * `effectCommitted` in one transaction. The mark is a column of the job row
+   * rather than "a ledger row exists" because a cancel waiting on the row's
+   * lock re-checks only that row: it would not see the new ledger row, and
+   * would cancel a job whose effect it was waiting on.
+   *
+   * Guarded by the lease: an attempt that lost the job — to a redelivery that
+   * cancelled it, say — has its effect rolled back.
+   *
+   * @returns `{ value }` holding what `work` returned, or `null` when this
+   * attempt no longer owns the job and nothing was written.
+   * @throws whatever `work` throws, the transaction rolled back.
+   */
+  commitEffect<T>(
+    jobId: string,
+    lease: number,
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+  ) {
+    return this.commitWith(jobId, lease, work, () => ({
+      effectCommitted: true,
+    }));
+  }
+
+  private async commitWith<T>(
+    jobId: string,
+    lease: number,
+    work: (tx: Prisma.TransactionClient) => Promise<T>,
+    mark: (value: T) => Prisma.JobUpdateManyMutationInput,
   ): Promise<{ value: T } | null> {
     try {
       return await this.prisma.$transaction(async (tx) => {
@@ -293,12 +353,10 @@ export class JobTransitionService {
         // Written after the work, not before: the job row stays locked from
         // here to the commit, and a progress write or a cancel request queued
         // behind that lock should wait for one statement, not the whole batch.
-        const saved = await this.move(
-          jobId,
-          ['RUNNING'],
-          { checkpoint: checkpoint(value) },
-          { client: tx, where: { lease } },
-        );
+        const saved = await this.move(jobId, ['RUNNING'], mark(value), {
+          client: tx,
+          where: { lease },
+        });
 
         if (!saved) {
           throw new CheckpointRefused();

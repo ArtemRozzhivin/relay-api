@@ -1,25 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { io, type Socket } from 'socket.io-client';
-import { RelayHarness, type Account } from '../harness/relay-harness.js';
+import {
+  RelayHarness,
+  type Account,
+  type JobEvent,
+} from '../harness/relay-harness.js';
 import { readProgress } from '../../src/jobs/job-progress.js';
-
-interface JobEvent {
-  id: string;
-  status: string;
-  progress?: unknown;
-}
-
-const connect = (baseUrl: string, token: string) =>
-  new Promise<Socket>((resolve, reject) => {
-    const socket = io(`${baseUrl}/events`, {
-      auth: { token },
-      transports: ['websocket'],
-      reconnection: false,
-    });
-
-    socket.on('connect', () => resolve(socket));
-    socket.on('connect_error', reject);
-  });
+import { REPORT_WINDOW_MS } from '../../src/jobs/job-context.factory.js';
 
 // A12b — the throttle's two halves, end to end rather than against fake
 // timers: a handler reporting far faster than the window must not flood the
@@ -28,7 +14,6 @@ const connect = (baseUrl: string, token: string) =>
 describe('A12b · progress is rate-limited but never loses its last value', () => {
   let harness: RelayHarness;
   let account: Account;
-  const sockets: Socket[] = [];
 
   beforeAll(async () => {
     harness = await RelayHarness.create();
@@ -37,17 +22,10 @@ describe('A12b · progress is rate-limited but never loses its last value', () =
     account = await harness.signUp('a12b');
   });
 
-  afterAll(async () => {
-    for (const socket of sockets) {
-      socket.close();
-    }
-
-    await harness.stop();
-  });
+  afterAll(() => harness.stop());
 
   it('coalesces a report per 50ms into a handful of events', async () => {
-    const socket = await connect(harness.baseUrl, account.token);
-    sockets.push(socket);
+    const socket = await harness.connectEvents(account.token);
 
     const seen: JobEvent[] = [];
     socket.on('job.updated', (job: JobEvent) => seen.push(job));
@@ -92,7 +70,9 @@ describe('A12b · progress is rate-limited but never loses its last value', () =
     });
   });
 
-  it('keeps the final value exact when every report lands in one window', async () => {
+  it('keeps the final value exact when every report lands in one window', async ({
+    skip,
+  }) => {
     const STEPS = 100;
 
     const { body } = await harness.submit(account, {
@@ -108,12 +88,24 @@ describe('A12b · progress is rate-limited but never loses its last value', () =
     // 100 reports as fast as the handler can make them — about 200 ms, since
     // each step reads the row for shouldStop() — so all but the first land
     // inside one window and only the processor's flush gets the last one out.
-    // On a machine slow enough to take past 500 ms, the window's timer would
-    // send it instead and this case would stop proving the flush.
     expect(terminal.status).toBe('SUCCEEDED');
     expect(readProgress(terminal.progress)).toEqual({
       processed: STEPS,
       total: STEPS,
     });
+
+    // The window opens after the claim and the first write, and the job
+    // finished after the flush. Inside one window, then, the window's timer
+    // never fired, and the flush is the only thing that can have written the
+    // last value. Any slower, and the timer may have written it instead: the
+    // value proves nothing about the flush, so the case is inconclusive
+    // rather than passed.
+    const ranMs =
+      terminal.finishedAt!.getTime() - terminal.startedAt!.getTime();
+
+    skip(
+      ranMs >= REPORT_WINDOW_MS,
+      `inconclusive: the job ran ${ranMs} ms, past the ${REPORT_WINDOW_MS} ms window, so the timer may have sent the last value`,
+    );
   });
 });

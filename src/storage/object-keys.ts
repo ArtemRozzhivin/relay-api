@@ -17,6 +17,9 @@ export const mintUploadKey = (userId: string) =>
 export const UPLOAD_KEY_PATTERN =
   /^uploads\/[0-9a-f-]{36}\/[0-9a-f-]{36}\.csv$/;
 
+/** Where every image made for an account's products lives. */
+export const productImagesPrefix = (userId: string) => `products/${userId}/`;
+
 /**
  * Where one size of a product's image lives. Under the URL it was made from as
  * well as the product: a slow job still working on a URL the seller has since
@@ -30,7 +33,7 @@ export const productImageKey = (
   sourceUrl: string,
   size: string,
 ) =>
-  `products/${userId}/${productId}/${createHash('sha256')
+  `${productImagesPrefix(userId)}${productId}/${createHash('sha256')
     .update(sourceUrl)
     .digest('hex')
     .slice(0, 16)}/${size}.webp`;

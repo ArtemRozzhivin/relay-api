@@ -36,6 +36,12 @@ export interface UploadSlip {
   expiresAt: Date;
 }
 
+/** A signed link that downloads one object until `expiresAt`. */
+export interface DownloadLink {
+  url: string;
+  expiresAt: Date;
+}
+
 @Injectable()
 export class StorageService implements OnModuleInit, OnModuleDestroy {
   private readonly client: S3Client;
@@ -94,6 +100,8 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
   /**
    * Whether an object exists. Only a 404 answers `false`: a permissions or
    * network failure is not an absent file, and must not be reported as one.
+   * S3 answers 404 for a missing key only to a principal allowed
+   * `s3:ListBucket`; to any other it answers 403, which this throws (§13.4).
    */
   async exists(key: string) {
     try {
@@ -148,6 +156,7 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
 
       return { body, etag: ETag };
     } catch (error) {
+      // Like exists(): NoSuchKey needs s3:ListBucket, or a missing key is a 403.
       if (error instanceof NoSuchKey) {
         return 'missing';
       }
@@ -192,11 +201,20 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** A link that downloads one object until it expires. */
-  signDownload(key: string, expiresInSeconds: number) {
-    return getSignedUrl(
+  async signDownload(
+    key: string,
+    expiresInSeconds: number,
+  ): Promise<DownloadLink> {
+    // Taken before signing, like an upload slip's, so the time a client is
+    // told is never later than the one S3 holds the link to.
+    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
+
+    const url = await getSignedUrl(
       this.client,
       new GetObjectCommand({ Bucket: this.bucket, Key: key }),
       { expiresIn: expiresInSeconds },
     );
+
+    return { url, expiresAt };
   }
 }

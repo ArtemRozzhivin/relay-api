@@ -1,11 +1,15 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
 import type { JobStatus } from '../../src/generated/prisma/enums.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+  seedJob,
+} from '../support/db.js';
 
 // Every cancellation transition is a guarded update whose WHERE clause is the
 // whole of its correctness, so each one is asserted against a real Postgres:
@@ -19,19 +23,11 @@ describe('cancellation transitions', () => {
     status: JobStatus,
     { attempts = status === 'QUEUED' ? 0 : 1, cancelRequested = false } = {},
   ) => {
-    const job = await prisma.job.create({
-      data: {
-        userId,
-        type: 'MOCK',
-        payload: {},
-        status,
-        attempts,
-        // A row built as attempt N of its first life has had N claims.
-        lease: attempts,
-        cancelRequested,
-        idempotencyKey: `cancel-${Math.random()}`,
-        correlationId: 'test',
-      },
+    const job = await seedJob(prisma, {
+      userId,
+      status,
+      attempts,
+      cancelRequested,
     });
 
     return job.id;
@@ -41,37 +37,19 @@ describe('cancellation transitions', () => {
     prisma.job.findUniqueOrThrow({ where: { id: jobId } });
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-        }),
-        PrismaModule,
-      ],
+    const moduleRef = await createTestModule({
+      imports: [PrismaModule],
       providers: [JobTransitionService],
-    }).compile();
-
-    await moduleRef.init();
+    });
 
     prisma = moduleRef.get(PrismaService);
     transitions = moduleRef.get(JobTransitionService);
 
-    const user = await prisma.user.create({
-      data: {
-        email: `cancel-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2, 8)}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
-
-    userId = user.id;
+    userId = await createThrowawayUser(prisma, 'cancel');
   });
 
   afterAll(async () => {
-    await prisma.user.delete({ where: { id: userId } });
+    await deleteUsers(prisma, [userId]);
     await prisma.$disconnect();
   });
 
@@ -204,6 +182,79 @@ describe('cancellation transitions', () => {
       expect(await transitions.isWanted(await jobIn('SUCCEEDED'), 1)).toBe(
         false,
       );
+    });
+  });
+
+  // Once a charge's money has moved, a CANCELLED row would be a lie (§5.2):
+  // only the job's handler may finish it, and it finishes it as a success.
+  describe('a job whose effect has committed', () => {
+    // What the CHARGE handler does: its ledger row, through commitEffect.
+    const charge = (jobId: string, lease: number) =>
+      transitions.commitEffect(jobId, lease, (tx) =>
+        tx.sideEffect.create({
+          data: {
+            effectKey: `${jobId}:charge`,
+            jobId,
+            kind: 'charge',
+            detail: {},
+          },
+        }),
+      );
+
+    it('is not cancelled by the delivery that finds the request', async () => {
+      const jobId = await jobIn('RUNNING');
+
+      await charge(jobId, 1);
+      await transitions.requestCancel(jobId);
+
+      expect(await transitions.cancelBeforeClaim(jobId)).toBeNull();
+      expect(await row(jobId)).toMatchObject({
+        status: 'RUNNING',
+        effectCommitted: true,
+      });
+    });
+
+    it('is not cancelled by the API while it waits for a retry', async () => {
+      const jobId = await jobIn('RUNNING');
+
+      await charge(jobId, 1);
+      await transitions.requeueForRetry(jobId, 1, {
+        code: 'ATTEMPT_FAILED',
+        message: 'test',
+        attempt: 1,
+      });
+      await transitions.requestCancel(jobId);
+
+      expect(await transitions.cancelQueued(jobId)).toBeNull();
+      expect(await row(jobId)).toMatchObject({
+        status: 'QUEUED',
+        cancelRequested: true,
+      });
+    });
+
+    // The redelivery cancelled it while the first attempt was stalled before
+    // its charge; that attempt then wakes up and reaches it.
+    it('is never charged by an attempt that has lost the job', async () => {
+      const jobId = await jobIn('RUNNING', { cancelRequested: true });
+
+      expect(await transitions.cancelBeforeClaim(jobId)).toMatchObject({
+        status: 'CANCELLED',
+      });
+      expect(await charge(jobId, 1)).toBeNull();
+      expect(await prisma.sideEffect.count({ where: { jobId } })).toBe(0);
+    });
+
+    it('cannot be made CANCELLED even by a write that skips the guard', async () => {
+      const jobId = await jobIn('RUNNING');
+
+      await charge(jobId, 1);
+
+      await expect(
+        prisma.job.update({
+          where: { id: jobId },
+          data: { status: 'CANCELLED' },
+        }),
+      ).rejects.toThrow('Job_effect_never_cancelled');
     });
   });
 

@@ -142,13 +142,14 @@ export class ProductsService {
       image = { status: 'FAILED', error: imageError };
     } else {
       const links = await Promise.all(
-        IMAGE_SIZES.map(async ({ name }) => [
-          name,
-          await this.storage.signDownload(
+        IMAGE_SIZES.map(async ({ name }) => {
+          const { url } = await this.storage.signDownload(
             productImageKey(product.userId, product.id, imageSourceUrl, name),
             IMAGE_LINK_SECONDS,
-          ),
-        ]),
+          );
+
+          return [name, url];
+        }),
       );
 
       image = {
@@ -208,6 +209,10 @@ export class ProductsService {
         ${batch.map((row) => row.currency)}::text[],
         ${batch.map((row) => row.imageUrl)}::text[]
       ) AS r(sku, name, description, price_cents, currency, image_url)
+      -- Each row is locked as it is written, so two imports into one store
+      -- writing the same skus in different orders could each hold a row the
+      -- other waits for (40P01). In one order, the second simply waits.
+      ORDER BY r.sku
       ON CONFLICT ("userId", "sku") DO UPDATE SET
         "name" = EXCLUDED."name",
         "description" = EXCLUDED."description",

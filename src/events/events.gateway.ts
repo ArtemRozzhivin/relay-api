@@ -19,6 +19,7 @@ import {
   type JobUpdatedEvent,
 } from '../jobs/job-events.js';
 import type { AccessTokenPayload } from '../auth/auth.types.js';
+import { describeError } from '../common/errors/describe-error.js';
 
 export const userRoom = (userId: string) => `user:${userId}`;
 
@@ -97,9 +98,7 @@ export class EventsGateway
       this.server.to(userRoom(event.userId)).emit('job.updated', event.job);
     } catch (error) {
       this.logger.warn(
-        `Discarded a malformed job event: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `Discarded a malformed job event: ${describeError(error)}`,
       );
     }
   }

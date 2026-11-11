@@ -57,6 +57,26 @@ describe('the image.process payload', () => {
   });
 });
 
+// Postgres refuses it in jsonb, so a payload carrying one failed at the
+// insert, as a 500.
+describe('a NUL character in a payload', () => {
+  it.each([
+    [
+      'a charge reference',
+      {
+        type: 'CHARGE',
+        payload: { amountCents: 100, reference: 'inv\u00001' },
+      },
+    ],
+    [
+      'an image sku',
+      { type: 'image.process', payload: { skus: ['A\u00001'] } },
+    ],
+  ])('in %s is refused at the edge', (_label, body) => {
+    expect(submitJobSchema.safeParse(body).success).toBe(false);
+  });
+});
+
 describe('payload schemas', () => {
   it('drop an unknown field instead of failing, for the worker re-parse', () => {
     const parsed = mockPayloadSchema.safeParse({

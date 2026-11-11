@@ -4,6 +4,7 @@ import { createServer } from 'node:net';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Redis } from 'ioredis';
 import { Queue } from 'bullmq';
+import { io, type Socket } from 'socket.io-client';
 import { PrismaClient } from '../../src/generated/prisma/client.js';
 import type {
   Job,
@@ -48,6 +49,13 @@ export interface ApiResponse<T = any> {
   body: T;
 }
 
+/** A `job.updated` event, as a client receives it. */
+export interface JobEvent {
+  id: string;
+  status: string;
+  progress?: unknown;
+}
+
 // A real OS process, so a test can do to it what production does: SIGKILL it
 // mid-handler, or SIGSTOP it to simulate a frozen event loop.
 export class ProcessHandle {
@@ -71,6 +79,12 @@ export class ProcessHandle {
 
   get exitCode() {
     return this.child.exitCode ?? undefined;
+  }
+
+  // Not exitCode alone: a Nest process re-raises the signal it shut down on,
+  // and a process ended by a signal has no exit code.
+  get exited() {
+    return this.child.exitCode !== null || this.child.signalCode !== null;
   }
 
   count(pattern: string | RegExp) {
@@ -142,6 +156,7 @@ export class RelayHarness {
   readonly baseUrl: string;
 
   private readonly processes: ProcessHandle[] = [];
+  private readonly sockets: Socket[] = [];
   private jobQueue?: Queue;
 
   private constructor(private readonly port: number) {
@@ -215,6 +230,10 @@ export class RelayHarness {
   }
 
   async stop() {
+    for (const socket of this.sockets) {
+      socket.close();
+    }
+
     // Awaited, not fired and forgotten: a surviving worker would go on
     // consuming jobs belonging to the next test file.
     await Promise.all(this.processes.map((handle) => handle.terminate()));
@@ -407,6 +426,29 @@ export class RelayHarness {
     return this.request(`/jobs/${jobId}/cancel`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${account.token}` },
+    });
+  }
+
+  // ─── realtime ────────────────────────────────────────────────────────────
+
+  /**
+   * A socket on the API's `/events` namespace, opened the way a client opens
+   * one, and closed by {@link stop}. Rejects when the handshake is refused.
+   */
+  connectEvents(token?: string) {
+    return new Promise<Socket>((resolve, reject) => {
+      const socket = io(`${this.baseUrl}/events`, {
+        auth: { token },
+        transports: ['websocket'],
+        // A test that drops a connection does so on purpose and opens a new
+        // one itself; a client library reconnecting behind its back would
+        // hide the gap the test is about.
+        reconnection: false,
+      });
+
+      this.sockets.push(socket);
+      socket.on('connect', () => resolve(socket));
+      socket.on('connect_error', reject);
     });
   }
 

@@ -1,16 +1,17 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
-import { AppModule } from '../../src/app.module.js';
 import { DeleteObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { StorageService } from '../../src/storage/storage.service.js';
 import { mintUploadKey } from '../../src/storage/object-keys.js';
 import { UPLOAD_MAX_BYTES } from '../../src/uploads/uploads.service.js';
 import { postUploadForm as send } from '../support/upload-form.js';
+import { registerAndLogin, startApp } from '../support/http.js';
+import { deleteUsers } from '../support/db.js';
+import { PrismaService } from '../../src/prisma/prisma.service.js';
 
 // Against the real dev bucket (D29): what is under test is S3 enforcing the
 // policy the API signed, which no stand-in for S3 can prove. Keys this file
@@ -22,37 +23,23 @@ describe('uploads', () => {
   let app: INestApplication;
   let server: Server;
   let storage: StorageService;
+  const users: string[] = [];
 
   const register = async (label: string) => {
-    const email = `upload-${label}-${randomUUID()}@example.com`;
+    const account = await registerAndLogin(server, `upload-${label}`);
 
-    await request(server)
-      .post('/auth/register')
-      .send({ email, password: 'password123' })
-      .expect(201);
+    users.push(account.userId);
 
-    const { body } = await request(server)
-      .post('/auth/login')
-      .send({ email, password: 'password123' });
-
-    return {
-      token: body.data.accessToken as string,
-      userId: body.data.user.id as string,
-    };
+    return account;
   };
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
-
-    app = moduleRef.createNestApplication();
-    await app.listen(0);
-    server = app.getHttpServer();
+    ({ app, server } = await startApp());
     storage = app.get(StorageService);
   });
 
   afterAll(async () => {
+    await deleteUsers(app.get(PrismaService), users);
     await app.close();
   });
 
@@ -86,9 +73,8 @@ describe('uploads', () => {
     const uploaded = await send(body.data, csv);
     expect(uploaded.status).toBe(204);
 
-    const downloaded = await fetch(
-      await storage.signDownload(body.data.key, 60),
-    );
+    const { url } = await storage.signDownload(body.data.key, 60);
+    const downloaded = await fetch(url);
     expect(downloaded.status).toBe(200);
     expect(await downloaded.text()).toBe(csv);
   });

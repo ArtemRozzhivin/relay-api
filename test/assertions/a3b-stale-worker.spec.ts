@@ -46,11 +46,12 @@ describe('A3b · a stale worker cannot overwrite the live one', () => {
 
     harness.startWorker('live', { WORKER_CONCURRENCY: String(JOBS) });
 
-    // The live worker takes over through the stalled checker, which is what
-    // bumps attempts to 2 and invalidates the frozen worker's token. The
-    // condition is `attempts >= 2` and not `RUNNING with attempts = 2`: jobs are
-    // reclaimed one at a time, so the early ones can finish before the last is
-    // taken over and the instantaneous version may never hold for all six.
+    // The live worker takes over through the stalled checker, whose claim
+    // moves the lease on, invalidating the frozen worker's, and attempts to 2.
+    // The condition is `attempts >= 2` and not `RUNNING with attempts = 2`:
+    // jobs are reclaimed one at a time, so the early ones can finish before the
+    // last is taken over and the instantaneous version may never hold for all
+    // six.
     await harness.waitForCount(
       account.id,
       { attempts: { gte: 2 } },

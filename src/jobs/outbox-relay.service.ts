@@ -3,14 +3,30 @@ import { Interval } from '@nestjs/schedule';
 import { InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
-import { JOBS_QUEUE, messageId, type JobMessage } from './job-queue.js';
+import {
+  JOBS_QUEUE,
+  jobOptions,
+  type JobMessage,
+  type OutboxMessage,
+} from './job-queue.js';
+import { describeError } from '../common/errors/describe-error.js';
+import { nonOverlapping } from '../common/scheduling/non-overlapping.js';
 
+// At most 100 rows a second, and that is a pace, not a throughput limit: a
+// bulk re-drive writes thousands of outbox rows at once and relies on this to
+// release them as a ramp against a downstream that has only just recovered
+// (D11). The direct path carries normal submits, so raising it buys nothing.
 const BATCH_SIZE = 100;
 
 @Injectable()
 export class OutboxRelayService {
   private readonly logger = new Logger(OutboxRelayService.name);
-  private running = false;
+
+  private readonly publishOnce = nonOverlapping(
+    () => this.publishPending(),
+    (error) =>
+      this.logger.error(`Outbox relay failed: ${describeError(error)}`),
+  );
 
   constructor(
     private readonly prisma: PrismaService,
@@ -18,22 +34,8 @@ export class OutboxRelayService {
   ) {}
 
   @Interval(1000)
-  async tick() {
-    if (this.running) {
-      return;
-    }
-
-    this.running = true;
-
-    try {
-      await this.publishPending();
-    } catch (error) {
-      this.logger.error(
-        `Outbox relay failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    } finally {
-      this.running = false;
-    }
+  tick() {
+    return this.publishOnce();
   }
 
   async publishPending() {
@@ -47,9 +49,9 @@ export class OutboxRelayService {
     let firstFailure: { rowId: bigint; reason: string } | undefined;
 
     for (const row of pending) {
-      const message = row.payload as unknown as JobMessage & {
-        maxAttempts: number;
-      };
+      // Json in the schema, so typed only by agreement: JobsService writes
+      // every row's payload as an OutboxMessage.
+      const message = row.payload as unknown as OutboxMessage;
 
       // Per row, not per tick: the next tick starts again from the oldest
       // unpublished row, so a row that always fails would otherwise hold back
@@ -60,13 +62,7 @@ export class OutboxRelayService {
         await this.queue.add(
           row.jobName,
           { jobId: message.jobId, correlationId: message.correlationId },
-          {
-            jobId: messageId(message.jobId, row.id),
-            attempts: message.maxAttempts,
-            backoff: { type: 'exponential', delay: 1000, jitter: 1 },
-            removeOnComplete: { age: 3600, count: 1000 },
-            removeOnFail: { age: 86_400 },
-          },
+          jobOptions(message.jobId, row.id, message.maxAttempts),
         );
 
         await this.prisma.outbox.update({
@@ -78,7 +74,7 @@ export class OutboxRelayService {
       } catch (error) {
         firstFailure ??= {
           rowId: row.id,
-          reason: error instanceof Error ? error.message : String(error),
+          reason: describeError(error),
         };
       }
     }

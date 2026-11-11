@@ -1,11 +1,15 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
 import type { Job } from '../../src/generated/prisma/client.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+  seedJob,
+} from '../support/db.js';
 
 // The monotonic guard on a progress write lives in SQL, as a predicate over a
 // jsonb path. Prisma's JSON filters are the kind of thing that compiles and then
@@ -17,19 +21,11 @@ describe('a progress write', () => {
   let userId: string;
 
   const runningJob = async (progress: Job['progress'], attempts = 1) => {
-    const job = await prisma.job.create({
-      data: {
-        userId,
-        type: 'MOCK',
-        payload: {},
-        status: 'RUNNING',
-        attempts,
-        // A row built as attempt N of its first life has had N claims.
-        lease: attempts,
-        idempotencyKey: `progress-${Math.random()}`,
-        correlationId: 'test',
-        ...(progress === null ? {} : { progress }),
-      },
+    const job = await seedJob(prisma, {
+      userId,
+      status: 'RUNNING',
+      attempts,
+      ...(progress === null ? {} : { progress }),
     });
 
     return job.id;
@@ -45,37 +41,19 @@ describe('a progress write', () => {
   };
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-        }),
-        PrismaModule,
-      ],
+    const moduleRef = await createTestModule({
+      imports: [PrismaModule],
       providers: [JobTransitionService],
-    }).compile();
-
-    await moduleRef.init();
+    });
 
     prisma = moduleRef.get(PrismaService);
     transitions = moduleRef.get(JobTransitionService);
 
-    const user = await prisma.user.create({
-      data: {
-        email: `progress-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2, 8)}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
-
-    userId = user.id;
+    userId = await createThrowawayUser(prisma, 'progress');
   });
 
   afterAll(async () => {
-    await prisma.user.delete({ where: { id: userId } });
+    await deleteUsers(prisma, [userId]);
     await prisma.$disconnect();
   });
 
@@ -208,7 +186,8 @@ describe('a progress write', () => {
     ).toBeNull();
   });
 
-  // The attempt a worker was handed by claim() is its ownership token (D25).
+  // A worker writes under the lease claim() handed it, and a later claim has
+  // moved the lease on (D7).
   it('is refused from an attempt that no longer owns the job', async () => {
     const jobId = await runningJob({ processed: 5 }, 2);
 

@@ -386,9 +386,18 @@ Each step is motivated by the failure of the one before it.
   ```
   _Worker throughput is invisible from the API's registry._
   ```
-- [ ] **8.3 · Rate limiting** on the abuse-prone surface (auth, submit) → resolve **D16**.
+- [ ] **8.3 · Rate limiting and per-account caps** on the abuse-prone surface → resolve **D16**,
+  build **D32**.
+  - Rate limits on auth, submit and `POST /uploads`.
+  - Per-account caps on outstanding upload slips, and on unfinished `import.csv` and
+    `image.process` jobs — or one unfinished import per upload key and ETag.
+  - Weigh a 1-day `uploads/` lifecycle against how long a dead import can then be re-driven.
+  - An AWS Budgets alarm on the account that holds the bucket.
   ```
-  _Re-verify_ `@nestjs/throttler`_'s Nest 12 support at this point rather than assuming it._
+  _Registration is public and a 50 MB slip is signed locally, and one upload can be submitted
+  under any number of keys — each job downloading the whole file again. A request rate does not
+  bound the bytes an account can hold. Re-verify_ `@nestjs/throttler`_'s Nest 12 support at
+  this point rather than assuming it._
   ```
 - [ ] **8.4 ·** `trust proxy` configured before rate limiting is believed.
   ```
@@ -407,6 +416,14 @@ Each step is motivated by the failure of the one before it.
 - [ ] **8.7 · Verify** `correlationId` **joins API and worker logs** end to end.
   ```
   _A correlation id that stops at the process boundary is decorative._
+  ```
+- [ ] **8.8 · Delete the files of a product's replaced image** — a sweep over
+  `products/<userId>/<productId>/` that deletes a hash folder only when it is not the hash of the
+  product's current `imageSourceUrl` **and** none of its files was written in the last day (§6.3c).
+  ```
+  _Deleting the old folder when the new image is recorded races a URL switched back while a slow
+  job finishes: its late delete takes the files the row points at again. A re-render rewrites the
+  folder, so its age says no job is using it._
   ```
 
 ### Done when
@@ -550,6 +567,13 @@ Each step is motivated by the failure of the one before it.
   ```
   _An unrehearsed backup is a hypothesis._
   ```
+- [ ] **11.8 · The prod bucket** — set up as §13.4 does the dev one, with its own IAM user
+  (`s3:ListBucket` included), plus a CORS rule for the dashboard's origin once PG serves one.
+  ```
+  _Without ListBucket a missing key answers 403, and a submit naming an expired upload fails
+  with a 500. Without CORS a browser's presigned POST is refused, though every script and test
+  passes._
+  ```
 
 ### Done when
 
@@ -605,8 +629,8 @@ checked under load. M10 must precede M11, so the box is sized against measured n
   _Handlers get a capability object, not the Prisma client; what a handler may do is a
   deliberate list._
   ```
-- [x] **A.4 ·** `progress Json?` **on** `Job`, written per batch with the `attempts` ownership
-  predicate (D25) **and** a `processed <=` predicate on the jsonb path, because a retry is the live
+- [x] **A.4 ·** `progress Json?` **on** `Job`, written per batch under the `lease` ownership
+  predicate (D7) **and** a `processed <=` predicate on the jsonb path, because a retry is the live
   attempt and counts from one again.
   ```
   _Progress is not a status transition, but a stale worker must still not overwrite it — and

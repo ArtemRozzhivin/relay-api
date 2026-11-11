@@ -19,15 +19,25 @@ export const limitParam = z.coerce
 const encodeCursor = (position: Record<string, string>) =>
   Buffer.from(JSON.stringify(position)).toString('base64url');
 
+// The longest token a position can encode to. JSON writes a control character
+// as six (\u0001) and base64 makes every 3 bytes 4; the rest is room for the
+// keys and quotes. A fixed limit refused cursors this server had issued, for a
+// sku long enough and made of such characters.
+const tokenLimit = (valueLength: number) =>
+  Math.ceil((valueLength * 6 + 128) / 3) * 4;
+
 /**
  * A list's `?cursor=`, decoded into the position `shape` describes. A token
  * that is not one the list issued — edited, truncated, or another list's — is
  * a 400 like any other malformed parameter, not an empty page.
+ *
+ * @param valueLength the most characters the position's values hold together,
+ * which bounds the token the list can have issued.
  */
-export const cursorParam = <T>(shape: z.ZodType<T>) =>
+export const cursorParam = <T>(shape: z.ZodType<T>, valueLength: number) =>
   z
     .string()
-    .max(512)
+    .max(tokenLimit(valueLength))
     .transform((token, context) => {
       try {
         const parsed = shape.safeParse(
