@@ -1,23 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { io, type Socket } from 'socket.io-client';
-import { RelayHarness, type Account } from '../harness/relay-harness.js';
-
-interface JobEvent {
-  id: string;
-  status: string;
-}
-
-const connect = (baseUrl: string, token?: string) =>
-  new Promise<Socket>((resolve, reject) => {
-    const socket = io(`${baseUrl}/events`, {
-      auth: { token },
-      transports: ['websocket'],
-      reconnection: false,
-    });
-
-    socket.on('connect', () => resolve(socket));
-    socket.on('connect_error', reject);
-  });
+import {
+  RelayHarness,
+  type Account,
+  type JobEvent,
+} from '../harness/relay-harness.js';
 
 // A7 — the realtime contract, including the half that is a deliberate loss:
 // pub/sub is at-most-once, so an event sent while a client is away is gone and
@@ -26,7 +12,6 @@ describe('A7 · realtime delivery and reconciliation', () => {
   let harness: RelayHarness;
   let userA: Account;
   let userB: Account;
-  const sockets: Socket[] = [];
 
   beforeAll(async () => {
     harness = await RelayHarness.create();
@@ -36,27 +21,18 @@ describe('A7 · realtime delivery and reconciliation', () => {
     userB = await harness.signUp('a7b');
   });
 
-  afterAll(async () => {
-    for (const socket of sockets) {
-      socket.close();
-    }
-
-    await harness.stop();
-  });
+  afterAll(() => harness.stop());
 
   it.each([
     ['no token', undefined],
     ['a forged token', 'not.a.jwt'],
   ])('refuses %s at the handshake', async (_label, token) => {
-    await expect(connect(harness.baseUrl, token)).rejects.toThrow(
-      /unauthorized/,
-    );
+    await expect(harness.connectEvents(token)).rejects.toThrow(/unauthorized/);
   });
 
   it('delivers a tenant its own events, loses the ones it is away for, and reconciles', async () => {
-    const socketA = await connect(harness.baseUrl, userA.token);
-    const socketB = await connect(harness.baseUrl, userB.token);
-    sockets.push(socketA, socketB);
+    const socketA = await harness.connectEvents(userA.token);
+    const socketB = await harness.connectEvents(userB.token);
 
     const seenA: JobEvent[] = [];
     const seenB: JobEvent[] = [];
@@ -93,8 +69,7 @@ describe('A7 · realtime delivery and reconciliation', () => {
     ]);
     expect(terminal.status).toBe('SUCCEEDED');
 
-    const reconnected = await connect(harness.baseUrl, userA.token);
-    sockets.push(reconnected);
+    const reconnected = await harness.connectEvents(userA.token);
 
     const replayed: JobEvent[] = [];
     reconnected.on('job.updated', (job: JobEvent) => replayed.push(job));

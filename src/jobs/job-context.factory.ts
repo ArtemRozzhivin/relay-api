@@ -17,7 +17,7 @@ const NOTHING_REPORTED = -1;
 // a second at best and is read ten times. 500ms keeps a bar visibly alive at 2Hz
 // while collapsing a tight loop into almost nothing. The final report is exempt,
 // which is what flush() is for.
-const REPORT_WINDOW_MS = 500;
+export const REPORT_WINDOW_MS = 500;
 
 interface RunningJob {
   jobId: string;

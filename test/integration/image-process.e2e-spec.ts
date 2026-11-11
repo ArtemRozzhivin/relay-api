@@ -1,13 +1,10 @@
 import 'dotenv/config';
-import { randomUUID } from 'node:crypto';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { crc32 } from 'node:zlib';
 import { ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import sharp from 'sharp';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { StorageModule } from '../../src/storage/storage.module.js';
@@ -24,8 +21,12 @@ import { ImageProcessJobHandler } from '../../src/jobs/handlers/image-process.ha
 import { JobCancelledError } from '../../src/jobs/job-handler.js';
 import { RetryableJobError } from '../../src/common/errors/app-error.js';
 import { recordingContext } from '../../src/jobs/job-context.fixture.js';
-import { workerEnvSchema } from '../../src/config/env.schema.js';
 import { deleteProductImages } from '../support/product-images.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+} from '../support/db.js';
 
 const png = (width: number, height: number) =>
   sharp({
@@ -60,16 +61,11 @@ describe('the image.process handler', () => {
   const onRequest = new Map<string, () => Promise<void>>();
 
   const store = async () => {
-    const user = await prisma.user.create({
-      data: {
-        email: `images-${randomUUID()}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
+    const userId = await createThrowawayUser(prisma, 'images');
 
-    users.push(user.id);
+    users.push(userId);
 
-    return user.id;
+    return userId;
   };
 
   const product = (userId: string, sku: string, imageUrl: string | null) =>
@@ -186,31 +182,19 @@ describe('the image.process handler', () => {
 
     base = `http://127.0.0.1:${port}`;
 
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-          validationSchema: workerEnvSchema,
-        }),
-        PrismaModule,
-        StorageModule,
-        ProductsModule,
-        OutboundModule,
-      ],
-      providers: [ImageProcessJobHandler],
-    })
-      .overrideProvider(GuardedDownloader)
-      .useValue(
-        new GuardedDownloader({
-          isAllowed: (address) => address === '127.0.0.1',
-          ports: ['', String(port)],
-        }),
-      )
-      .compile();
-
-    await moduleRef.init();
+    const moduleRef = await createTestModule(
+      {
+        imports: [PrismaModule, StorageModule, ProductsModule, OutboundModule],
+        providers: [ImageProcessJobHandler],
+      },
+      (builder) =>
+        builder.overrideProvider(GuardedDownloader).useValue(
+          new GuardedDownloader({
+            isAllowed: (address) => address === '127.0.0.1',
+            ports: ['', String(port)],
+          }),
+        ),
+    );
 
     prisma = moduleRef.get(PrismaService);
     storage = moduleRef.get(StorageService);
@@ -222,7 +206,7 @@ describe('the image.process handler', () => {
     await Promise.all(
       users.map((userId) => deleteProductImages(s3, bucket, userId)),
     );
-    await prisma.user.deleteMany({ where: { id: { in: users } } });
+    await deleteUsers(prisma, users);
     await prisma.$disconnect();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));

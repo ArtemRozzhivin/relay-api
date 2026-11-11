@@ -10,8 +10,6 @@ import {
   onTestFinished,
   vi,
 } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { StorageModule } from '../../src/storage/storage.module.js';
@@ -27,8 +25,12 @@ import { JobCancelledError } from '../../src/jobs/job-handler.js';
 import type { Prisma } from '../../src/generated/prisma/client.js';
 import { recordingContext } from '../../src/jobs/job-context.fixture.js';
 import { TerminalJobError } from '../../src/common/errors/app-error.js';
-import { workerEnvSchema } from '../../src/config/env.schema.js';
 import { postUploadForm } from '../support/upload-form.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+} from '../support/db.js';
 
 // The handler against what it really reads and writes: a file in the dev
 // bucket (D29) and the Product table. Each file is uploaded the way a client
@@ -40,16 +42,11 @@ describe('the import.csv handler', () => {
   const users: string[] = [];
 
   const store = async () => {
-    const user = await prisma.user.create({
-      data: {
-        email: `import-${randomUUID()}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
+    const userId = await createThrowawayUser(prisma, 'import');
 
-    users.push(user.id);
+    users.push(userId);
 
-    return user.id;
+    return userId;
   };
 
   const upload = async (
@@ -111,22 +108,10 @@ describe('the import.csv handler', () => {
     ].join('\n');
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-          validationSchema: workerEnvSchema,
-        }),
-        PrismaModule,
-        StorageModule,
-        ProductsModule,
-      ],
+    const moduleRef = await createTestModule({
+      imports: [PrismaModule, StorageModule, ProductsModule],
       providers: [ImportCsvJobHandler],
-    }).compile();
-
-    await moduleRef.init();
+    });
 
     prisma = moduleRef.get(PrismaService);
     storage = moduleRef.get(StorageService);
@@ -134,7 +119,7 @@ describe('the import.csv handler', () => {
   });
 
   afterAll(async () => {
-    await prisma.user.deleteMany({ where: { id: { in: users } } });
+    await deleteUsers(prisma, users);
     await prisma.$disconnect();
   });
 

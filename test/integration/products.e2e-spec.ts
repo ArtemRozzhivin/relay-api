@@ -1,8 +1,5 @@
 import 'dotenv/config';
-import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { ProductsModule } from '../../src/products/products.module.js';
@@ -10,6 +7,11 @@ import {
   ProductsService,
   type ProductRow,
 } from '../../src/products/products.service.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+} from '../support/db.js';
 
 // The upsert is the import's only write, and everything A14 relies on is in
 // what it does on a conflict — so each case is asserted against a real
@@ -20,16 +22,11 @@ describe('the product upsert', () => {
   const users: string[] = [];
 
   const store = async () => {
-    const user = await prisma.user.create({
-      data: {
-        email: `products-${randomUUID()}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
+    const userId = await createThrowawayUser(prisma, 'products');
 
-    users.push(user.id);
+    users.push(userId);
 
-    return user.id;
+    return userId;
   };
 
   const row = (
@@ -49,26 +46,16 @@ describe('the product upsert', () => {
     prisma.product.findMany({ where: { userId }, orderBy: { sku: 'asc' } });
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-        }),
-        PrismaModule,
-        ProductsModule,
-      ],
-    }).compile();
-
-    await moduleRef.init();
+    const moduleRef = await createTestModule({
+      imports: [PrismaModule, ProductsModule],
+    });
 
     prisma = moduleRef.get(PrismaService);
     products = moduleRef.get(ProductsService);
   });
 
   afterAll(async () => {
-    await prisma.user.deleteMany({ where: { id: { in: users } } });
+    await deleteUsers(prisma, users);
     await prisma.$disconnect();
   });
 

@@ -1,9 +1,8 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { Test, type TestingModule } from '@nestjs/testing';
+import type { TestingModule } from '@nestjs/testing';
 import { Logger } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
 import { BullModule, getQueueToken } from '@nestjs/bullmq';
 import { Worker, type Job as QueueJob, type Queue } from 'bullmq';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
@@ -12,11 +11,16 @@ import { RedisModule } from '../../src/redis/redis.module.js';
 import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
 import { JobEventsPublisher } from '../../src/jobs/job-events.publisher.js';
 import { JOBS_QUEUE, messageId } from '../../src/jobs/job-queue.js';
-import { workerEnvSchema } from '../../src/config/env.schema.js';
 import {
   StrandedJobSweeper,
   type SweepCandidate,
 } from '../../src/worker/stranded-job.sweeper.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+  seedJob,
+} from '../support/db.js';
 
 // The sweep decides from the queue's state, so each state is built for real in
 // Redis — under a prefix of its own, so nothing another tier left in the queue
@@ -42,34 +46,27 @@ describe('the stranded-job sweep', () => {
     status: 'RUNNING' | 'QUEUED',
   ): Promise<SweepCandidate> => {
     const claimed = status === 'RUNNING';
-    const job = await prisma.job.create({
+    const job = await seedJob(prisma, {
+      userId,
+      status,
+      attempts: claimed ? 1 : 0,
+      startedAt: claimed ? new Date() : null,
+    });
+    const outbox = await prisma.outbox.create({
       data: {
-        userId,
-        type: 'MOCK',
+        jobId: job.id,
+        queue: JOBS_QUEUE,
+        jobName: 'MOCK',
         payload: {},
-        status,
-        attempts: claimed ? 1 : 0,
-        lease: claimed ? 1 : 0,
-        startedAt: claimed ? new Date() : null,
-        idempotencyKey: `sweep-${randomUUID()}`,
-        correlationId: 'sweep',
-        outbox: {
-          create: {
-            queue: JOBS_QUEUE,
-            jobName: 'MOCK',
-            payload: {},
-            publishedAt: claimed ? null : new Date(),
-          },
-        },
+        publishedAt: claimed ? null : new Date(),
       },
-      include: { outbox: true },
     });
 
     return {
       id: job.id,
       status: job.status,
       lease: job.lease,
-      outboxId: job.outbox[0].id,
+      outboxId: outbox.id,
     };
   };
 
@@ -103,23 +100,15 @@ describe('the stranded-job sweep', () => {
     // The test drives the sweep itself; its own timer must never fire here.
     process.env.RELAY_SWEEP_INTERVAL_MS = String(3_600_000);
 
-    moduleRef = await Test.createTestingModule({
+    moduleRef = await createTestModule({
       imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-          validationSchema: workerEnvSchema,
-        }),
         PrismaModule,
         RedisModule,
         BullModule.forRoot({ connection, prefix }),
         BullModule.registerQueue({ name: JOBS_QUEUE }),
       ],
       providers: [JobTransitionService, JobEventsPublisher, StrandedJobSweeper],
-    }).compile();
-
-    await moduleRef.init();
+    });
 
     prisma = moduleRef.get(PrismaService);
     sweeper = moduleRef.get(StrandedJobSweeper);
@@ -127,20 +116,13 @@ describe('the stranded-job sweep', () => {
     queue = moduleRef.get(getQueueToken(JOBS_QUEUE));
     worker = new Worker(JOBS_QUEUE, null, { connection, prefix });
 
-    const user = await prisma.user.create({
-      data: {
-        email: `sweep-${randomUUID()}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
-
-    userId = user.id;
+    userId = await createThrowawayUser(prisma, 'sweep');
   });
 
   afterAll(async () => {
     await worker.close();
     await queue.obliterate({ force: true });
-    await prisma.user.delete({ where: { id: userId } });
+    await deleteUsers(prisma, [userId]);
     await moduleRef.close();
   });
 

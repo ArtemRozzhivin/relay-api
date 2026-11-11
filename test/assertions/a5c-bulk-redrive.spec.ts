@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
 import type { DeadLetterCode } from '../../src/jobs/job-error-codes.js';
+import { seedJob } from '../support/db.js';
 
 // A5c — the dead-letter family's third case: a filtered bulk re-drive revives
 // exactly the matching dead letters, and they actually run. Process-level
@@ -23,18 +24,13 @@ describe('A5c · a filtered bulk re-drive revives exactly the matching dead lett
   // Written directly: how a job dies is A5 and A5b's subject, not this one's.
   // The payload succeeds, so a re-driven job can show that it ran.
   const deadLetter = async (code: DeadLetterCode) => {
-    const job = await harness.prisma.job.create({
-      data: {
-        userId: account.id,
-        type: 'MOCK',
-        payload: { durationMs: 10 },
-        status: 'DEAD_LETTERED',
-        attempts: 3,
-        idempotencyKey: `a5c-${Math.random()}`,
-        correlationId: 'a5c',
-        error: { code, message: 'it died', attempt: 3 },
-        finishedAt: new Date(),
-      },
+    const job = await seedJob(harness.prisma, {
+      userId: account.id,
+      payload: { durationMs: 10 },
+      status: 'DEAD_LETTERED',
+      attempts: 3,
+      error: { code, message: 'it died', attempt: 3 },
+      finishedAt: new Date(),
     });
 
     return job.id;

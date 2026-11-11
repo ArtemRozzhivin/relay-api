@@ -1,11 +1,11 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
-import { AppModule } from '../../src/app.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
+import { registerAndLogin, startApp } from '../support/http.js';
+import { deleteUsers, seedJob } from '../support/db.js';
 
 // What a cursor has to get right that an offset does not: every row exactly
 // once, however the list changes while a client is part-way through it (D14).
@@ -13,23 +13,14 @@ describe('cursor pagination', () => {
   let app: INestApplication;
   let server: Server;
   let prisma: PrismaService;
+  const users: string[] = [];
 
   const register = async (label: string) => {
-    const email = `page-${label}-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 8)}@example.com`;
+    const account = await registerAndLogin(server, `page-${label}`);
 
-    await request(server)
-      .post('/auth/register')
-      .send({ email, password: 'password123' })
-      .expect(201);
+    users.push(account.userId);
 
-    const { body } = await request(server)
-      .post('/auth/login')
-      .send({ email, password: 'password123' });
-    const user = await prisma.user.findUniqueOrThrow({ where: { email } });
-
-    return { token: body.data.accessToken as string, userId: user.id };
+    return account;
   };
 
   const get = (token: string, path: string) =>
@@ -65,18 +56,7 @@ describe('cursor pagination', () => {
 
   const jobsFor = (userId: string, createdAt: Date[]) =>
     Promise.all(
-      createdAt.map((at, index) =>
-        prisma.job.create({
-          data: {
-            userId,
-            type: 'MOCK',
-            payload: {},
-            idempotencyKey: `page-${index}-${Math.random()}`,
-            correlationId: 'page',
-            createdAt: at,
-          },
-        }),
-      ),
+      createdAt.map((at) => seedJob(prisma, { userId, createdAt: at })),
     );
 
   // The order the list promises, read straight from the table.
@@ -90,17 +70,12 @@ describe('cursor pagination', () => {
     ).map(({ id }) => id);
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
-
-    app = moduleRef.createNestApplication();
-    await app.listen(0);
-    server = app.getHttpServer();
+    ({ app, server } = await startApp());
     prisma = app.get(PrismaService);
   });
 
   afterAll(async () => {
+    await deleteUsers(prisma, users);
     await app.close();
   });
 

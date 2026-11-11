@@ -69,7 +69,7 @@ one-time AWS setup is in [§13.4 of the specification](docs/TECH_SPEC.md#134-loc
 
 ```bash
 npm ci
-cp .env.example .env         # then set S3_BUCKET and the AWS key pair
+cp .env.example .env         # then set AWS_REGION, S3_BUCKET and the AWS key pair
 docker compose up -d         # Postgres and Redis
 npm run db:migrate
 npm run db:generate:client

@@ -1,11 +1,15 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
 import type { JobStatus } from '../../src/generated/prisma/enums.js';
+import {
+  createTestModule,
+  createThrowawayUser,
+  deleteUsers,
+  seedJob,
+} from '../support/db.js';
 
 // Every cancellation transition is a guarded update whose WHERE clause is the
 // whole of its correctness, so each one is asserted against a real Postgres:
@@ -19,19 +23,11 @@ describe('cancellation transitions', () => {
     status: JobStatus,
     { attempts = status === 'QUEUED' ? 0 : 1, cancelRequested = false } = {},
   ) => {
-    const job = await prisma.job.create({
-      data: {
-        userId,
-        type: 'MOCK',
-        payload: {},
-        status,
-        attempts,
-        // A row built as attempt N of its first life has had N claims.
-        lease: attempts,
-        cancelRequested,
-        idempotencyKey: `cancel-${Math.random()}`,
-        correlationId: 'test',
-      },
+    const job = await seedJob(prisma, {
+      userId,
+      status,
+      attempts,
+      cancelRequested,
     });
 
     return job.id;
@@ -41,37 +37,19 @@ describe('cancellation transitions', () => {
     prisma.job.findUniqueOrThrow({ where: { id: jobId } });
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-        }),
-        PrismaModule,
-      ],
+    const moduleRef = await createTestModule({
+      imports: [PrismaModule],
       providers: [JobTransitionService],
-    }).compile();
-
-    await moduleRef.init();
+    });
 
     prisma = moduleRef.get(PrismaService);
     transitions = moduleRef.get(JobTransitionService);
 
-    const user = await prisma.user.create({
-      data: {
-        email: `cancel-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2, 8)}@example.com`,
-        passwordHash: 'not-a-real-hash',
-      },
-    });
-
-    userId = user.id;
+    userId = await createThrowawayUser(prisma, 'cancel');
   });
 
   afterAll(async () => {
-    await prisma.user.delete({ where: { id: userId } });
+    await deleteUsers(prisma, [userId]);
     await prisma.$disconnect();
   });
 

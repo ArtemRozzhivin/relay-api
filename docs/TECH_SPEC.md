@@ -1435,7 +1435,9 @@ admin user (never the root user):
    Objects and the bucket are separate resources: `/*` is every object, the bare ARN is the bucket
    itself, which `ListBucket` acts on — and without which a missing object reads as `403`, not `404`.
 3. An access key for that user into `.env` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), with
-   `AWS_REGION` and `S3_BUCKET`. CI reads the same four from repository secrets.
+   `AWS_REGION` and `S3_BUCKET`. CI reads the bucket and the key pair from repository secrets,
+   and only on the two test steps that reach S3 — every step runs code from `node_modules`, and
+   `npm ci` runs install scripts. The region is not a secret; `ci.yml` sets it.
 
 **After pulling a change that touches `prisma/`:**
 
@@ -1482,7 +1484,7 @@ cases.
 | **A10** | **No side effect inside a transaction.** Enforced by review, not code — the `relay-reviewer` agent's checklist | Grep every `$transaction` block: it may write the ledger row, never perform the effect | ongoing |
 | **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change. *In PA the per-step effect is the progress report; the ledger-count form needs batched effects and is asserted with the CSV import (PB)* | PA |
 | **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic for the life of one submission. An operator re-drive clears it and the count starts again (D25) | PA |
-| **A12b** | **Progress is rate-limited, and the last value still lands.** Report 60 times across 3s, and 100 times as fast as the handler can (about 200 ms, inside one 500 ms window) | Events carrying `progress` are **> 1 and < 20**, not ~60; and the stored value equals the final report in both cases. The second case lands entirely inside one window, so only the processor's flush gets it out | PA |
+| **A12b** | **Progress is rate-limited, and the last value still lands.** Report 60 times across 3s, and 100 times as fast as the handler can (about 200 ms, inside one 500 ms window) | Events carrying `progress` are **> 1 and < 20**, not ~60; and the stored value equals the final report in both cases. The second case lands entirely inside one window, so only the processor's flush gets it out; a run slower than the window is reported skipped (inconclusive), since the window's timer may then have sent the last value | PA |
 | **A13** | **A large import does not grow with the file.** Import 20 000 rows | Peak RSS flat within a stated band; **name the band before running** or the result is unfalsifiable | PB |
 | **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
@@ -1536,7 +1538,14 @@ Redis through ioredis, so assertions read typed rows instead of parsing `docker 
 
 **Tests wait for conditions, never for durations.** `waitUntil` replaced every `sleep`. A3 used to
 sleep and then report `INCONCLUSIVE` when no job happened to be mid-charge; it now waits until all
-six provably are, so the vacuous case is a precondition rather than an outcome to detect.
+six provably are, so the vacuous case is a precondition rather than an outcome to detect. Where
+a run cannot be made to prove its claim, the case is **skipped as inconclusive**, never passed:
+A12b's flush case proves the flush only when the job ran inside one progress window, which it
+reads from the job's own `startedAt` and `finishedAt`.
+
+**Integration specs share their setup.** `test/support/db.ts` builds the Nest module — always under
+the worker's env schema — and writes throwaway users and job rows; `test/support/http.ts` starts the
+app and registers an account over HTTP. Every spec deletes the users it made.
 
 Three traps found while building it, each of which had made a test lie:
 
@@ -1926,6 +1935,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-11 | §13.4, §14, §15.1 — CI hands the AWS keys only to the two test steps that reach S3, not to every step: `npm ci` runs every dependency's install script. §13.4 had said CI reads the region from secrets; `ci.yml` sets it. A12b's flush case reports itself inconclusive when the job ran longer than one progress window, where it had passed without proving the flush. Integration specs share their setup (`test/support/db.ts`, `test/support/http.ts`); copies had drifted, and only some validated their env or deleted their users. |
 | 2026-11-11 | D25 — the worker keeps reclaiming a progress value it cannot read until a write lands. It stopped once the first write was sent, so a database error on that one write froze the column for the rest of the attempt. |
 | 2026-11-11 | §6.3c, §13.4, D29, D31 — on an `image.process` job's last attempt, an image that might pass later is recorded `FAILED` (`Gave up after N attempts: <reason>`) and the job succeeds: it had been left `PENDING` with nothing to ever finish it once the job dead-lettered. The processor decides "last attempt" once and hands it to the handler as `context.lastAttempt`. The tests that make product images now delete them: `products/` never expires, and D29 had said the dev bucket expires everything. A replaced URL's old files are still kept; deleting them when the new image is recorded can delete a live image, so an age-guarded sweep is planned (M8.8). |
 | 2026-11-10 | §4.7, §7.7, §7.9 — a job's `error.message` holds only words written for its owner: an `AppError`'s message as it is, anything else as an internal error with the correlation id, its text in the worker's log. Prisma's and S3's messages had reached clients, and S3's AccessDenied names the IAM principal. `RetryableJobError` keeps a retry's own message where it was written for the owner — an image batch's "N of M images could not be downloaded". A host name that does not exist gets the same answer as one that resolves privately, so `image.error` no longer tells which internal names exist. The product upsert writes in `sku` order: two imports into one store had deadlocked on each other. |

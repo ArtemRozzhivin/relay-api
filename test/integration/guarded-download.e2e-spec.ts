@@ -5,11 +5,9 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Readable } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
-import { ConfigModule } from '@nestjs/config';
 import { StorageModule } from '../../src/storage/storage.module.js';
 import { StorageService } from '../../src/storage/storage.service.js';
-import { workerEnvSchema } from '../../src/config/env.schema.js';
+import { createTestModule } from '../support/db.js';
 import {
   DownloadFailedError,
   GuardedDownloader,
@@ -304,19 +302,7 @@ describe('the guarded download', () => {
   // The whole real path once: public DNS, TLS, and the lookup that checks the
   // addresses it connects to.
   it('downloads from a real public host under the real rule', async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [
-        ConfigModule.forRoot({
-          isGlobal: true,
-          cache: true,
-          envFilePath: ['.env'],
-          validationSchema: workerEnvSchema,
-        }),
-        StorageModule,
-      ],
-    }).compile();
-
-    await moduleRef.init();
+    const moduleRef = await createTestModule({ imports: [StorageModule] });
 
     const storage = moduleRef.get(StorageService);
     const key = `fixtures/${randomUUID()}.png`;

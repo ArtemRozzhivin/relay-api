@@ -1,14 +1,14 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Test } from '@nestjs/testing';
 import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
-import { AppModule } from '../../src/app.module.js';
 import { Readable } from 'node:stream';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { StorageService } from '../../src/storage/storage.service.js';
 import { errorReportKey } from '../../src/storage/object-keys.js';
+import { registerAndLogin, startApp } from '../support/http.js';
+import { deleteUsers } from '../support/db.js';
 
 // The in-process tier: the real app, the real database, no worker. It covers the
 // request contract — validation, authentication, tenant scoping — which the
@@ -16,22 +16,15 @@ import { errorReportKey } from '../../src/storage/object-keys.js';
 describe('the job API contract', () => {
   let app: INestApplication;
   let server: Server;
+  const users: string[] = [];
 
+  // Most cases need only the token.
   const register = async (label: string) => {
-    const email = `int-${label}-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 8)}@example.com`;
+    const { token, userId } = await registerAndLogin(server, `int-${label}`);
 
-    await request(server)
-      .post('/auth/register')
-      .send({ email, password: 'password123' })
-      .expect(201);
+    users.push(userId);
 
-    const { body } = await request(server)
-      .post('/auth/login')
-      .send({ email, password: 'password123' });
-
-    return body.data.accessToken as string;
+    return token;
   };
 
   const submit = (token: string, key = `int-${Math.random()}`) =>
@@ -42,20 +35,11 @@ describe('the job API contract', () => {
       .send({ type: 'MOCK', payload: { durationMs: 10, failureRate: 0 } });
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
-
-    app = moduleRef.createNestApplication();
-
-    // listen(), not init(): against a server that is not already listening,
-    // supertest binds and closes a port per request, and two concurrent
-    // requests then race on the same server object and surface as ECONNRESET.
-    await app.listen(0);
-    server = app.getHttpServer();
+    ({ app, server } = await startApp());
   });
 
   afterAll(async () => {
+    await deleteUsers(app.get(PrismaService), users);
     await app.close();
   });
 
