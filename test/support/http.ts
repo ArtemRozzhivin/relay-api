@@ -1,13 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import type { Server } from 'node:http';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { AppModule } from '../../src/app.module.js';
+import { configureApp } from '../../src/configure-app.js';
 
 const PASSWORD = 'password123';
 
 /**
- * The API's whole `AppModule`, listening on a free port.
+ * The API's whole `AppModule`, behind the edge `main.ts` gives it, listening on
+ * a free port.
  *
  * `listen()`, not `init()`: against a server that is not already listening,
  * supertest binds and closes a port per request, and two concurrent requests
@@ -17,8 +20,11 @@ export const startApp = async () => {
   const moduleRef = await Test.createTestingModule({
     imports: [AppModule],
   }).compile();
-  const app = moduleRef.createNestApplication();
+  const app = moduleRef.createNestApplication<NestExpressApplication>({
+    bodyParser: false,
+  });
 
+  configureApp(app);
   await app.listen(0);
 
   return { app, server: app.getHttpServer() as Server };

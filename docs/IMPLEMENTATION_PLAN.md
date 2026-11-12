@@ -370,7 +370,7 @@ Each step is motivated by the failure of the one before it.
 
 ### Tasks
 
-- [ ] **8.0 · A config-driven socket.io adapter** — the gateway's CORS is `{ origin: true }`,
+- [x] **8.0 · A config-driven socket.io adapter** — the gateway's CORS is `{ origin: true }`,
   which reflects any origin. Tighten it to `CORS_ORIGINS` once a browser client exists.
 
   ```
@@ -403,7 +403,7 @@ Each step is motivated by the failure of the one before it.
   ```
   _Behind a proxy every client shares one IP unless the forwarded header is trusted._
   ```
-- [ ] **8.5 · helmet, CORS allowlist, body-size limits.**
+- [x] **8.5 · helmet, CORS allowlist, body-size limits.**
   ```
   _Cheap defence in depth;_ `*` _CORS is a dev convenience only._
   ```

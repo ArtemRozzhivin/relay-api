@@ -1298,6 +1298,10 @@ inject anything, which is discovered the moment a guard needs a DB read.
 | `APP_INTERCEPTOR` | `LoggingInterceptor` (request id, timing) |
 | `APP_FILTER` | `DomainExceptionFilter` |
 
+What must run before Nest's own middleware — the request id, helmet, CORS, the body parser — and
+the socket's adapter are applied by `configureApp()` instead, from `main.ts` and from the tests
+that boot `AppModule` alike (§15.2).
+
 ### 10.3 Lifecycle order — where it bites
 
 ```
@@ -1337,7 +1341,7 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `RELAY_FAULT_SKIP_ABANDON` | bool | — | ✓ | Tests only (A5d). Default `false` |
 | `JOB_MAX_ATTEMPTS` | int | ✓ | ✓ | Default ceiling |
 | `LOG_LEVEL` | enum | ✓ | ✓ | |
-| `CORS_ORIGINS` | csv | ✓ | — | |
+| `CORS_ORIGINS` | csv | ✓ | — | The origins a browser may call from, over HTTP and the socket alike. Empty: none (§15.2) |
 | `ARGONID_TIME_COST` / `ARGONID_MEMORY_COST` | int | ✓ | — | Defaults `2` and `19456` (KiB): OWASP's minimum for Argon2id. Every registration and login pays it, so raise them as far as the host's latency allows, never lower |
 | `AWS_REGION` | str | ✓ | ✓ | The bucket's region (D29) |
 | `S3_BUCKET` | str | ✓ | ✓ | The dev bucket locally and in CI, the prod bucket when deployed |
@@ -1412,6 +1416,7 @@ Verified 2026-09-01 against the official NestJS, BullMQ, and Prisma documentatio
 | `ipaddr.js` | 2.x | Classifies a resolved address as public or not, for the guarded downloader (§7.9) |
 | `zod` | 4.x | |
 | `nestjs-pino` + `pino` + `pino-http` | 5.x / 10.x / 11.x | pino 10 is required by nestjs-pino 5 |
+| `helmet` | 8.x | Security headers on every response (§15.2) |
 | `argon2` | latest | `Bun.password` does not exist on Node |
 | `ioredis` | latest | Now an **optional** peer of BullMQ v6, so declare it explicitly |
 | `vitest` | latest | **Not Jest** — see below |
@@ -1553,13 +1558,14 @@ Specifying them now would produce prose that is wrong by the time it is used.
 
 | Phase | Objective | Exit criterion | Detail written |
 |---|---|---|---|
-| **8 · Observability & hardening** | Prometheus `/metrics` from both processes: queue depth, duration histogram, failure rate, dead-letter count. Rate limiting, per-account caps on S3-backed work (D32), `trust proxy`, helmet, CORS allowlist, body limits. Dead-letter inspection and re-drive | Queue depth observably rises and drains under load; one job's full story is retrievable from logs by `correlationId` alone | Start of phase 8 |
+| **8 · Observability & hardening** | Prometheus `/metrics` from both processes: queue depth, duration histogram, failure rate, dead-letter count. Rate limiting, per-account caps on S3-backed work (D32), `trust proxy`, helmet, CORS allowlist, body limits. Dead-letter inspection and re-drive | Queue depth observably rises and drains under load; one job's full story is retrievable from logs by `correlationId` alone | **§15.2** |
 | **9 · Test harness & CI** | The shared harness, fixtures and CI — **not** the tests themselves, which are written with the code throughout (§14). A1–A7 become automated cases including process kill/restart | `npm run test:all` reproduces every reliability assertion with no manual steps; CI green from a clean checkout | **§15.1** |
 | **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a closed with measurements attached, D10's repeated on the target host | Start of phase 10 |
 | **11 · Deploy** | One VPS: Docker running API + worker, Caddy for auto-HTTPS, `ufw`, managed Postgres, restart policies, migrations as a release step. Multi-instance socket.io (D13) becomes real here | HTTPS on a real domain; a reboot restores both processes unattended; a restore from backup has been rehearsed | Start of phase 11 |
 
 **Note for phase 8:** `@nestjs/throttler` 6.5.0 declares peers stopping at Nest 11. Re-verify its
-support at that point rather than pinning the assumption now.
+support at that point rather than pinning the assumption now. **Re-verified 2026-11-12:** 6.7.1
+declares Nest 12 (§15.2).
 
 ### 15.1 Test tiers — written 2026-10-26
 
@@ -1625,6 +1631,46 @@ terminal job, so `claim()` refuses and the handler never runs. The two gate diff
 Only logging reads `NODE_ENV` and nothing reads the Node version, so this is latent rather than
 broken — but CI is the stricter of the two and the field should be widened or the local runtime
 aligned.
+
+### 15.2 Phase 8 — written 2026-11-12
+
+Built in this order, each step with its tests: the HTTP edge (8.0, 8.5); metrics from both
+processes (8.1, 8.2); `trust proxy`, then rate limits and per-account caps (8.4, 8.3 — D16, D32);
+dead-letter inspection (8.6); the correlation id across both processes' logs (8.7); the sweep of
+replaced image folders (8.8). Each section below is written when its step lands.
+
+Two dependencies were re-verified at the start of the phase:
+
+- `@nestjs/throttler` 6.7.1 declares Nest 12 as a peer.
+- `prom-client` was deprecated in August 2026 for `@prometheus-io/client` — the same library,
+  adopted by the Prometheus project. Phase 8 uses the new name.
+
+#### The HTTP edge — 8.0, 8.5
+
+One function, `configureApp()`, sets the edge up — in `main.ts` and in every in-process test
+that boots `AppModule`, so those tests run against the edge that ships. In the order a request
+meets it:
+
+| Step | Why there |
+|---|---|
+| Request id | The body parser rejects a request before Nest's module middleware — pino-http among them — ever runs. Without an id assigned first, every `400` and `413` from the parser answered with `requestId: "undefined"` |
+| helmet | Security headers on every response, and no `X-Powered-By: Express` |
+| CORS (`CORS_ORIGINS`) | Before the parser: a browser reads an error only from a response that carries its CORS headers, so a `413` would otherwise reach a dashboard as an opaque network failure |
+| JSON body parser, 64 KB | The largest body a route takes is an `image.process` batch — 50 SKUs, about 30 KB even with every character sent as a `\u` escape. JSON only: no route reads a form |
+
+- **An empty `CORS_ORIGINS` admits no browser origin.** A request without an `Origin` — a
+  script, `curl`, the harness — is not affected: CORS is enforced by browsers, not by the server.
+- **The socket uses the same list,** through an `IoAdapter` subclass. A gateway's decorator is
+  evaluated when its file is imported, before any configuration exists, so `origin: true` there
+  could not have been replaced by configuration. The `cors` option binds only a browser's polling
+  requests; a WebSocket upgrade is not subject to CORS. That is accepted rather than patched with
+  an `allowRequest` origin check: a socket authenticates with a bearer token in its handshake,
+  not an ambient cookie, so a foreign page has nothing to ride on.
+- **A body the parser refuses keeps its status.** The parser's errors are `http-errors` objects,
+  and Nest converts only invalid JSON (a `SyntaxError`) into an `HttpException`. The exception
+  filter passed the rest through as an internal error: every body over the limit answered `500`
+  and was logged as an unhandled exception. It now maps any error marked `expose: true` to its
+  own status — `413 PAYLOAD_TOO_LARGE`, `415`.
 
 ---
 
@@ -1993,6 +2039,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-12 | §10.2, §11, §13.2, §15, §15.2 — phase 8's detail begun, and the HTTP edge built: one `configureApp()` for `main.ts` and the in-process tests, applying the request id, helmet, CORS from `CORS_ORIGINS` — over HTTP and, through an adapter, the socket, whose decorator had reflected any origin — and a 64 KB JSON-only parser. Two defects the new tests found: every body over the limit answered `500` and logged an unhandled exception, because Nest converts only invalid JSON and the filter took the parser's other errors for crashes; and a request the parser refused answered with `requestId: "undefined"`, because the parser runs before pino-http assigns one. `@nestjs/throttler` re-verified for Nest 12; `prom-client` is now `@prometheus-io/client`. |
 | 2026-11-11 | §14, §15.1 — A13 automated. Its criterion moved from peak RSS to live memory: RSS counted garbage V8 had not yet collected and swung between +45 and +82 MB on identical runs, failing the band named for it. Live memory after a forced collection, with a full-size warm-up, reads +2–3 MB for 18 000 more rows against a band of 18 MB, and +62 MB for a worker that buffers the file. |
 | 2026-11-11 | Header, §2, §3, §4.3, §6, §6.2, §7.5, §8.2, §10.1, §11, §13.2, §13.4, §15, §15.1, §16, D6b, D15, D32 — an alignment pass. `Job.error` is `{ code, reason?, message, attempt? }` with `ATTEMPT_FAILED` while a retry is coming; nothing ever wrote `retryable`. `startedAt` is the latest claim. Routes have no `/api/v1` prefix. The queue options and backoff are the ones `jobOptions()` builds. §3, §10.1 and §13.2 gain S3, the upload and product modules, the sweeper and PB–PC's packages; §2 lists the real job types and D15 is closed by them. The Argon2id settings are documented as OWASP's minimum, not test-speed values. A bulk re-drive always resumes, and an import whose upload expired dies again. The bucket needs a CORS rule once a browser uploads (M11.8). **D32 decided:** caps on the work an account can put on S3 are planned now and built in phase 8 (M8.3). |
 | 2026-11-11 | §13.4, §14, §15.1 — CI hands the AWS keys only to the two test steps that reach S3, not to every step: `npm ci` runs every dependency's install script. §13.4 had said CI reads the region from secrets; `ci.yml` sets it. A12b's flush case reports itself inconclusive when the job ran longer than one progress window, where it had passed without proving the flush. Integration specs share their setup (`test/support/db.ts`, `test/support/http.ts`); copies had drifted, and only some validated their env or deleted their users. |

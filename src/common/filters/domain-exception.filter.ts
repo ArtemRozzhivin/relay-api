@@ -25,6 +25,18 @@ interface ErrorBody {
   details?: unknown;
 }
 
+// What the body parser throws — a body too large, a charset it cannot read —
+// reaches here as an http-errors error, not an HttpException, since Nest
+// converts only invalid JSON. `expose` marks the ones meant for the client.
+const isClientHttpError = (
+  exception: unknown,
+): exception is Error & { status: number } =>
+  exception instanceof Error &&
+  'expose' in exception &&
+  exception.expose === true &&
+  'status' in exception &&
+  typeof exception.status === 'number';
+
 @Catch()
 export class DomainExceptionFilter implements ExceptionFilter {
   private readonly logger = new Logger(DomainExceptionFilter.name);
@@ -59,6 +71,16 @@ export class DomainExceptionFilter implements ExceptionFilter {
       };
     }
 
+    if (isClientHttpError(exception)) {
+      return {
+        status: exception.status,
+        error: {
+          code: HttpStatus[exception.status] ?? 'HTTP_ERROR',
+          message: exception.message,
+        },
+      };
+    }
+
     this.logger.error(
       `Unhandled exception [requestId=${requestId}]`,
       exception instanceof Error ? exception.stack : String(exception),
@@ -82,7 +104,11 @@ export class DomainExceptionFilter implements ExceptionFilter {
     const { message } = payload as { message?: string | string[] };
 
     return Array.isArray(message)
-      ? { code: 'VALIDATION_FAILED', message: 'Request validation failed', details: message }
+      ? {
+          code: 'VALIDATION_FAILED',
+          message: 'Request validation failed',
+          details: message,
+        }
       : { code, message: message ?? exception.message };
   }
 }
