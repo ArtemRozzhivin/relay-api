@@ -18,15 +18,15 @@ in a runnable, demonstrable state.
 - [x] **M6** · Reliability
 - [x] **M7** · Realtime
 - [ ] **M8** · Observability and hardening
-- [ ] **M9** · Test harness and CI
+- [x] **M9** · Test harness and CI
 - [ ] **M10** · Load testing
 - [ ] **M11** · Deployment
 
 ### Product phases — the real-job proposal (2026-10-24)
 
 - [x] **PA** · Handler registry, progress, cancellation
-- [ ] **PB** · Object storage, `Product` domain, `import.csv`
-- [ ] **PC** · `image.process`
+- [x] **PB** · Object storage, `Product` domain, `import.csv`
+- [x] **PC** · `image.process`
 - [ ] **PD** · `ai.enrich`
 - [ ] **PE** · Pipeline fan-out
 - [ ] **PF** · API keys and public docs
@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 → PA → PB → PC → M8 → PD → PE → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 → PD → PE → PF → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -476,8 +476,8 @@ Each step is motivated by the failure of the one before it.
 - [x] `npm run test:all` reproduces every reliability assertion without manual steps — the three
   scripts chain in one command. Counts are not recorded here: every phase adds tests, so a number
   in this line is stale by the next commit.
-- [ ] CI is green from a clean checkout — the workflow is written and YAML-valid but **cannot be
-  verified until it has run on a push**; this stays open deliberately
+- [x] CI is green from a clean checkout — on GitHub's runners for PR #3 and PR #4, the second
+  with the AWS keys scoped to the two steps that reach S3
 - [x] A deliberately reintroduced double-charge bug fails CI — verified by re-scoping the ledger
   key to the attempt number: A3 failed with 12 ledger rows for 6 jobs, and the source was restored
   by the harness script's trap
@@ -716,7 +716,8 @@ rows.
 
 ### Done when
 
-- [ ] **A13 passes** — 20 000 rows import with flat memory
+- [x] **A13 passes** — 20 000 rows import with flat memory: live memory +2–3 MB over 2 000 rows,
+  against a band of 18 MB; a worker that buffers the file reads +62 MB
 - [x] **A14 passes** — `SIGKILL` mid-import resumes from the checkpoint; the final product count is
   exact and contains no duplicates
 - [x] **A15 passes** — the same file submitted twice returns the first job
