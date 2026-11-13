@@ -11,6 +11,7 @@ import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { AppError, TerminalJobError } from '../common/errors/app-error.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';
+import { JobMetrics, type AttemptOutcome } from './job-metrics.js';
 
 // The HTTP filter's rule, applied to a job's error: only an AppError's message
 // was written for the job's owner. Anything else — Prisma, S3, a socket — can
@@ -40,6 +41,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     private readonly contexts: JobContextFactory,
     private readonly events: JobEventsPublisher,
     private readonly config: ConfigService<WorkerEnv, true>,
+    private readonly metrics: JobMetrics,
   ) {
     super();
   }
@@ -79,6 +81,11 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     // job, and the catch below dead-letters by the same answer.
     const lastAttempt = attempt >= claimed.maxAttempts;
 
+    const endAttempt = this.metrics.startAttempt(claimed.type);
+    // Until a branch below records one: a transition that throws leaves the
+    // attempt with no outcome written, and the queue delivers the job again.
+    let outcome: AttemptOutcome = 'unrecorded';
+
     await this.events.jobUpdated(claimed);
 
     this.logger.log(
@@ -108,6 +115,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
       const succeeded = await this.transitions.succeed(jobId, lease, result);
 
+      outcome = succeeded ? 'succeeded' : 'superseded';
+
       if (succeeded) {
         await this.events.jobUpdated(succeeded);
       } else {
@@ -126,6 +135,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         const stopped = await this.transitions.cancel(jobId, lease);
 
         if (stopped) {
+          outcome = 'cancelled';
           await this.events.jobUpdated(stopped);
           this.logger.log(
             `Job ${jobId} cancelled at a safe point on attempt ${attempt}`,
@@ -139,6 +149,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           : null;
 
         if (released) {
+          outcome = 'handed_back';
           await this.events.jobUpdated(released);
           this.logger.log(
             `Job ${jobId} handed back at a safe point for the next worker; attempt ${attempt} not counted`,
@@ -153,6 +164,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
         // shouldStop() is also true for an attempt that lost the job; the
         // attempt that holds it now is the one entitled to finish it.
+        outcome = 'superseded';
         this.logger.warn(
           `Job ${jobId} stopped on attempt ${attempt}, which no longer owns it`,
         );
@@ -180,6 +192,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           attempt,
         });
 
+        outcome = dead ? 'dead_lettered' : 'superseded';
+
         if (dead) {
           await this.events.jobUpdated(dead);
 
@@ -201,6 +215,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         attempt,
       });
 
+      outcome = requeued ? 'retrying' : 'superseded';
+
       if (!requeued) {
         this.logger.warn(
           `Job ${jobId} failed on attempt ${attempt}, which no longer owns it; retry not scheduled`,
@@ -214,6 +230,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       }
 
       throw cause;
+    } finally {
+      endAttempt(outcome);
     }
   }
 

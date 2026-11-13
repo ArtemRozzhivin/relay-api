@@ -194,6 +194,8 @@ every line of application code is wrong; constraints listed as **APP** are polic
   list's order without and with a status filter, so a page is a range of an index rather than a
   sort of every job the caller has (D14).
 - `(status)` partial `WHERE status IN ('QUEUED','RUNNING')` — operational "what is in flight".
+- `(type)` partial `WHERE status = 'DEAD_LETTERED'` — the dead-letter count every metrics scrape
+  takes across all accounts (§12.3), which no index leading with `userId` can serve.
 
 **DB** `CHECK (attempts >= 0)`.
 
@@ -1346,6 +1348,7 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `AWS_REGION` | str | ✓ | ✓ | The bucket's region (D29) |
 | `S3_BUCKET` | str | ✓ | ✓ | The dev bucket locally and in CI, the prod bucket when deployed |
 | `S3_ENDPOINT` | url? | ✓ | ✓ | Only for an S3-compatible emulator; unset for AWS |
+| `METRICS_PORT` | int? | ✓ | ✓ | Unset: the process serves no metrics. Set per process — an API and a worker on one host need two (§12.3) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | str | ✓ | ✓ | Read by the AWS SDK itself, not by the config schema, so a host with a role needs neither. Resolved at boot, so a missing key fails startup |
 
 **The two processes deliberately do not share a config surface.** The worker holding JWT secrets
@@ -1382,6 +1385,25 @@ either `MicroserviceHealthIndicator` with `Transport.REDIS` (which pulls in
 `@nestjs/microservices`) or a small custom indicator running `PING`. **v1: a custom indicator** —
 it is ~15 lines and avoids a dependency added purely for a health check.
 
+### 12.3 Metrics
+
+Each process serves `GET /metrics` in Prometheus's text format on `METRICS_PORT` — its own port,
+never the API's — and serves nothing when it is unset. Every series carries `role` (`api` or
+`worker`), and each process also exports Node's runtime metrics: event-loop lag, heap, CPU, GC.
+
+| Metric | From | What it is |
+|---|---|---|
+| `relay_job_attempt_duration_seconds{type, outcome}` | worker | A histogram of every claimed attempt, from its claim to its outcome. `outcome` is `succeeded`, `retrying`, `dead_lettered`, `cancelled`, `handed_back` (stopped for a shutdown, uncounted), `superseded` (another attempt had taken the job over) or `unrecorded` (the outcome could not be written; the queue delivers the job again) |
+| `relay_queue_depth{state}` | API | Unfinished jobs by where they wait: `outbox` (committed, not yet queued), `waiting`, `prioritized`, `delayed`, `active`. Read when scraped |
+| `relay_dead_letters{type}` | API | Dead-lettered jobs nobody has re-driven, every type listed. Read when scraped |
+
+The failure rate is computed by Prometheus from the histogram's count, not exported:
+
+```
+sum(rate(relay_job_attempt_duration_seconds_count{outcome=~"retrying|dead_lettered"}[5m]))
+  / sum(rate(relay_job_attempt_duration_seconds_count[5m]))
+```
+
 ---
 
 ## 13. Tooling and versions
@@ -1417,6 +1439,7 @@ Verified 2026-09-01 against the official NestJS, BullMQ, and Prisma documentatio
 | `zod` | 4.x | |
 | `nestjs-pino` + `pino` + `pino-http` | 5.x / 10.x / 11.x | pino 10 is required by nestjs-pino 5 |
 | `helmet` | 8.x | Security headers on every response (§15.2) |
+| `@prometheus-io/client` | 0.16.x | The metrics registry (§12.3). Formerly `prom-client`, renamed when the Prometheus project adopted it |
 | `argon2` | latest | `Bun.password` does not exist on Node |
 | `ioredis` | latest | Now an **optional** peer of BullMQ v6, so declare it explicitly |
 | `vitest` | latest | **Not Jest** — see below |
@@ -1544,6 +1567,7 @@ cases.
 | **A24** | **The parent cannot be lost.** Crash between the last child committing and the parent being enqueued | The relay publishes the parent's outbox row; the pipeline finalizes exactly once | PE |
 | **A25** | **Revocation is immediate.** Revoke a key, then use it | `401`, with no process restart | PF |
 | **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
+| **A27** | **The backlog can be watched.** Submit 20 jobs with no worker running, then start one | Scraped from the API's own metrics port, `relay_queue_depth` rises by 20 and falls back to where it began; the worker's `relay_job_attempt_duration_seconds_count{outcome="succeeded"}` reaches 20. A job dead-lettered after it raises `relay_dead_letters` and counts as `dead_lettered` on the worker | 8 |
 
 **A6 is written to fail against the phase-5 design.** The commit-then-enqueue gap is a knowingly
 accepted risk; A6 quantifies it rather than leaving it undocumented.
@@ -1671,6 +1695,39 @@ meets it:
   filter passed the rest through as an internal error: every body over the limit answered `500`
   and was logged as an unhandled exception. It now maps any error marked `expose: true` to its
   own status — `413 PAYLOAD_TOO_LARGE`, `415`.
+
+#### Metrics from both processes — 8.1, 8.2
+
+What is exported is listed in §12.3. How:
+
+- **A port of their own, off unless set.** Not a route on the API: the edge's CORS and the rate
+  limits of 8.3 would apply to Prometheus, and a firewall could not close metrics while leaving
+  the API open. The worker has no other HTTP server anyway. Off by default because a port that
+  answers anyone is opened only where a deployment asks for it — and because the API and a
+  worker read one `.env` locally, where a shared default would have the second fail to bind.
+  The port opens from `main.ts` and `worker.ts`, not on bootstrap, so a test that compiles a
+  module binds nothing.
+- **A port that cannot be bound stops the process at startup,** like any misconfiguration, rather
+  than leaving it running unscraped.
+- **The backlog gauges come from the API alone.** They describe the whole system — Postgres and
+  Redis read the same from anywhere — so every worker exporting them would make a sum count the
+  backlog once per worker. They are read at scrape time, not kept up to date by the code that
+  changes them: a count kept in memory drifts from the database the moment a process dies
+  between a write and its increment.
+- **A source that cannot be read drops its series from that scrape.** One failing `collect()`
+  fails the registry's whole answer, so each is caught: with Redis down, the queue states vanish
+  while the outbox, the dead letters and the process's own metrics still arrive. Dropped, not
+  zeroed and not left stale: a gap on a graph reads "unknown", a zero reads "empty".
+- **One histogram, not a histogram and a counter.** A histogram's `_count` per label set is a
+  counter, so the attempts by outcome — the failure rate's numerator and denominator — come with
+  the durations.
+- **`(type) WHERE status = 'DEAD_LETTERED'`,** a partial index (§4.3), because the dead-letter
+  count runs every scrape across all accounts. Verified with `EXPLAIN` on the parameterised
+  query Prisma sends: a bitmap scan of that index.
+- **BullMQ's own `exportPrometheusMetrics()` was not used:** it returns text of its own, outside
+  the registry, without the `role` label or the outbox stage before the queue.
+- **Request metrics are left to 8.3,** where the rate limiter makes `429`s by route the number
+  worth having.
 
 ---
 
@@ -2039,6 +2096,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-12 | §4.3, §11, §12.3, §13.2, §14, §15.2 — metrics from both processes, each on its own `METRICS_PORT` and labelled by `role`: the worker times every attempt by type and outcome, the API reads the backlog — the outbox and each queue state — and the dead letters by type when scraped. A source that cannot be read drops its series instead of failing the scrape. A partial index serves the dead-letter count. A27 registered and automated. |
 | 2026-11-12 | §10.2, §11, §13.2, §15, §15.2 — phase 8's detail begun, and the HTTP edge built: one `configureApp()` for `main.ts` and the in-process tests, applying the request id, helmet, CORS from `CORS_ORIGINS` — over HTTP and, through an adapter, the socket, whose decorator had reflected any origin — and a 64 KB JSON-only parser. Two defects the new tests found: every body over the limit answered `500` and logged an unhandled exception, because Nest converts only invalid JSON and the filter took the parser's other errors for crashes; and a request the parser refused answered with `requestId: "undefined"`, because the parser runs before pino-http assigns one. `@nestjs/throttler` re-verified for Nest 12; `prom-client` is now `@prometheus-io/client`. |
 | 2026-11-11 | §14, §15.1 — A13 automated. Its criterion moved from peak RSS to live memory: RSS counted garbage V8 had not yet collected and swung between +45 and +82 MB on identical runs, failing the band named for it. Live memory after a forced collection, with a full-size warm-up, reads +2–3 MB for 18 000 more rows against a band of 18 MB, and +62 MB for a worker that buffers the file. |
 | 2026-11-11 | Header, §2, §3, §4.3, §6, §6.2, §7.5, §8.2, §10.1, §11, §13.2, §13.4, §15, §15.1, §16, D6b, D15, D32 — an alignment pass. `Job.error` is `{ code, reason?, message, attempt? }` with `ATTEMPT_FAILED` while a retry is coming; nothing ever wrote `retryable`. `startedAt` is the latest claim. Routes have no `/api/v1` prefix. The queue options and backoff are the ones `jobOptions()` builds. §3, §10.1 and §13.2 gain S3, the upload and product modules, the sweeper and PB–PC's packages; §2 lists the real job types and D15 is closed by them. The Argon2id settings are documented as OWASP's minimum, not test-speed values. A bulk re-drive always resumes, and an import whose upload expired dies again. The bucket needs a CORS rule once a browser uploads (M11.8). **D32 decided:** caps on the work an account can put on S3 are planned now and built in phase 8 (M8.3). |

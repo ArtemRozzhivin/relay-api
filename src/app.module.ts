@@ -17,6 +17,7 @@ import { DomainExceptionFilter } from './common/filters/domain-exception.filter.
 import { ResponseEnvelopeInterceptor } from './common/interceptors/response-envelope.interceptor.js';
 import { LoggerModule } from 'nestjs-pino';
 import { buildLoggerParams } from './common/logging/logger.params.js';
+import { MetricsModule } from './metrics/metrics.module.js';
 
 @Module({
   imports: [
@@ -36,6 +37,7 @@ import { buildLoggerParams } from './common/logging/logger.params.js';
         connection: { url: config.get('REDIS_URL', { infer: true }) },
       }),
     }),
+    MetricsModule.forRoot('api'),
     PrismaModule,
     RedisModule,
     HealthModule,

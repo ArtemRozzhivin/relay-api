@@ -4,6 +4,7 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module.js';
 import { configureApp } from './configure-app.js';
+import { MetricsServer } from './metrics/metrics.server.js';
 import type { ApiEnv } from './config/env.schema.js';
 
 async function bootstrap() {
@@ -19,6 +20,7 @@ async function bootstrap() {
   app.enableShutdownHooks();
 
   await app.listen(config.get('PORT', { infer: true }));
+  await app.get(MetricsServer).listen();
 }
 
 await bootstrap();

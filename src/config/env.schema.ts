@@ -17,6 +17,9 @@ export const sharedEnvSchema = z.object({
   AWS_REGION: z.string().min(1),
   S3_BUCKET: z.string().min(1),
   S3_ENDPOINT: z.url().optional(),
+  // Unset, the process serves no metrics: a port is opened only where a
+  // deployment asks for one.
+  METRICS_PORT: z.coerce.number().int().min(1).max(65535).optional(),
 });
 
 export const apiEnvSchema = sharedEnvSchema.extend({

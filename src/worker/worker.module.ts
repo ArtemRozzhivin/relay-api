@@ -9,6 +9,8 @@ import { JobsProcessor } from './jobs.processor.js';
 import { StrandedJobSweeper } from './stranded-job.sweeper.js';
 import { workerEnvSchema, type WorkerEnv } from '../config/env.schema.js';
 import { buildWorkerLoggerParams } from '../common/logging/logger.params.js';
+import { MetricsModule } from '../metrics/metrics.module.js';
+import { JobMetrics } from './job-metrics.js';
 
 @Module({
   imports: [
@@ -22,6 +24,7 @@ import { buildWorkerLoggerParams } from '../common/logging/logger.params.js';
       inject: [ConfigService],
       useFactory: buildWorkerLoggerParams,
     }),
+    MetricsModule.forRoot('worker'),
     PrismaModule,
     JobCoreModule,
     BullModule.forRootAsync({
@@ -32,6 +35,6 @@ import { buildWorkerLoggerParams } from '../common/logging/logger.params.js';
     }),
     BullModule.registerQueue({ name: JOBS_QUEUE }),
   ],
-  providers: [JobsProcessor, StrandedJobSweeper],
+  providers: [JobsProcessor, StrandedJobSweeper, JobMetrics],
 })
 export class WorkerModule {}

@@ -378,11 +378,11 @@ Each step is motivated by the failure of the one before it.
   another origin._
   ```
 
-- [ ] **8.1 · Prometheus** `/metrics` — queue depth, job duration histogram, failure rate, dead-letter count.
+- [x] **8.1 · Prometheus** `/metrics` — queue depth, job duration histogram, failure rate, dead-letter count.
   ```
   _Logs say what happened; metrics say how much and how often._
   ```
-- [ ] **8.2 · Metrics from both processes**, labelled by role.
+- [x] **8.2 · Metrics from both processes**, labelled by role.
   ```
   _Worker throughput is invisible from the API's registry._
   ```
@@ -428,8 +428,8 @@ Each step is motivated by the failure of the one before it.
 
 ### Done when
 
-- [ ] A scrapeable `/metrics` exists on both processes
-- [ ] Queue depth visibly rises and drains under load
+- [x] A scrapeable `/metrics` exists on both processes — each on its own `METRICS_PORT`
+- [x] Queue depth visibly rises and drains under load — A27: 20 jobs with no worker, then one
 - [ ] One job's full story is retrievable from logs by `correlationId` alone
 
 ---
