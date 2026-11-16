@@ -25,7 +25,11 @@ describe('apiEnvSchema', () => {
   });
 
   it('ignores unrelated process variables', () => {
-    const env = apiEnvSchema.parse({ ...valid, PATH: '/usr/bin', HOME: '/root' });
+    const env = apiEnvSchema.parse({
+      ...valid,
+      PATH: '/usr/bin',
+      HOME: '/root',
+    });
     expect(env).not.toHaveProperty('PATH');
   });
 
@@ -55,13 +59,47 @@ describe('apiEnvSchema', () => {
   });
 
   it('rejects a JWT secret shorter than 32 characters', () => {
-    const result = apiEnvSchema.safeParse({ ...valid, JWT_ACCESS_SECRET: 'short' });
+    const result = apiEnvSchema.safeParse({
+      ...valid,
+      JWT_ACCESS_SECRET: 'short',
+    });
     expect(result.success).toBe(false);
-    expect(result.error?.issues[0]?.message).toContain('at least 32 characters');
+    expect(result.error?.issues[0]?.message).toContain(
+      'at least 32 characters',
+    );
   });
 
   it('rejects an out-of-range JOB_MAX_ATTEMPTS', () => {
-    expect(apiEnvSchema.safeParse({ ...valid, JOB_MAX_ATTEMPTS: '0' }).success).toBe(false);
-    expect(apiEnvSchema.safeParse({ ...valid, JOB_MAX_ATTEMPTS: '21' }).success).toBe(false);
+    expect(
+      apiEnvSchema.safeParse({ ...valid, JOB_MAX_ATTEMPTS: '0' }).success,
+    ).toBe(false);
+    expect(
+      apiEnvSchema.safeParse({ ...valid, JOB_MAX_ATTEMPTS: '21' }).success,
+    ).toBe(false);
+  });
+
+  it('limits requests unless told not to', () => {
+    expect(apiEnvSchema.parse(valid).RATE_LIMITS).toBe(true);
+    expect(
+      apiEnvSchema.parse({ ...valid, RATE_LIMITS: 'false' }).RATE_LIMITS,
+    ).toBe(false);
+  });
+
+  it('reads TRUST_PROXY as a hop count or a list of proxies', () => {
+    expect(apiEnvSchema.parse(valid).TRUST_PROXY).toBeUndefined();
+    expect(apiEnvSchema.parse({ ...valid, TRUST_PROXY: '1' }).TRUST_PROXY).toBe(
+      1,
+    );
+    expect(
+      apiEnvSchema.parse({ ...valid, TRUST_PROXY: 'loopback, 10.0.0.0/8 ' })
+        .TRUST_PROXY,
+    ).toEqual(['loopback', '10.0.0.0/8']);
+  });
+
+  it('refuses to trust every proxy', () => {
+    const result = apiEnvSchema.safeParse({ ...valid, TRUST_PROXY: 'true' });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0]?.message).toContain('not true');
   });
 });

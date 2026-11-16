@@ -2,8 +2,11 @@ import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { Registry } from '@prometheus-io/client';
 import request from 'supertest';
 import { startApp } from '../support/http.js';
+import { samples, sum, type Labels } from '../support/metrics.js';
 
 const ALLOWED = 'https://dashboard.example';
 const OTHER = 'https://elsewhere.example';
@@ -130,6 +133,45 @@ describe('the HTTP edge', () => {
         .send({ email: 'a@example.com', password: 'password123' });
 
       expect(res.status).toBe(400);
+    });
+  });
+
+  describe('request metrics', () => {
+    const count = async (labels: Labels) =>
+      sum(
+        samples(
+          await app.get(Registry).metrics(),
+          'relay_http_request_duration_seconds_count',
+          labels,
+        ),
+      );
+
+    // One series per route, not per job: a path would add one for every id.
+    it('records a response under the route it matched, not its path', async () => {
+      const labels = { method: 'GET', route: '/jobs/:id', status: '401' };
+      const before = await count(labels);
+
+      await request(server).get(`/jobs/${randomUUID()}`).expect(401);
+
+      expect(await count(labels)).toBe(before + 1);
+    });
+
+    it('records what no route matched as unmatched', async () => {
+      const notFound = { method: 'GET', route: 'unmatched', status: '404' };
+      const tooLarge = { method: 'POST', route: 'unmatched', status: '413' };
+      const before = [await count(notFound), await count(tooLarge)];
+
+      await request(server).get(`/no-such-route/${randomUUID()}`).expect(404);
+      await request(server)
+        .post('/auth/login')
+        .set('Content-Type', 'application/json')
+        .send(JSON.stringify({ password: 'x'.repeat(70_000) }))
+        .expect(413);
+
+      expect([await count(notFound), await count(tooLarge)]).toEqual([
+        before[0] + 1,
+        before[1] + 1,
+      ]);
     });
   });
 });

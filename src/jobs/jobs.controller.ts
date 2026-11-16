@@ -9,11 +9,13 @@ import {
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { Req } from '@nestjs/common';
+import { minutes } from '@nestjs/throttler';
 import type { Job } from '../generated/prisma/client.js';
 import { JobsService } from './jobs.service.js';
 import { IdempotencyKey } from './idempotency-key.decorator.js';
 import { CurrentUser } from '../auth/decorators/current-user.decorator.js';
 import type { AuthenticatedUser } from '../auth/auth.types.js';
+import { RateLimit } from '../common/rate-limit/rate-limit.js';
 import {
   bulkRedriveSchema,
   jobIdSchema,
@@ -41,6 +43,9 @@ const toJobView = ({
 export class JobsController {
   constructor(private readonly jobs: JobsService) {}
 
+  // Each accepted job is work for the worker; many images go in one
+  // image.process batch, not one submit each.
+  @RateLimit(60, minutes(1))
   @Post()
   @HttpCode(202)
   async submit(
@@ -59,6 +64,9 @@ export class JobsController {
     return { ...toJobView(job), replayed };
   }
 
+  // Each call can send up to 1000 dead letters back to work. Working through
+  // an outage is a loop of calls, and ten a minute is ten thousand jobs.
+  @RateLimit(10, minutes(1))
   @Post('retry')
   @HttpCode(202)
   redriveMatching(
@@ -69,6 +77,8 @@ export class JobsController {
     return this.jobs.redriveMatching(user.id, filter, String(request.id));
   }
 
+  // Each re-drive runs a job again, as a submit does.
+  @RateLimit(60, minutes(1))
   @Post(':id/retry')
   @HttpCode(202)
   async redrive(

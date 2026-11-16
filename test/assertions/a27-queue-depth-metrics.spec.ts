@@ -5,6 +5,7 @@ import {
   type Account,
   type ProcessHandle,
 } from '../harness/relay-harness.js';
+import { samples, sum, type Labels } from '../support/metrics.js';
 
 // A27 — the backlog can be watched from outside: with no worker running,
 // submitted jobs show up in the API's queue depth, and once a worker starts
@@ -12,30 +13,6 @@ import {
 // way Prometheus reads it, over each process's own metrics port.
 
 const JOBS = 20;
-
-type Labels = Record<string, string>;
-
-// The value of every sample of `name` whose labels include `labels`, from
-// Prometheus's text format: `name{a="1",b="2"} 42`.
-const samples = (text: string, name: string, labels: Labels = {}) =>
-  text
-    .split('\n')
-    .map((line) => /^(\w+)(?:\{(.*)\})? (\S+)$/.exec(line))
-    .filter((match) => match?.[1] === name)
-    .filter((match) => {
-      const found = Object.fromEntries(
-        [...(match![2] ?? '').matchAll(/(\w+)="([^"]*)"/g)].map(
-          ([, key, value]) => [key, value],
-        ),
-      );
-
-      return Object.entries(labels).every(
-        ([key, value]) => found[key] === value,
-      );
-    })
-    .map((match) => Number(match![3]));
-
-const sum = (values: number[]) => values.reduce((a, b) => a + b, 0);
 
 describe('A27 · queue depth rises and drains, as /metrics shows it', () => {
   let harness: RelayHarness;

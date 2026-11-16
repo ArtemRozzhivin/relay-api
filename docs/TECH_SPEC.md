@@ -1291,18 +1291,23 @@ Registered via **provider tokens**, not `app.useGlobalX(new X())` — the token 
 the DI container, so a guard or filter can inject `PrismaService`. The `new X()` form cannot
 inject anything, which is discovered the moment a guard needs a DB read.
 
+All of them in `AppModule`, the guards in the order they run:
+
 | Token | Provider |
 |---|---|
 | `APP_PIPE` | `StandardSchemaValidationPipe` |
 | `APP_GUARD` | `JwtAuthGuard` (opt out per-route with `@Public()`) |
-| `APP_GUARD` | `RolesGuard` (`@Roles('ADMIN')`) |
+| `APP_GUARD` | `RateLimitGuard` (a baseline; a stricter limit per-route with `@RateLimit()`). After the JWT guard, so it counts a signed-in caller by account (§15.2) |
 | `APP_INTERCEPTOR` | `ResponseEnvelopeInterceptor` |
-| `APP_INTERCEPTOR` | `LoggingInterceptor` (request id, timing) |
 | `APP_FILTER` | `DomainExceptionFilter` |
 
-What must run before Nest's own middleware — the request id, helmet, CORS, the body parser — and
-the socket's adapter are applied by `configureApp()` instead, from `main.ts` and from the tests
-that boot `AppModule` alike (§15.2).
+Request logging — the request id and timing — is pino-http's module middleware, not an
+interceptor. `RolesGuard` and `@Roles()` exist for a first admin-only route and are not registered
+until one does.
+
+What must run before Nest's own middleware — `trust proxy`, request metrics, the request id,
+helmet, CORS, the body parser — and the socket's adapter are applied by `configureApp()` instead,
+from `main.ts` and from the tests that boot `AppModule` alike (§15.2).
 
 ### 10.3 Lifecycle order — where it bites
 
@@ -1344,6 +1349,8 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `JOB_MAX_ATTEMPTS` | int | ✓ | ✓ | Default ceiling |
 | `LOG_LEVEL` | enum | ✓ | ✓ | |
 | `CORS_ORIGINS` | csv | ✓ | — | The origins a browser may call from, over HTTP and the socket alike. Empty: none (§15.2) |
+| `TRUST_PROXY` | hops or csv? | ✓ | — | The proxy whose `X-Forwarded-For` names the client: a hop count, or its addresses (`loopback`, a subnet). Unset: none, and the address is the connection's. `true` is refused (§15.2) |
+| `RATE_LIMITS` | bool | ✓ | — | Default `true`. `false` only in the test tiers, which register every account from one address |
 | `ARGONID_TIME_COST` / `ARGONID_MEMORY_COST` | int | ✓ | — | Defaults `2` and `19456` (KiB): OWASP's minimum for Argon2id. Every registration and login pays it, so raise them as far as the host's latency allows, never lower |
 | `AWS_REGION` | str | ✓ | ✓ | The bucket's region (D29) |
 | `S3_BUCKET` | str | ✓ | ✓ | The dev bucket locally and in CI, the prod bucket when deployed |
@@ -1396,6 +1403,7 @@ never the API's — and serves nothing when it is unset. Every series carries `r
 | `relay_job_attempt_duration_seconds{type, outcome}` | worker | A histogram of every claimed attempt, from its claim to its outcome. `outcome` is `succeeded`, `retrying`, `dead_lettered`, `cancelled`, `handed_back` (stopped for a shutdown, uncounted), `superseded` (another attempt had taken the job over) or `unrecorded` (the outcome could not be written; the queue delivers the job again) |
 | `relay_queue_depth{state}` | API | Unfinished jobs by where they wait: `outbox` (committed, not yet queued), `waiting`, `prioritized`, `delayed`, `active`. Read when scraped |
 | `relay_dead_letters{type}` | API | Dead-lettered jobs nobody has re-driven, every type listed. Read when scraped |
+| `relay_http_request_duration_seconds{method, route, status}` | API | A histogram of every response, from the first middleware. `route` is the matched pattern (`/jobs/:id`), or `unmatched` for a `404` or a body the parser refused |
 
 The failure rate is computed by Prometheus from the histogram's count, not exported:
 
@@ -1439,6 +1447,7 @@ Verified 2026-09-01 against the official NestJS, BullMQ, and Prisma documentatio
 | `zod` | 4.x | |
 | `nestjs-pino` + `pino` + `pino-http` | 5.x / 10.x / 11.x | pino 10 is required by nestjs-pino 5 |
 | `helmet` | 8.x | Security headers on every response (§15.2) |
+| `@nestjs/throttler` | 6.7.x | Rate limits, with its in-memory storage (§15.2) |
 | `@prometheus-io/client` | 0.16.x | The metrics registry (§12.3). Formerly `prom-client`, renamed when the Prometheus project adopted it |
 | `argon2` | latest | `Bun.password` does not exist on Node |
 | `ioredis` | latest | Now an **optional** peer of BullMQ v6, so declare it explicitly |
@@ -1726,8 +1735,56 @@ What is exported is listed in §12.3. How:
   query Prisma sends: a bitmap scan of that index.
 - **BullMQ's own `exportPrometheusMetrics()` was not used:** it returns text of its own, outside
   the registry, without the `role` label or the outbox stage before the queue.
-- **Request metrics are left to 8.3,** where the rate limiter makes `429`s by route the number
+- **Request metrics came with the rate limits** (below), where `429`s by route are the number
   worth having.
+
+#### The client's address and rate limits — 8.4, 8.3
+
+The first half of 8.3. Per-account caps on S3 work (D32) are its second.
+
+Every route has a baseline; the ones where one request costs real work set a stricter limit.
+Limits are per route: a caller refused on one still reaches the others.
+
+| Route | Counted per | Limit | Why |
+|---|---|---|---|
+| Any other route | account, or address before sign-in | 300 a minute | Five a second, where a dashboard polling every couple of seconds uses one. Reads are indexed and pages hold at most 100 |
+| `POST /auth/login` | address | 10 a minute | Each guess costs an Argon2 hash |
+| `POST /auth/register` | address | 5 an hour | Each account brings limits of its own, so this bounds how many fresh sets one address mints |
+| `POST /auth/refresh` | address | 60 a minute | The database work of one address replaying stale tokens |
+| `POST /jobs` | account | 60 a minute | Each accepted job is worker time; many images go in one `image.process` batch |
+| `POST /jobs/:id/retry` | account | 60 a minute | A re-drive runs a job again, as a submit does — and a job that always fails could otherwise be re-driven without end |
+| `POST /jobs/retry` | account | 10 a minute | Each call re-drives up to 1000 dead letters |
+| `POST /uploads` | account | 10 a minute | Each slip lets its holder store up to 50 MB |
+
+- **Over the limit: `429 TOO_MANY_REQUESTS`, with `Retry-After` in seconds** — exposed through
+  CORS, since a dashboard has to read it to know when to try again. The request that goes over,
+  and every one for a window after it, is refused. Every request counts, a replay (D16) and one
+  then refused by validation alike: the limiter runs before the pipes.
+- **Global, like the JWT guard.** A route added later is limited by the baseline without anyone
+  remembering to; `@RateLimit()` only makes a route stricter.
+- **Per account once signed in, per address before.** The limiter is registered after
+  `JwtAuthGuard`, in `AppModule` beside it — global guards run in the order they are registered —
+  so it knows the account: a new address does not reset an account's count, and an office behind
+  one address does not share one. A flood of requests with no valid token is refused by the JWT
+  guard before it is counted, at the cost of one signature check each.
+- **The address is the connection's unless `TRUST_PROXY` names the proxy.** Behind Caddy
+  (phase 11) every connection comes from the proxy, and every client would share one limit. But
+  trusting `X-Forwarded-For` from anything other than the proxy lets a client write its own
+  address — a fresh limit on every request — so it is off unless set, and `true`, which trusts
+  every hop, is refused at startup. The proxy's addresses are safer than a hop count, which also
+  believes a client that reaches the API around the proxy.
+- **Counters live in the API's memory.** Exact while one API instance runs, which phase 11 does;
+  a restart resets them. A second instance is the trigger to move them to Redis — and since
+  `@nest-lab/throttler-storage-redis` does not declare Nest 12, to a storage of our own.
+- **A flood shield at the proxy is left to phase 11.** The proxy sees addresses, not accounts, so
+  it can only cap requests per address across every route — coarser than this, and refused before
+  Node spends anything. Caddy needs a plugin for it, built in with `xcaddy`; nginx has `limit_req`.
+- **`RATE_LIMITS=false` in the test tiers only.** Every test file registers its accounts from one
+  address, far past the registration limit; the integration tests of the limits switch them on.
+- **Request metrics** (§12.3) are timed from the first middleware, so a body the parser refuses
+  is counted too. A request no controller took is `unmatched`: Nest mounts module middleware —
+  the logger — as a wildcard route, `{/*splat}`, so `req.route` is not empty for it, and no
+  controller's route has a wildcard.
 
 ---
 
@@ -1765,7 +1822,7 @@ to settle it.
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
 | D14 | ~~Cursor pagination~~ | A list endpoint where offset pagination measurably hurts | **DECIDED 2026-11-09** — keyset cursors on `/jobs` and `/products`, measured below |
 | D15 | ~~Job types beyond `MOCK` / `CHARGE`~~ | A real use case | **DECIDED 2026-10-26** — the real-job proposal is that use case: `import.csv`, `image.process`, then PD–PE (below) |
-| D16 | Do replays bypass the rate limiter? | A client retrying with the same key gets `429` for a job already accepted | 8 |
+| D16 | ~~Do replays bypass the rate limiter?~~ | A client retrying with the same key gets `429` for a job already accepted | **DECIDED 2026-11-13** — no: a replay counts like any request, and its retry after `Retry-After` is answered with the accepted job. Below |
 | D32 | ~~Limits on the work an account can put on S3~~ | Registration is public and `POST /uploads` signs without limit | **DECIDED 2026-11-11** — planned now, built in phase 8 (M8.3). Below |
 
 ### Forced earlier than planned by the real-job proposal
@@ -2021,6 +2078,11 @@ limits on auth and submit alone bound requests, not bytes. Phase 8 adds a rate l
 also shorten how long a dead import can be re-driven (§6.2). Nothing is deployed, so until phase
 11 the risk is latent.
 
+**D16 — a replay counts against the rate limit.** The limiter runs before the handler, so it
+cannot tell a replay from a new submit without a database read in front of it — the read the
+limit exists to bound. Nothing is lost by counting it: a client refused `429` for a replay retries
+after `Retry-After` with the same key and is answered with the job already accepted (D1).
+
 **D10 — image work does not stall the worker: concurrency stays 5, renders stay in-process.**
 First written as: `sharp` fills the 4-thread libuv pool, which delays all async I/O, BullMQ's lock
 renewal included. Measured, half of that holds. The pool does fill: five loops rendering the
@@ -2096,6 +2158,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-13 | §10.2, §11, §12.3, §13.2, §15.2, D16 — `trust proxy` and rate limits: 8.4 and the first half of 8.3. A global limiter gives every route a baseline of 300 a minute per caller; login, registration and refresh are limited further per address, and submit, both re-drives and `POST /uploads` per account. A `429` carries a `Retry-After` a browser can read. `TRUST_PROXY` names the proxy; unset, `X-Forwarded-For` is ignored, and `true` is refused. **D16 decided:** a replay counts. Request metrics by route and status, where a request no controller took is `unmatched` — which needed Nest's middleware route, `{/*splat}`, told apart from a controller's. §10.2 listed a `RolesGuard` that is not registered and a `LoggingInterceptor` that does not exist; it lists the registrations there are. |
 | 2026-11-12 | §4.3, §11, §12.3, §13.2, §14, §15.2 — metrics from both processes, each on its own `METRICS_PORT` and labelled by `role`: the worker times every attempt by type and outcome, the API reads the backlog — the outbox and each queue state — and the dead letters by type when scraped. A source that cannot be read drops its series instead of failing the scrape. A partial index serves the dead-letter count. A27 registered and automated. |
 | 2026-11-12 | §10.2, §11, §13.2, §15, §15.2 — phase 8's detail begun, and the HTTP edge built: one `configureApp()` for `main.ts` and the in-process tests, applying the request id, helmet, CORS from `CORS_ORIGINS` — over HTTP and, through an adapter, the socket, whose decorator had reflected any origin — and a 64 KB JSON-only parser. Two defects the new tests found: every body over the limit answered `500` and logged an unhandled exception, because Nest converts only invalid JSON and the filter took the parser's other errors for crashes; and a request the parser refused answered with `requestId: "undefined"`, because the parser runs before pino-http assigns one. `@nestjs/throttler` re-verified for Nest 12; `prom-client` is now `@prometheus-io/client`. |
 | 2026-11-11 | §14, §15.1 — A13 automated. Its criterion moved from peak RSS to live memory: RSS counted garbage V8 had not yet collected and swung between +45 and +82 MB on identical runs, failing the band named for it. Live memory after a forced collection, with a full-size warm-up, reads +2–3 MB for 18 000 more rows against a band of 18 MB, and +62 MB for a worker that buffers the file. |

@@ -7,14 +7,16 @@ import helmet from 'helmet';
 import type { ServerOptions } from 'socket.io';
 import type { ApiEnv } from './config/env.schema.js';
 import { assignRequestId } from './common/logging/request-id.js';
+import { HttpMetrics } from './metrics/http-metrics.js';
 
 // The largest body a route takes is an image.process batch: 50 SKUs, about
 // 30 KB even with every character sent as a \u escape.
 const JSON_BODY_LIMIT = '64kb';
 
 /**
- * The HTTP edge: the request id, security headers, the body parser, and the
- * origins a browser may call from — over HTTP and over the socket alike.
+ * The HTTP edge: the client's address, request metrics, the request id,
+ * security headers, the body parser, and the origins a browser may call from
+ * — over HTTP and over the socket alike.
  * Shared by `main.ts` and the tests that boot `AppModule`, so those run against
  * the edge that ships.
  *
@@ -25,14 +27,22 @@ export const configureApp = (app: NestExpressApplication) => {
   const config: ConfigService<ApiEnv, true> = app.get(ConfigService);
   const origins = config.get('CORS_ORIGINS', { infer: true });
 
-  // In the order they run. CORS before the body parser: a browser can read
+  // What `req.ip` is — the address an anonymous caller is rate-limited by.
+  app.set('trust proxy', config.get('TRUST_PROXY', { infer: true }) ?? false);
+
+  // In the order they run. Metrics first, so a request the parser refuses is
+  // timed and counted too. CORS before the body parser: a browser can read
   // an error only from a response that carries its CORS headers.
+  app.use(app.get(HttpMetrics).middleware);
   app.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
     assignRequestId(req, res);
     next();
   });
   app.use(helmet());
-  app.enableCors({ origin: origins, exposedHeaders: ['X-Request-Id'] });
+  app.enableCors({
+    origin: origins,
+    exposedHeaders: ['X-Request-Id', 'Retry-After'],
+  });
   app.useBodyParser('json', { limit: JSON_BODY_LIMIT });
 
   app.useWebSocketAdapter(new AllowlistIoAdapter(app, origins));

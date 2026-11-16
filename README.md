@@ -81,6 +81,8 @@ npm run start:worker:dev     # the worker, in a second terminal
 `GET /health` answers while the process is up; `GET /ready` also checks Postgres and Redis.
 Set `METRICS_PORT` on either process to have it serve Prometheus metrics on that port
 ([§12.3](docs/TECH_SPEC.md#123-metrics)).
+Behind a reverse proxy, set `TRUST_PROXY` to it, or every client shares the rate limits of the
+proxy's address ([§15.2](docs/TECH_SPEC.md#152-phase-8--written-2026-11-12)).
 
 ## Tests
 

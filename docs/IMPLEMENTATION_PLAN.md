@@ -387,8 +387,10 @@ Each step is motivated by the failure of the one before it.
   _Worker throughput is invisible from the API's registry._
   ```
 - [ ] **8.3 · Rate limiting and per-account caps** on the abuse-prone surface → resolve **D16**,
-  build **D32**.
-  - Rate limits on auth, submit and `POST /uploads`.
+  build **D32**. The rate limits landed with 8.4, and D16 is decided — a replay counts; the caps
+  remain.
+  - [x] Rate limits on auth, submit and `POST /uploads` — and on both re-drives, with a baseline
+    on every other route.
   - Per-account caps on outstanding upload slips, and on unfinished `import.csv` and
     `image.process` jobs — or one unfinished import per upload key and ETag.
   - Weigh a 1-day `uploads/` lifecycle against how long a dead import can then be re-driven.
@@ -399,7 +401,7 @@ Each step is motivated by the failure of the one before it.
   bound the bytes an account can hold. Re-verify_ `@nestjs/throttler`_'s Nest 12 support at
   this point rather than assuming it._
   ```
-- [ ] **8.4 ·** `trust proxy` configured before rate limiting is believed.
+- [x] **8.4 ·** `trust proxy` configured before rate limiting is believed.
   ```
   _Behind a proxy every client shares one IP unless the forwarded header is trusted._
   ```
