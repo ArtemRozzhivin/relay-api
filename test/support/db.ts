@@ -65,7 +65,7 @@ export const createThrowawayUser = async (
   return user.id;
 };
 
-/** Deletes test users; their jobs, products and outbox rows go with them. */
+/** Deletes test users; their jobs, products, upload slips and outbox rows go with them. */
 export const deleteUsers = (prisma: PrismaClient, ids: string[]) =>
   prisma.user.deleteMany({ where: { id: { in: ids } } });
 

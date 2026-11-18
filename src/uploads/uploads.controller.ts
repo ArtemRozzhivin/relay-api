@@ -12,7 +12,7 @@ export class UploadsController {
   // Each slip lets its holder store up to 50 MB.
   @RateLimit(10, minutes(1))
   // 200, not 201: nothing exists yet. The object appears only once the client
-  // has sent the file to S3, and nothing on this side records the request.
+  // has sent the file to S3; what is recorded here is that a slip was given.
   @Post()
   @HttpCode(200)
   create(@CurrentUser() user: AuthenticatedUser) {

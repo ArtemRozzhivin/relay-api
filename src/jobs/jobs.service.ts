@@ -30,6 +30,13 @@ import type {
 } from './jobs.schema.js';
 import type { ApiEnv } from '../config/env.schema.js';
 import { requestHash } from './request-hash.js';
+import {
+  assertUnderCap,
+  isCapped,
+  roomLeft,
+  withinRoom,
+} from './unfinished-caps.js';
+import { lockAccount } from '../prisma/account-lock.js';
 import { toPage } from '../common/pagination/cursor.js';
 import { describeError } from '../common/errors/describe-error.js';
 
@@ -110,6 +117,9 @@ export class JobsService {
    * different body.
    * @throws UploadNotFoundError (422) when an `import.csv` names a key that is
    * not one of the caller's uploads, or no longer exists.
+   * @throws TooManyUnfinishedJobsError (429) when the caller already has as many
+   * unfinished jobs of this type as it may (D32). A replay is answered as one
+   * all the same.
    */
   async submit({ userId, idempotencyKey, correlationId, input }: SubmitArgs) {
     await this.checkUpload(userId, idempotencyKey, input);
@@ -119,6 +129,12 @@ export class JobsService {
 
     try {
       committed = await this.prisma.$transaction(async (tx) => {
+        if (isCapped(input.type)) {
+          await lockAccount(tx, userId);
+        }
+
+        // Written before the cap is checked, so a replay fails here on the
+        // unique key and is answered as one even with the account at its cap.
         const job = await tx.job.create({
           data: {
             userId,
@@ -130,6 +146,8 @@ export class JobsService {
             maxAttempts: input.maxAttempts,
           },
         });
+
+        await assertUnderCap(tx, userId, job.type);
 
         const outbox = await tx.outbox.create({
           data: outboxEntry(job, correlationId),
@@ -236,6 +254,8 @@ export class JobsService {
    * @throws JobNotFoundError (404) when the job does not exist or is another
    * tenant's.
    * @throws JobNotDeadLetteredError (409) when the job is not dead-lettered.
+   * @throws TooManyUnfinishedJobsError (429) when the caller already has as many
+   * unfinished jobs of its type as it may (D32).
    */
   async redrive(
     userId: string,
@@ -246,6 +266,10 @@ export class JobsService {
     const existing = await this.findOne(userId, jobId);
 
     const requeued = await this.prisma.$transaction(async (tx) => {
+      if (isCapped(existing.type)) {
+        await lockAccount(tx, userId);
+      }
+
       const job = await this.transitions.redrive(existing.id, tx, {
         fromStart,
       });
@@ -253,6 +277,8 @@ export class JobsService {
       if (!job) {
         return null;
       }
+
+      await assertUnderCap(tx, userId, job.type);
 
       const outbox = await tx.outbox.create({
         data: outboxEntry(job, correlationId),
@@ -287,6 +313,11 @@ export class JobsService {
    * re-checks the status — but a re-driven job that dies again is a new dead
    * letter, and with no `deadLetteredTo` it matches again.
    *
+   * Capped types come back only as far as the caller's caps have room (D32),
+   * so a call can re-drive fewer than `limit` while more still match: the rest
+   * stay dead-lettered, counted in `remaining`, for a call made once some of
+   * the caller's jobs have finished.
+   *
    * @returns how many this call re-drove, and how many still match — call
    * again until `remaining` is 0, with `deadLetteredTo` set to when the loop
    * started so it works through a fixed set. With `dryRun`, nothing changes and
@@ -304,21 +335,32 @@ export class JobsService {
     }
 
     const redriven = await this.prisma.$transaction(async (tx) => {
+      await lockAccount(tx, userId);
+
+      const room = await roomLeft(tx, userId);
+      // Left out of the query, not only out of the batch: a backlog of
+      // imports at their cap would otherwise fill every batch, and the dead
+      // letters behind them would never be reached.
+      const full = [...room]
+        .filter(([, left]) => left <= 0)
+        .map(([type]) => type);
+
       // Oldest first, so repeated calls work through a backlog in the order
       // it died.
       const batch = await tx.job.findMany({
-        where,
+        where: { AND: [where, { type: { notIn: full } }] },
         orderBy: { finishedAt: 'asc' },
         take: filter.limit,
-        select: { id: true },
+        select: { id: true, type: true },
       });
+      const fits = withinRoom(batch, room);
 
-      if (batch.length === 0) {
+      if (fits.length === 0) {
         return [];
       }
 
       const jobs = await this.transitions.redriveMany(
-        batch.map(({ id }) => id),
+        fits.map(({ id }) => id),
         tx,
       );
 

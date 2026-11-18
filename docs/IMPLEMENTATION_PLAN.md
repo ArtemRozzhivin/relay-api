@@ -387,14 +387,16 @@ Each step is motivated by the failure of the one before it.
   _Worker throughput is invisible from the API's registry._
   ```
 - [ ] **8.3 · Rate limiting and per-account caps** on the abuse-prone surface → resolve **D16**,
-  build **D32**. The rate limits landed with 8.4, and D16 is decided — a replay counts; the caps
-  remain.
+  build **D32**. The rate limits landed with 8.4, and D16 is decided — a replay counts. The caps
+  are built; the budget alarm is what remains.
   - [x] Rate limits on auth, submit and `POST /uploads` — and on both re-drives, with a baseline
     on every other route.
-  - Per-account caps on outstanding upload slips, and on unfinished `import.csv` and
-    `image.process` jobs — or one unfinished import per upload key and ETag.
-  - Weigh a 1-day `uploads/` lifecycle against how long a dead import can then be re-driven.
-  - An AWS Budgets alarm on the account that holds the bucket.
+  - [x] Per-account caps on upload slips (20 a day), and on unfinished `import.csv` (3) and
+    `image.process` (50) jobs, at submit and at both re-drives.
+  - [x] Weigh a 1-day `uploads/` lifecycle against how long a dead import can then be re-driven —
+    weighed, and kept at 7 days (D32).
+  - [ ] An AWS Budgets alarm on the account that holds the bucket — set up in the console, as
+    §13.4 step 4 describes.
   ```
   _Registration is public and a 50 MB slip is signed locally, and one upload can be submitted
   under any number of keys — each job downloading the whole file again. A request rate does not

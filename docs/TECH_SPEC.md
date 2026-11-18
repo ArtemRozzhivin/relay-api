@@ -303,6 +303,21 @@ image variants (C), enrichment (D) — in their own migrations.
 > and nothing has been measured yet. Adding a Redis projection later is easy; removing one after
 > code depends on it is not. Revisit at D12 if `GET /jobs/:id` is ever *measured* slow.
 
+### 4.8 `UploadSlip` — phase 8
+
+One row per slip `POST /uploads` signs, so an account's slips can be counted (D32). Nothing else
+records one: the file it allows goes straight to S3, past the API.
+
+| Column | Type | Constraints / notes |
+|---|---|---|
+| `id` | `uuid` | PK |
+| `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE` |
+| `key` | `text` | The key the slip was signed for |
+| `createdAt` | `timestamptz(6)` | |
+
+**DB** index `(userId, createdAt)`. Signing a slip deletes the caller's rows older than a day, so
+the table holds a day's worth per account at most.
+
 ---
 
 ## 5. Job state machine
@@ -401,15 +416,15 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/auth/login` | — | `200` | Access + refresh pair |
 | `POST` | `/auth/refresh` | refresh token | `200` | Rotation: presented token revoked, new pair issued |
 | `POST` | `/auth/logout` | refresh token | `204` | Idempotent — revoking an already-revoked token is a no-op |
-| `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded. See §6.3 |
+| `POST` | `/jobs` | access | **`202`** / `422` / `429` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded; `429 TOO_MANY_UNFINISHED_JOBS` when the caller already has 3 `import.csv` or 50 `image.process` jobs queued or running — a replay is answered as one all the same (D32). See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
 | `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) |
-| `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. Phase 6. See D6b, D26 |
-| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. See D11 |
+| `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
+| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
-| `POST` | `/uploads` | access | `200` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. See §6.3a |
+| `POST` | `/uploads` | access | `200` / `429` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. `429 TOO_MANY_UPLOADS` past 20 in 24 hours (D32). See §6.3a |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
 
@@ -453,6 +468,10 @@ that is not on the row, that stops being true and a stored-response table become
 `202`, not `200` or `201`: the work has been *accepted*, not *done*. The client polls
 `GET /jobs/:id` or listens on the socket.
 
+**Capped types.** An account can have 3 `import.csv` and 50 `image.process` jobs queued or
+running at once (D32, §15.2). One more is `429 TOO_MANY_UNFINISHED_JOBS`, with no `Retry-After`:
+the place frees when one of the account's own jobs finishes, which `job.updated` reports.
+
 **Payload per type.** The union in §6.4 is the authority; unknown keys are a `400`.
 
 | Type | Field | Range | Default |
@@ -488,8 +507,10 @@ POST /uploads                      (no body)
 - **S3 enforces the signed policy itself**: that key, a size of 1 byte to `maxBytes` (50 MB), and
   the 5-minute expiry. Breaking any of them is S3's answer, not ours: `403` for a changed key or
   an expired slip, `400 EntityTooLarge` / `EntityTooSmall` for the size.
-- `200`, not `201`: nothing exists yet, and nothing on the API side records the request. An upload
-  the client never follows with a job is an orphan; the bucket's lifecycle rule removes it.
+- `200`, not `201`: nothing exists yet. What the API records is that a slip was given (§4.8): an
+  account can start **20 uploads in any 24 hours**, and the next is `429 TOO_MANY_UPLOADS` (D32).
+  An upload the client never follows with a job is an orphan; the bucket's lifecycle rule removes
+  it.
 
 ### 6.3b `import.csv` — the file and what comes back
 
@@ -579,7 +600,8 @@ A resumed import reports its checkpoint as its first `processed`.
 
 The payload names up to 50 of the caller's skus: a batch, because one job per product makes a
 20 000-product catalog 20 000 jobs, and one job for the catalog lets a single slow image hold up
-the rest. For each product whose current `imageUrl` has no `READY` result yet, the worker
+the rest. An account can have 50 batches queued or running (D32), so a catalog of 400 sends its
+next batch as one finishes. For each product whose current `imageUrl` has no `READY` result yet, the worker
 downloads it through the guard (§7.9) — `jpeg`, `png`, `webp`, `gif` or `avif`, at most 10 MB, 15 s
 — and makes three WebP sizes with `sharp`: `thumb` 200, `medium` 600 and `large` 1200 pixels wide,
 upright by their EXIF orientation, never enlarged, without the source's metadata, which can carry
@@ -1515,6 +1537,12 @@ admin user (never the root user):
    `AWS_REGION` and `S3_BUCKET`. CI reads the bucket and the key pair from repository secrets,
    and only on the two test steps that reach S3 — every step runs code from `node_modules`, and
    `npm ci` runs install scripts. The region is not a secret; `ci.yml` sets it.
+4. A **cost budget** on the AWS account (D32) — what notices abuse spread across many accounts,
+   which no per-account cap can. Billing and Cost Management → Budgets → Create budget →
+   *Customize* → *Cost budget*: monthly, a fixed $10, and two email alerts — actual cost past 80%,
+   and forecasted cost past 100%. An IAM user sees Billing only once the root user has turned on
+   *IAM user and role access to Billing information* in the account settings. Budgets read cost
+   data a few times a day, so an alert arrives hours after the spend, not minutes.
 
 **After pulling a change that touches `prisma/`:**
 
@@ -1786,6 +1814,47 @@ Limits are per route: a caller refused on one still reaches the others.
   the logger — as a wildcard route, `{/*splat}`, so `req.route` is not empty for it, and no
   controller's route has a wildcard.
 
+#### Per-account caps — 8.3 (D32)
+
+The second half of 8.3. A rate limit bounds how often an account asks; a cap bounds how much it
+holds at once.
+
+| What | Cap per account | Over it | Why |
+|---|---|---|---|
+| `import.csv` queued or running | 3 | `429 TOO_MANY_UNFINISHED_JOBS` | Each holds one download of up to 50 MB, and a store imports one catalog at a time |
+| `image.process` queued or running | 50 batches | `429 TOO_MANY_UNFINISHED_JOBS` | 2 500 products in flight; a larger catalog sends its next batch as one finishes |
+| Upload slips | 20 in any 24 hours | `429 TOO_MANY_UPLOADS` | Room many times over for a store re-uploading after a mistake. With the 7-day lifecycle, one account holds at most about 8 GB |
+
+- **`MOCK` and `CHARGE` have no cap:** they do no S3 work, and the submit rate bounds them.
+- **Every way back to work is capped:** a submit, a re-drive, and a bulk re-drive — without the
+  last, one call would bring a thousand dead imports back at once. A bulk re-drive brings back a
+  capped type only as far as there is room, and the rest stay dead-lettered, in `remaining`. A
+  type already at its cap is left out of the query, not only out of the batch: older dead imports
+  would otherwise fill every batch, and the dead letters behind them would never be reached.
+- **`429`, without `Retry-After`.** As with a rate limit, nothing is wrong with the request and
+  the same one succeeds later — but when depends on the account's own jobs, which `job.updated`
+  reports.
+- **A replay is still a replay** (D1). The job is written before the cap is checked, so a replay
+  fails first, on its unique key, and is answered with the job it already has.
+- **Counting and writing are one step, under a lock per account:** `pg_advisory_xact_lock`, keyed
+  by the account and held until the transaction ends. Two requests that each counted one free
+  place would otherwise both take it. Other accounts never wait on it, and a `MOCK` or `CHARGE`
+  submit never takes it. Fired together over HTTP, two requests never overlap — each transaction
+  lasts a couple of milliseconds — so the tests hold the lock themselves with the last place
+  filled, and check that the request under test waits and then refuses.
+- **A slip is a row** (§4.8): counting needs a record, and there was none. Counting the files
+  under the account's prefix in S3 instead would cost an S3 call per slip, miss slips not yet
+  used, and need gigabytes of real uploads to test.
+- **The `uploads/` lifecycle stays 7 days.** A day would cut what one account can hold from about
+  8 GB to about 2 GB, but a dead import more than a day old could no longer be re-driven — its
+  file gone, the seller would have to upload it again. One account's worst case costs cents a
+  month either way; many accounts at once is what the budget alarm is for (§13.4).
+- **What the caps do not bound: downloads over a day.** Three imports at a time, each reading one
+  50 MB file, can follow one another for as long as the account keeps submitting or re-driving
+  them. From the phase-11 VPS, outside AWS, S3 bills that transfer, at about $0.09 a GB. The
+  budget alarm is the backstop; a daily allowance of import attempts per account is the next step
+  if it ever fires.
+
 ---
 
 ## 16. Open decisions register
@@ -1823,7 +1892,7 @@ to settle it.
 | D14 | ~~Cursor pagination~~ | A list endpoint where offset pagination measurably hurts | **DECIDED 2026-11-09** — keyset cursors on `/jobs` and `/products`, measured below |
 | D15 | ~~Job types beyond `MOCK` / `CHARGE`~~ | A real use case | **DECIDED 2026-10-26** — the real-job proposal is that use case: `import.csv`, `image.process`, then PD–PE (below) |
 | D16 | ~~Do replays bypass the rate limiter?~~ | A client retrying with the same key gets `429` for a job already accepted | **DECIDED 2026-11-13** — no: a replay counts like any request, and its retry after `Retry-After` is answered with the accepted job. Below |
-| D32 | ~~Limits on the work an account can put on S3~~ | Registration is public and `POST /uploads` signs without limit | **DECIDED 2026-11-11** — planned now, built in phase 8 (M8.3). Below |
+| D32 | ~~Limits on the work an account can put on S3~~ | Registration is public and `POST /uploads` signs without limit | **DECIDED 2026-11-11** — planned now, built in phase 8 (M8.3). **Built 2026-11-16** (§15.2). Below |
 
 ### Forced earlier than planned by the real-job proposal
 
@@ -2078,6 +2147,14 @@ limits on auth and submit alone bound requests, not bytes. Phase 8 adds a rate l
 also shorten how long a dead import can be re-driven (§6.2). Nothing is deployed, so until phase
 11 the risk is latent.
 
+**Built 2026-11-16** (§15.2): 3 unfinished imports, 50 unfinished image batches and 20 upload
+slips a day per account, counted under a lock per account and enforced at submit and at both
+re-drives. The lifecycle stays 7 days: a day would cut one account's worst case from about 8 GB
+to 2, which is cents, and cost every dead import older than a day its re-drive. The budget alarm
+(§13.4) covers what per-account caps cannot — many accounts at once, and the downloads one
+account's imports make over a day. **Trigger** for a daily allowance of import attempts per
+account: the alarm fires.
+
 **D16 — a replay counts against the rate limit.** The limiter runs before the handler, so it
 cannot tell a replay from a new submit without a database read in front of it — the read the
 limit exists to bound. Nothing is lost by counting it: a client refused `429` for a replay retries
@@ -2158,6 +2235,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-16 | §4.8, §6.2, §6.3, §6.3a, §6.3c, §13.4, §15.2, D32 — per-account caps, the second half of 8.3. An account can have 3 `import.csv` and 50 `image.process` jobs queued or running, checked at submit and at both re-drives, and start 20 uploads a day, now recorded in `UploadSlip`; over any of them is `429`, without `Retry-After`. Each count and its write run under a per-account advisory lock. The `uploads/` lifecycle stays 7 days, and a budget alarm on the AWS account is a setup step. |
 | 2026-11-13 | §10.2, §11, §12.3, §13.2, §15.2, D16 — `trust proxy` and rate limits: 8.4 and the first half of 8.3. A global limiter gives every route a baseline of 300 a minute per caller; login, registration and refresh are limited further per address, and submit, both re-drives and `POST /uploads` per account. A `429` carries a `Retry-After` a browser can read. `TRUST_PROXY` names the proxy; unset, `X-Forwarded-For` is ignored, and `true` is refused. **D16 decided:** a replay counts. Request metrics by route and status, where a request no controller took is `unmatched` — which needed Nest's middleware route, `{/*splat}`, told apart from a controller's. §10.2 listed a `RolesGuard` that is not registered and a `LoggingInterceptor` that does not exist; it lists the registrations there are. |
 | 2026-11-12 | §4.3, §11, §12.3, §13.2, §14, §15.2 — metrics from both processes, each on its own `METRICS_PORT` and labelled by `role`: the worker times every attempt by type and outcome, the API reads the backlog — the outbox and each queue state — and the dead letters by type when scraped. A source that cannot be read drops its series instead of failing the scrape. A partial index serves the dead-letter count. A27 registered and automated. |
 | 2026-11-12 | §10.2, §11, §13.2, §15, §15.2 — phase 8's detail begun, and the HTTP edge built: one `configureApp()` for `main.ts` and the in-process tests, applying the request id, helmet, CORS from `CORS_ORIGINS` — over HTTP and, through an adapter, the socket, whose decorator had reflected any origin — and a 64 KB JSON-only parser. Two defects the new tests found: every body over the limit answered `500` and logged an unhandled exception, because Nest converts only invalid JSON and the filter took the parser's other errors for crashes; and a request the parser refused answered with `requestId: "undefined"`, because the parser runs before pino-http assigns one. `@nestjs/throttler` re-verified for Nest 12; `prom-client` is now `@prometheus-io/client`. |
