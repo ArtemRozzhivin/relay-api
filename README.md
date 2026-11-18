@@ -35,6 +35,7 @@ nothing.
 | Progress never moves backwards                            | Reports from a stale attempt are refused (A12)                    |
 | An import killed mid-file resumes rather than restarts    | `SIGKILL` while a batch is held on a row lock (A14)               |
 | The same file submitted twice imports once                | Two submits, one key, one catalog (A15)                           |
+| One request id finds everything it caused, in both logs   | A job fails, is re-driven; both processes' logs read back (A28)   |
 
 The full list, with the SQL each test checks, is §14 of the
 [technical specification](docs/TECH_SPEC.md#14-verification-plan).
@@ -90,7 +91,7 @@ proxy's address ([§15.2](docs/TECH_SPEC.md#152-phase-8--written-2026-11-12)).
 | ----------- | -------------------------- | ----------------------------------------------------------------------- |
 | Unit        | `npm test`                 | Services, schemas and pure helpers, in memory                           |
 | Integration | `npm run test:integration` | The HTTP contract and the handlers, against real Postgres, Redis and S3 |
-| Assertions  | `npm run test:assertions`  | The guarantees above, with real API and worker processes; ~13 minutes   |
+| Assertions  | `npm run test:assertions`  | The guarantees above, with real API and worker processes; ~16 minutes   |
 
 CI runs all three on every pull request.
 

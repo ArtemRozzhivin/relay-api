@@ -911,7 +911,8 @@ socket, so it follows the HTTP filter's rule: only an `AppError`'s message — w
 owner, as `TerminalJobError`'s and `RetryableJobError`'s are — is stored as it is. Anything else
 (Prisma naming a table, S3 naming the principal it refused, a socket naming an internal address) is
 stored as `Internal error; the worker's log has it under correlationId <id>`, and the worker logs
-the text. The correlation id is the submit's request id, which the owner already holds. A `failed`
+the text. The correlation id is the id of the request that queued the attempt — the submit's, or a
+re-drive's — which the owner already holds (§15.2, 8.7). A `failed`
 event's message is stored only when it is an `UnrecoverableError`: BullMQ's own (a stall past the
 limit) or the processor's, already made safe.
 
@@ -1408,11 +1409,12 @@ it never uses is needless blast radius. One schema, two required-sets.
 
 **The correlation id must cross the process boundary.** A request id that stops at the API makes
 submit and processing unjoinable in logs — which is precisely the moment you need them joined.
-The path: request id → `Job.correlationId` → queue message (§8.3) → the worker's child logger for
-that job.
+The path: request id → `Job.correlationId` → queue message (§8.3) → the worker's log context for
+that run.
 
-Standard fields on every worker log line: `correlationId`, `jobId`, `jobType`, `attempt`,
-`status`.
+Fields on every line about a job, in both processes: `correlationId`. In the worker, `jobId` too,
+and `jobType` and `attempt` once the attempt has claimed the job. Built in 8.7 (§15.2), proven by
+A28.
 
 ### 12.2 Health
 
@@ -1620,6 +1622,7 @@ cases.
 | **A25** | **Revocation is immediate.** Revoke a key, then use it | `401`, with no process restart | PF |
 | **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
 | **A27** | **The backlog can be watched.** Submit 20 jobs with no worker running, then start one | Scraped from the API's own metrics port, `relay_queue_depth` rises by 20 and falls back to where it began; the worker's `relay_job_attempt_duration_seconds_count{outcome="succeeded"}` reaches 20. A job dead-lettered after it raises `relay_dead_letters` and counts as `dead_lettered` on the worker | 8 |
+| **A28** | **A job's story is found by one id.** Under a chosen `X-Request-Id`, submit a job that fails twice, then re-drive it under another; and one that succeeds. Both processes log JSON, as in production | Under the submit's id: the API's lines for the submit, and every worker line of both attempts, the handler's included, each naming the job, its type and its attempt, ending in the dead letter. No line about the job is without it. The re-drive's runs are under the re-drive's id, none under the submit's. A succeeded job's lines end in one saying so | 8 |
 
 **A6 is written to fail against the phase-5 design.** The commit-then-enqueue gap is a knowingly
 accepted risk; A6 quantifies it rather than leaving it undocumented.
@@ -1872,6 +1875,41 @@ holds at once.
   them. From the phase-11 VPS, outside AWS, S3 bills that transfer, at about $0.09 a GB. The
   budget alarm is the backstop; a daily allowance of import attempts per account is the next step
   if it ever fires.
+
+#### Logs joined by correlationId — 8.7
+
+The request id is the job's `correlationId` (§6.1), and every line about the job carries it as a
+field, in both processes. One search returns the request that queued a job and every attempt the
+worker made of it (A28).
+
+| Line | Fields |
+|---|---|
+| Any line the API writes while it handles a request | `correlationId` |
+| The line that closes a request | `correlationId`, the whole `req` and `res`, `userId` |
+| Any line the worker writes while it runs a job: the processor's, the handler's, anything they call | `correlationId`, `jobId`; `jobType` and `attempt` once the attempt has claimed the job |
+| A job that stalled, or that the queue abandoned and the `failed` event or the sweep finished | `correlationId`, `jobId` |
+
+- **A stall is read back from the queue.** BullMQ's `stalled` event names only the queue entry,
+  so the worker reads the entry for the ids — one Redis read, on a rare event. It is the line a
+  search for a lost run most needs.
+- **A context, not a logger passed along.** The worker opens a log context for each run with
+  nestjs-pino's `runInContext`, the counterpart of what pino-http does for each request, and any
+  `Logger` used inside it writes the fields, however deep. A logger passed by hand reaches only the
+  code it is passed to; a handler's lines and a transition's would fall outside.
+- **One name in both processes.** pino-http calls the request id `reqId` and binds the whole
+  request to every line. The API binds only the id, as `correlationId`, and leaves the request to
+  the line that closes it.
+- **A re-drive is a request of its own.** The runs it starts are logged under its id, not the
+  submit's, and so is the sweep's line for a delivery a re-drive queued: an id answers "what did
+  this request cause", and `jobId` joins a job's lives. `Job.correlationId` stays the submit's.
+- **A story ends in a line.** A succeeded attempt logs that it succeeded; a search used to end at
+  "Running job".
+- **The id is the client's when it sends one** (`X-Request-Id`), so it can be quoted back. A job
+  that failed for an internal reason shows its owner the id the worker logged the reason under
+  (§7.7).
+- `status` had been listed as a standard field and is not one: it changes during an attempt, so
+  a field bound when the attempt starts would be wrong by its end, and each line says what
+  happened.
 
 ---
 
@@ -2265,6 +2303,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-18 | §7.7, §12.1, §14, §15.2 — logs joined by `correlationId`, 8.7. Every line about a job carries it as a field in both processes: the API binds the request id under that name to each line it writes while handling the request, and the worker runs each job, its stall, its abandonment and the sweep's finishing of it in a log context naming the `correlationId` and `jobId`, adding `jobType` and `attempt` once claimed — whichever class writes the line. A re-drive's runs are logged under the re-drive's id. A succeeded attempt now logs that it succeeded. `status` dropped from §12.1's fields. A28 registered and automated. |
 | 2026-11-18 | §4.3, §15.2 — the dead-letter metric now reads its partial index. As a Prisma `groupBy` it never had: Prisma sends the status as a parameter cast at run time, which the planner cannot match to the index's `WHERE`, so every scrape read every job. The count is raw SQL with the status written in, and an integration test checks its plan. §15.2 had claimed the index was verified in use; corrected. |
 | 2026-11-18 | §4.3, §6.2, D11, D14 — dead-letter inspection, 8.6. `GET /jobs/dead-letters` lists the caller's dead letters by the bulk re-drive's own filter and in its order, a cursor page at a time, so a batch can be read before it is re-driven; no filter is required. The bulk re-drive breaks ties by `id`, so jobs that died in the same millisecond are taken in the order the list shows them. `Job.finishedAt` narrowed to milliseconds, as `createdAt` was: at microseconds the next page would start before the job the last one ended on. A job has a `finishedAt` exactly when it is finished (a `CHECK`), and `(userId, status, finishedAt, id)` makes a page or a re-drive batch an index range: 0.06 ms against 10 ms over 20 000 dead letters. A partial index was measured and never chosen, because Prisma sends the status as a cast parameter. |
 | 2026-11-16 | §4.8, §6.2, §6.3, §6.3a, §6.3c, §13.4, §15.2, D32 — per-account caps, the second half of 8.3. An account can have 3 `import.csv` and 50 `image.process` jobs queued or running, checked at submit and at both re-drives, and start 20 uploads a day, now recorded in `UploadSlip`; over any of them is `429`, without `Retry-After`. Each count and its write run under a per-account advisory lock. The `uploads/` lifecycle stays 7 days, and a budget alarm on the AWS account is a setup step. |

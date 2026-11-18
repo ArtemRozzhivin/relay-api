@@ -421,7 +421,11 @@ Each step is motivated by the failure of the one before it.
   ```
   _A dead letter nobody can act on is just a slow data leak._
   ```
-- [ ] **8.7 · Verify** `correlationId` **joins API and worker logs** end to end.
+- [x] **8.7 · Verify** `correlationId` **joins API and worker logs** end to end.
+  - [x] Every line about a job carries `correlationId` as a field in both processes, whichever
+    class writes it. The worker's lines name `jobId` too, and `jobType` and `attempt` once the
+    attempt has claimed the job. A re-drive's runs are under the re-drive's id, joined to the
+    submit's by `jobId`. A28 reads both processes' JSON logs.
   ```
   _A correlation id that stops at the process boundary is decorative._
   ```
@@ -438,7 +442,9 @@ Each step is motivated by the failure of the one before it.
 
 - [x] A scrapeable `/metrics` exists on both processes — each on its own `METRICS_PORT`
 - [x] Queue depth visibly rises and drains under load — A27: 20 jobs with no worker, then one
-- [ ] One job's full story is retrievable from logs by `correlationId` alone
+- [x] One job's full story is retrievable from logs by `correlationId` alone — A28: the submit
+  and every attempt under the submit's id; a re-drive's runs under the re-drive's id, joined by
+  `jobId`
 
 ---
 

@@ -1,7 +1,8 @@
 import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
-import { UnrecoverableError, type Job as QueueJob } from 'bullmq';
+import { UnrecoverableError, type Job as QueueJob, type Queue } from 'bullmq';
 import { type Histogram, Registry } from '@prometheus-io/client';
+import type { PinoLogger, RunInContextOptions } from 'nestjs-pino';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   RetryableJobError,
@@ -43,8 +44,9 @@ const hidden =
 
 // A processor whose handler runs `run` on the attempt given, with every error
 // the processor asked a transition to write collected in `errors`, what it
-// built each handler's context from in `contexts`, and its metrics in
-// `registry`. `transitions` replaces any of the transitions' answers.
+// built each handler's context from in `contexts`, the fields of each log
+// context it opened in `logContexts`, and its metrics in `registry`.
+// `transitions` replaces any of the transitions' answers.
 const processorFor = ({
   attempt = 1,
   run,
@@ -56,6 +58,7 @@ const processorFor = ({
 }) => {
   const errors: Prisma.InputJsonValue[] = [];
   const contexts: { lastAttempt?: boolean }[] = [];
+  const logContexts: Record<string, unknown>[] = [];
   const registry = new Registry();
   const write = async (
     _jobId: string,
@@ -91,9 +94,19 @@ const processorFor = ({
     { jobUpdated: async () => {} } as unknown as JobEventsPublisher,
     { get: () => false } as unknown as ConfigService<WorkerEnv, true>,
     new JobMetrics(registry),
+    {
+      runInContext: (fn: () => unknown, options: RunInContextOptions = {}) => {
+        logContexts.push({ ...options.bindings });
+
+        return fn();
+      },
+      assign: (fields: Record<string, unknown>) =>
+        Object.assign(logContexts.at(-1)!, fields),
+    } as unknown as PinoLogger,
+    { getJob: async () => message } as unknown as Queue,
   );
 
-  return { processor, errors, contexts, registry };
+  return { processor, errors, contexts, logContexts, registry };
 };
 
 // A processor whose handler throws `failure` on the attempt given.
@@ -138,6 +151,47 @@ describe('JobsProcessor', () => {
     vi.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
     vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => {});
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => {});
+  });
+
+  // Whoever logs while the job runs, so a search for the correlationId finds
+  // every line, the handler's included.
+  it('logs a run under its correlationId and id, with its type and attempt once claimed', async () => {
+    const { processor, logContexts } = processorFor({
+      attempt: 2,
+      run: async () => ({}),
+      transitions: { succeed: async () => claimed },
+    });
+
+    await processor.process(message);
+
+    expect(logContexts).toEqual([
+      {
+        correlationId: 'req-1',
+        jobId: 'a-job',
+        jobType: 'import.csv',
+        attempt: 2,
+      },
+    ]);
+  });
+
+  it('logs a delivery it cannot claim under its correlationId and id', async () => {
+    const { processor, logContexts } = processorFor({
+      run: async () => ({}),
+      transitions: { claim: async () => null },
+    });
+
+    await processor.process(message);
+
+    expect(logContexts).toEqual([{ correlationId: 'req-1', jobId: 'a-job' }]);
+  });
+
+  // A bare listener, given only the queue entry's id.
+  it('logs a stall under its correlationId and id', async () => {
+    const { processor, logContexts } = processorFor({ run: async () => ({}) });
+
+    await processor.onStalled('a-job.1');
+
+    expect(logContexts).toEqual([{ correlationId: 'req-1', jobId: 'a-job' }]);
   });
 
   it("stores a terminal failure's reason beside the engine's code", async () => {
@@ -244,7 +298,7 @@ describe('JobsProcessor', () => {
         'job stalled more than allowable limit',
       ],
     ])('abandons a job with %s', async (_label, failure, shown) => {
-      const { processor, errors } = failingOn(1, null);
+      const { processor, errors, logContexts } = failingOn(1, null);
 
       processor.onFailed(
         { ...message, finishedOn: Date.now() } as QueueJob<JobMessage>,
@@ -256,6 +310,8 @@ describe('JobsProcessor', () => {
           { code: 'DELIVERY_ABANDONED', message: shown },
         ]),
       );
+      // Outside process(), where no context is open unless it opens one.
+      expect(logContexts).toEqual([{ correlationId: 'req-1', jobId: 'a-job' }]);
     });
   });
 

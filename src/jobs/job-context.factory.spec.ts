@@ -17,7 +17,6 @@ const running: {
   userId: string;
   attempt: number;
   lease: number;
-  correlationId: string;
   progress: Prisma.JsonValue | null;
   checkpoint: Prisma.JsonValue | null;
 } = {
@@ -26,7 +25,6 @@ const running: {
   attempt: 2,
   // Deliberately not the attempt, so a write carrying the wrong one shows.
   lease: 7,
-  correlationId: 'req-1',
   progress: null,
   checkpoint: null,
 };

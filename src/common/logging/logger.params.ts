@@ -16,6 +16,13 @@ export function buildLoggerParams(config: ConfigService<ApiEnv, true>): Params {
 
       genReqId: assignRequestId,
 
+      // Every line logged while a request is handled carries its id, and under
+      // the worker's name for it: one search for a correlationId finds the
+      // request and the job runs it started (§12.1). The whole request goes on
+      // the line that closes it, not on each line before.
+      quietReqLogger: true,
+      customAttributeKeys: { reqId: 'correlationId' },
+
       redact: {
         paths: ['req.headers.authorization', 'req.headers.cookie'],
         censor: '[redacted]',
