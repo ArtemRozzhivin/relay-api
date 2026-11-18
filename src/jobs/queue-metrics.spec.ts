@@ -13,12 +13,9 @@ const sources = () => {
 
   const prisma = {
     outbox: { count: () => (fail.postgres ? down() : Promise.resolve(3)) },
-    job: {
-      groupBy: () =>
-        fail.postgres
-          ? down()
-          : Promise.resolve([{ type: 'MOCK', _count: { _all: 2 } }]),
-    },
+    // Only the dead-letter count is a raw query.
+    $queryRaw: () =>
+      fail.postgres ? down() : Promise.resolve([{ type: 'MOCK', count: 2 }]),
   } as unknown as PrismaService;
 
   const queue = {

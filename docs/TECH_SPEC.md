@@ -201,7 +201,9 @@ every line of application code is wrong; constraints listed as **APP** are polic
   partial index on dead letters was never chosen.
 - `(status)` partial `WHERE status IN ('QUEUED','RUNNING')` — operational "what is in flight".
 - `(type)` partial `WHERE status = 'DEAD_LETTERED'` — the dead-letter count every metrics scrape
-  takes across all accounts (§12.3), which no index leading with `userId` can serve.
+  takes across all accounts (§12.3), which no index leading with `userId` can serve. That count
+  is written in SQL with the status in it, for the reason above: as a Prisma query it read every
+  job.
 
 **DB** `CHECK (attempts >= 0)`.
 
@@ -1772,8 +1774,11 @@ What is exported is listed in §12.3. How:
   counter, so the attempts by outcome — the failure rate's numerator and denominator — come with
   the durations.
 - **`(type) WHERE status = 'DEAD_LETTERED'`,** a partial index (§4.3), because the dead-letter
-  count runs every scrape across all accounts. Verified with `EXPLAIN` on the parameterised
-  query Prisma sends: a bitmap scan of that index.
+  count runs every scrape across all accounts. The count is raw SQL with the status written in:
+  Prisma sends the status as `CAST($1::text AS "JobStatus")`, worked out only when the query
+  runs, so the planner cannot match it to the index's `WHERE` and read every job instead. An
+  integration test checks the plan names the index. *Corrected 2026-11-18: this bullet had said
+  `EXPLAIN` showed Prisma's own query using the index; it never did.*
 - **BullMQ's own `exportPrometheusMetrics()` was not used:** it returns text of its own, outside
   the registry, without the `role` label or the outbox stage before the queue.
 - **Request metrics came with the rate limits** (below), where `429`s by route are the number
@@ -2260,6 +2265,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-18 | §4.3, §15.2 — the dead-letter metric now reads its partial index. As a Prisma `groupBy` it never had: Prisma sends the status as a parameter cast at run time, which the planner cannot match to the index's `WHERE`, so every scrape read every job. The count is raw SQL with the status written in, and an integration test checks its plan. §15.2 had claimed the index was verified in use; corrected. |
 | 2026-11-18 | §4.3, §6.2, D11, D14 — dead-letter inspection, 8.6. `GET /jobs/dead-letters` lists the caller's dead letters by the bulk re-drive's own filter and in its order, a cursor page at a time, so a batch can be read before it is re-driven; no filter is required. The bulk re-drive breaks ties by `id`, so jobs that died in the same millisecond are taken in the order the list shows them. `Job.finishedAt` narrowed to milliseconds, as `createdAt` was: at microseconds the next page would start before the job the last one ended on. A job has a `finishedAt` exactly when it is finished (a `CHECK`), and `(userId, status, finishedAt, id)` makes a page or a re-drive batch an index range: 0.06 ms against 10 ms over 20 000 dead letters. A partial index was measured and never chosen, because Prisma sends the status as a cast parameter. |
 | 2026-11-16 | §4.8, §6.2, §6.3, §6.3a, §6.3c, §13.4, §15.2, D32 — per-account caps, the second half of 8.3. An account can have 3 `import.csv` and 50 `image.process` jobs queued or running, checked at submit and at both re-drives, and start 20 uploads a day, now recorded in `UploadSlip`; over any of them is `429`, without `Retry-After`. Each count and its write run under a per-account advisory lock. The `uploads/` lifecycle stays 7 days, and a budget alarm on the AWS account is a setup step. |
 | 2026-11-13 | §10.2, §11, §12.3, §13.2, §15.2, D16 — `trust proxy` and rate limits: 8.4 and the first half of 8.3. A global limiter gives every route a baseline of 300 a minute per caller; login, registration and refresh are limited further per address, and submit, both re-drives and `POST /uploads` per account. A `429` carries a `Retry-After` a browser can read. `TRUST_PROXY` names the proxy; unset, `X-Forwarded-For` is ignored, and `true` is refused. **D16 decided:** a replay counts. Request metrics by route and status, where a request no controller took is `unmatched` — which needed Nest's middleware route, `{/*splat}`, told apart from a controller's. §10.2 listed a `RolesGuard` that is not registered and a `LoggingInterceptor` that does not exist; it lists the registrations there are. |

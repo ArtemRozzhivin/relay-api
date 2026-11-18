@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Gauge, Registry } from '@prometheus-io/client';
 import type { Queue } from 'bullmq';
+import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { describeError } from '../common/errors/describe-error.js';
 import { JOBS_QUEUE, type JobMessage } from './job-queue.js';
@@ -10,6 +11,18 @@ import { JOB_TYPES } from './jobs.schema.js';
 // Where an unfinished job can wait in the queue. Completed and failed entries
 // are history the queue trims, not work still to do.
 const QUEUE_STATES = ['waiting', 'prioritized', 'delayed', 'active'] as const;
+
+// SQL rather than a groupBy, with the status written into it: Postgres reads
+// the small index of dead letters only when it can see, as it plans, that the
+// query asks for that status. Prisma sends the status as a parameter cast at
+// run time, which the planner cannot match, so every scrape read every job.
+export const DEAD_LETTERS_BY_TYPE = Prisma.sql`
+  -- An int: a bigint arrives as a BigInt, which a gauge does not take.
+  SELECT "type", count(*)::int AS "count"
+  FROM "Job"
+  WHERE "status" = 'DEAD_LETTERED'
+  GROUP BY "type"
+`;
 
 /**
  * The backlog, read from Postgres and Redis whenever Prometheus scrapes.
@@ -78,19 +91,18 @@ export class QueueMetrics {
 
   private async readDeadLetters() {
     try {
-      const counts = await this.prisma.job.groupBy({
-        by: ['type'],
-        where: { status: 'DEAD_LETTERED' },
-        _count: { _all: true },
-      });
+      const counts =
+        await this.prisma.$queryRaw<{ type: string; count: number }[]>(
+          DEAD_LETTERS_BY_TYPE,
+        );
 
       // Every type, so one with none reads 0 rather than nothing.
       for (const type of JOB_TYPES) {
         this.deadLetters.set({ type }, 0);
       }
 
-      for (const { type, _count } of counts) {
-        this.deadLetters.set({ type }, _count._all);
+      for (const { type, count } of counts) {
+        this.deadLetters.set({ type }, count);
       }
     } catch (error) {
       this.deadLetters.reset();
