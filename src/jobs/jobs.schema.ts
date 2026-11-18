@@ -117,15 +117,52 @@ export const listJobsSchema = z
   })
   .strict();
 
-export const bulkRedriveSchema = z
-  .object({
-    type: z.enum(JOB_TYPES).optional(),
-    errorCode: z.enum(DEAD_LETTER_CODES).optional(),
-    // When the job was dead-lettered — its `finishedAt` — not when it was
-    // submitted: an outage is a window in which jobs died. Half-open, so two
-    // adjacent windows never re-drive the same job twice.
-    deadLetteredFrom: instant.optional(),
-    deadLetteredTo: instant.optional(),
+// What finds a dead letter, read one way by the list and by the re-drive, so
+// the list shows what a re-drive with the same filter works through.
+const deadLetterFilter = z.object({
+  type: z.enum(JOB_TYPES).optional(),
+  errorCode: z.enum(DEAD_LETTER_CODES).optional(),
+  // When the job was dead-lettered — its `finishedAt` — not when it was
+  // submitted: an outage is a window in which jobs died. Half-open, so two
+  // adjacent windows never re-drive the same job twice.
+  deadLetteredFrom: instant.optional(),
+  deadLetteredTo: instant.optional(),
+});
+
+export type DeadLetterFilter = z.infer<typeof deadLetterFilter>;
+
+const windowInOrder = (filter: DeadLetterFilter) =>
+  filter.deadLetteredFrom === undefined ||
+  filter.deadLetteredTo === undefined ||
+  filter.deadLetteredFrom < filter.deadLetteredTo;
+
+const WINDOW_OUT_OF_ORDER = {
+  message: 'deadLetteredFrom must be before deadLetteredTo',
+};
+
+export const listDeadLettersSchema = deadLetterFilter
+  .extend({
+    limit: limitParam,
+    // The last dead letter a page held, by the two values the list is ordered
+    // on.
+    cursor: cursorParam(
+      z.object({
+        finishedAt: instant,
+        id: z.uuid(),
+      }),
+      // An ISO instant and a uuid.
+      24 + 36,
+    ).optional(),
+  })
+  .strict()
+  // No filter is a request to read every dead letter, which is harmless; it is
+  // the re-drive that needs one.
+  .refine(windowInOrder, WINDOW_OUT_OF_ORDER);
+
+export type ListDeadLettersQuery = z.infer<typeof listDeadLettersSchema>;
+
+export const bulkRedriveSchema = deadLetterFilter
+  .extend({
     // Bounded per call, so no single transaction holds thousands of row locks
     // until it commits. The response says how many still match.
     limit: z.number().int().min(1).max(1000).default(500),
@@ -144,13 +181,7 @@ export const bulkRedriveSchema = z
       message: 'At least one filter is required',
     },
   )
-  .refine(
-    (filter) =>
-      filter.deadLetteredFrom === undefined ||
-      filter.deadLetteredTo === undefined ||
-      filter.deadLetteredFrom < filter.deadLetteredTo,
-    { message: 'deadLetteredFrom must be before deadLetteredTo' },
-  );
+  .refine(windowInOrder, WINDOW_OUT_OF_ORDER);
 
 export type BulkRedriveInput = z.infer<typeof bulkRedriveSchema>;
 

@@ -411,9 +411,13 @@ Each step is motivated by the failure of the one before it.
   ```
   _Cheap defence in depth;_ `*` _CORS is a dev convenience only._
   ```
-- [ ] **8.6 · Dead-letter inspection and bulk re-drive** → resolve **D11**. The re-drive half
+- [x] **8.6 · Dead-letter inspection and bulk re-drive** → resolve **D11**. The re-drive half
   landed in A.7; what remains is inspection — listing dead letters by error code and window, so
   an operator can see a batch before acting on it, beyond `dryRun`'s count.
+  - [x] `GET /jobs/dead-letters`: the bulk re-drive's filter and order, paged by
+    `(finishedAt, id)`; the re-drive breaks ties by `id` to match, and `Job.finishedAt` holds
+    milliseconds so the cursor carries it exactly. A job has a `finishedAt` exactly when it is
+    finished, and an index serves both queries.
   ```
   _A dead letter nobody can act on is just a slow data leak._
   ```

@@ -52,7 +52,10 @@ describe('per-account caps', () => {
     userId: string,
     type: string,
     count: number,
-    { status = 'QUEUED' as JobStatus, finishedAt = null as Date | null } = {},
+    {
+      status = 'QUEUED',
+      finishedAt,
+    }: { status?: JobStatus; finishedAt?: Date } = {},
   ) =>
     prisma.job.createManyAndReturn({
       data: Array.from({ length: count }, () => ({
@@ -60,7 +63,10 @@ describe('per-account caps', () => {
         type,
         payload: {},
         status,
-        finishedAt,
+        // A job has a finishedAt exactly when it is finished (a CHECK).
+        finishedAt:
+          finishedAt ??
+          (status === 'QUEUED' || status === 'RUNNING' ? null : new Date()),
         error:
           status === 'DEAD_LETTERED'
             ? { code: 'ATTEMPTS_EXHAUSTED', message: 'it died', attempt: 5 }
@@ -395,7 +401,7 @@ describe('per-account caps', () => {
 
       await prisma.job.updateMany({
         where: { userId, idempotencyKey: { startsWith: 'held-' } },
-        data: { status: 'CANCELLED' },
+        data: { status: 'CANCELLED', finishedAt: new Date() },
       });
 
       const bulk = await whileLastPlaceIsTaken(userId, fill, async () =>

@@ -249,10 +249,12 @@ describe('cancellation transitions', () => {
 
       await charge(jobId, 1);
 
+      // Finished as a cancel would finish it, so this is the only CHECK the
+      // write breaks.
       await expect(
         prisma.job.update({
           where: { id: jobId },
-          data: { status: 'CANCELLED' },
+          data: { status: 'CANCELLED', finishedAt: new Date() },
         }),
       ).rejects.toThrow('Job_effect_never_cancelled');
     });

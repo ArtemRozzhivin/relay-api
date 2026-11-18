@@ -10,7 +10,7 @@ those claims has a test that kills real processes to prove it.
 
 - **Jobs over HTTP.** `POST /jobs` with an `Idempotency-Key` answers `202` at once; a separate
   worker process runs the job, with retries and backoff, dead-lettering, cancellation, and
-  re-drive one at a time or by filter.
+  re-drive one at a time or by filter — with the dead letters a filter matches listed first.
 - **CSV catalog import.** The client uploads straight to S3 with a presigned POST, so the API never
   carries the file. The worker streams it into Postgres 500 rows at a time in flat memory, resumes
   from its last committed batch after a crash, and leaves a downloadable report of the bad rows.

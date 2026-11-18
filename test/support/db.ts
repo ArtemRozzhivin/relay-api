@@ -86,6 +86,13 @@ export const seedJob = (
       correlationId: 'test',
       // A row built as attempt N of its first life has had N claims.
       lease: data.attempts ?? 0,
+      // A job has a finishedAt exactly when it is finished (a CHECK).
+      finishedAt:
+        data.status === undefined ||
+        data.status === 'QUEUED' ||
+        data.status === 'RUNNING'
+          ? null
+          : new Date(),
       ...data,
     },
   });

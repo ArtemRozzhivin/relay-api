@@ -184,7 +184,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `createdAt` | `timestamptz(3)` | Milliseconds, not microseconds: the list's cursor carries it through a JS `Date`, which holds no finer, and a rounded cursor would skip a job created microseconds after the one a page ended on (D14) |
 | `updatedAt` | `timestamptz(6)` | |
 | `startedAt` | `timestamptz(6)?` | The latest claim. Cleared by a re-drive |
-| `finishedAt` | `timestamptz(6)?` | Terminal transition |
+| `finishedAt` | `timestamptz(3)?` | Terminal transition. Milliseconds, like `createdAt`: the dead-letter list's cursor carries it through a JS `Date` too (D14) |
 
 **Indexes**
 
@@ -193,11 +193,23 @@ every line of application code is wrong; constraints listed as **APP** are polic
 - `(userId, createdAt DESC, id DESC)` and `(userId, status, createdAt DESC, id DESC)` — the job
   list's order without and with a status filter, so a page is a range of an index rather than a
   sort of every job the caller has (D14).
+- `(userId, status, finishedAt, id)` — the dead-letter list's order and the bulk re-drive's, so a
+  page or a batch is a range of an index rather than a sort of every dead letter the account has
+  (D11, D14). Measured over one account's 20 000 dead letters: the first page 0.06 ms against
+  10.1 ms, a re-drive batch of 1000 0.23 ms against 5.6 ms. Not partial: Prisma sends the status
+  as `CAST($1::text AS "JobStatus")`, which the planner cannot match to an index's `WHERE`, so a
+  partial index on dead letters was never chosen.
 - `(status)` partial `WHERE status IN ('QUEUED','RUNNING')` — operational "what is in flight".
 - `(type)` partial `WHERE status = 'DEAD_LETTERED'` — the dead-letter count every metrics scrape
   takes across all accounts (§12.3), which no index leading with `userId` can serve.
 
 **DB** `CHECK (attempts >= 0)`.
+
+**DB** `CHECK ((status IN ('QUEUED','RUNNING')) = (finishedAt IS NULL))` — a job has a
+`finishedAt` exactly when it is finished. Every transition into `SUCCEEDED`, `DEAD_LETTERED` or
+`CANCELLED` stamps it, and a re-drive, the one way back, clears it. The dead-letter list's cursor
+relies on it: a dead letter without `finishedAt` would sort last, end a page on a value the
+cursor cannot carry, and be re-driven without ever being listed.
 
 > `attempts <= maxAttempts` was specified and had to be dropped — it is unsatisfiable. The two
 > counters count different things: `Job.attempts` is incremented by `claim()` on **every
@@ -420,9 +432,10 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
+| `GET` | `/jobs/dead-letters` | access | `200` | The caller's dead letters, oldest-dead first, matching `POST /jobs/retry`'s filter — `?type=`, `?errorCode=`, `?deadLetteredFrom=`, `?deadLetteredTo=`, none required — in the order a re-drive with the same filter takes them. The re-drive skips a type at its cap, and later dead letters take its places (D32). Paged like `/jobs`: `?limit=` (1–100), `?cursor=` → `{ items, nextCursor }`. Send an offset's `+` as `%2B`: a query string reads `+` as a space, and the instant is refused. A scroll is not a snapshot; to page through a fixed set, set `deadLetteredTo` a few seconds in the past. See D11 |
 | `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) |
 | `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
-| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. See D11 |
+| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. Read a batch before sending it with `GET /jobs/dead-letters`. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
 | `POST` | `/uploads` | access | `200` / `429` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. `429 TOO_MANY_UPLOADS` past 20 in 24 hours (D32). See §6.3a |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
@@ -1886,10 +1899,10 @@ to settle it.
 | D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
 | D10 | ~~Worker concurrency tuning; sandboxed processors~~ | Measured event-loop blocking in the worker | **DECIDED 2026-11-09** — concurrency 5, renders in-process; image work leaves the event loop alone, measured below. Re-measured on the target host in phase 10 |
-| D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox |
+| D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox. Inspection **built 2026-11-18**: `GET /jobs/dead-letters` |
 | D12 | Status cache in Redis | A **measured** slow `GET /jobs/:id`. Never before | — |
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
-| D14 | ~~Cursor pagination~~ | A list endpoint where offset pagination measurably hurts | **DECIDED 2026-11-09** — keyset cursors on `/jobs` and `/products`, measured below |
+| D14 | ~~Cursor pagination~~ | A list endpoint where offset pagination measurably hurts | **DECIDED 2026-11-09** — keyset cursors on `/jobs` and `/products`, measured below; `/jobs/dead-letters` since 2026-11-18 |
 | D15 | ~~Job types beyond `MOCK` / `CHARGE`~~ | A real use case | **DECIDED 2026-10-26** — the real-job proposal is that use case: `import.csv`, `image.process`, then PD–PE (below) |
 | D16 | ~~Do replays bypass the rate limiter?~~ | A client retrying with the same key gets `429` for a job already accepted | **DECIDED 2026-11-13** — no: a replay counts like any request, and its retry after `Retry-After` is answered with the accepted job. Below |
 | D32 | ~~Limits on the work an account can put on S3~~ | Registration is public and `POST /uploads` signs without limit | **DECIDED 2026-11-11** — planned now, built in phase 8 (M8.3). **Built 2026-11-16** (§15.2). Below |
@@ -2027,7 +2040,7 @@ Three details the implementation settled:
 
 **D14 — lists page with an opaque cursor, never an offset.**
 A page starts strictly after the last item the previous one held — `(createdAt, id)` for jobs,
-newest first; `sku` for products — and the response carries that position as `nextCursor`. Three
+newest first; `(finishedAt, id)` for dead letters, oldest first; `sku` for products — and the response carries that position as `nextCursor`. Three
 things an offset gets wrong: a deep page reads and discards every row before it; a row inserted
 mid-scroll shifts the rest, so the next page repeats one already shown; and `total` is a
 `count(*)` over every matching row on every page. Measured on the last page of 20 000 rows,
@@ -2038,7 +2051,7 @@ locally: products **6.3 ms** by offset, a sequential scan and a sort of all 20 0
 The cursor carries the **values**, not a reference to a row. Prisma's own cursor names a row and
 skips it with `OFFSET 1`, so once that row leaves the filter — paging `?status=QUEUED` past a job
 that has since started — it skips a real row instead. Carrying the values through JavaScript is
-why `Job.createdAt` holds milliseconds (§4.3), and why `id` breaks ties, which a millisecond
+why `Job.createdAt` and `Job.finishedAt` hold milliseconds (§4.3), and why `id` breaks ties, which a millisecond
 clock makes common. A cursor's length limit is computed from the longest values its position
 holds, with JSON's six-character escape of a control character as the worst case, so a list
 never refuses a cursor it issued. It is base64url JSON and deliberately unsigned: every list is filtered to the
@@ -2086,6 +2099,18 @@ At least one filter is required — an empty body is what a client bug sends —
 counts without writing. A filter matching nothing answers `202 { redriven: 0, remaining: 0 }`:
 the caller asked for a set, and an empty set is a complete answer, unlike a cancel naming one
 job that had already finished.
+**Inspection — built 2026-11-18 (8.6).** `dryRun` says how many; `GET /jobs/dead-letters` says
+which, with each job's `error` and attempts, before anything is re-driven. It is a route of its
+own, not more filters on `GET /jobs`: that list is newest-submitted first while a re-drive works
+oldest-dead first, and an error code or a window of deaths means nothing for a job still running.
+It reads the re-drive's filter through the same function and pages in the re-drive's order,
+`(finishedAt, id)` — `id` was added to the re-drive's order for it, since jobs dying in the same
+millisecond had come back in no fixed order. What the list cannot show is the caps: the re-drive
+leaves a type at its cap out of the query, so later dead letters take that type's places in the
+batch, and a type with some room is cut short (D32). Nor is a scroll a snapshot: `finishedAt` is
+stamped before the write commits, so a job can land behind a cursor already past it, and a fixed
+set is paged with `deadLetteredTo` a few seconds in the past. Unlike the re-drive the list needs
+no filter: reading every dead letter changes nothing.
 
 **D28 — a reused key with a different body is a `422`, decided by a fingerprint.**
 D1 settled who mints the key, its scope and its lifetime, and never what a replay must match: a
@@ -2235,6 +2260,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-18 | §4.3, §6.2, D11, D14 — dead-letter inspection, 8.6. `GET /jobs/dead-letters` lists the caller's dead letters by the bulk re-drive's own filter and in its order, a cursor page at a time, so a batch can be read before it is re-driven; no filter is required. The bulk re-drive breaks ties by `id`, so jobs that died in the same millisecond are taken in the order the list shows them. `Job.finishedAt` narrowed to milliseconds, as `createdAt` was: at microseconds the next page would start before the job the last one ended on. A job has a `finishedAt` exactly when it is finished (a `CHECK`), and `(userId, status, finishedAt, id)` makes a page or a re-drive batch an index range: 0.06 ms against 10 ms over 20 000 dead letters. A partial index was measured and never chosen, because Prisma sends the status as a cast parameter. |
 | 2026-11-16 | §4.8, §6.2, §6.3, §6.3a, §6.3c, §13.4, §15.2, D32 — per-account caps, the second half of 8.3. An account can have 3 `import.csv` and 50 `image.process` jobs queued or running, checked at submit and at both re-drives, and start 20 uploads a day, now recorded in `UploadSlip`; over any of them is `429`, without `Retry-After`. Each count and its write run under a per-account advisory lock. The `uploads/` lifecycle stays 7 days, and a budget alarm on the AWS account is a setup step. |
 | 2026-11-13 | §10.2, §11, §12.3, §13.2, §15.2, D16 — `trust proxy` and rate limits: 8.4 and the first half of 8.3. A global limiter gives every route a baseline of 300 a minute per caller; login, registration and refresh are limited further per address, and submit, both re-drives and `POST /uploads` per account. A `429` carries a `Retry-After` a browser can read. `TRUST_PROXY` names the proxy; unset, `X-Forwarded-For` is ignored, and `true` is refused. **D16 decided:** a replay counts. Request metrics by route and status, where a request no controller took is `unmatched` — which needed Nest's middleware route, `{/*splat}`, told apart from a controller's. §10.2 listed a `RolesGuard` that is not registered and a `LoggingInterceptor` that does not exist; it lists the registrations there are. |
 | 2026-11-12 | §4.3, §11, §12.3, §13.2, §14, §15.2 — metrics from both processes, each on its own `METRICS_PORT` and labelled by `role`: the worker times every attempt by type and outcome, the API reads the backlog — the outbox and each queue state — and the dead letters by type when scraped. A source that cannot be read drops its series instead of failing the scrape. A partial index serves the dead-letter count. A27 registered and automated. |

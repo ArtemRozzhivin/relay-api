@@ -19,10 +19,12 @@ import { RateLimit } from '../common/rate-limit/rate-limit.js';
 import {
   bulkRedriveSchema,
   jobIdSchema,
+  listDeadLettersSchema,
   listJobsSchema,
   redriveQuerySchema,
   submitJobSchema,
   type BulkRedriveInput,
+  type ListDeadLettersQuery,
   type ListJobsQuery,
   type RedriveQuery,
   type SubmitJobInput,
@@ -101,6 +103,18 @@ export class JobsController {
     @Param('id', { schema: jobIdSchema }) id: string,
   ) {
     return toJobView(await this.jobs.cancel(user.id, id));
+  }
+
+  // Declared before ':id', which would otherwise take 'dead-letters' for a job
+  // id and refuse it as one.
+  @Get('dead-letters')
+  async findDeadLetters(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query({ schema: listDeadLettersSchema }) query: ListDeadLettersQuery,
+  ) {
+    const page = await this.jobs.findDeadLetters(user.id, query);
+
+    return { ...page, items: page.items.map(toJobView) };
   }
 
   @Get(':id')

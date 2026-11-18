@@ -25,6 +25,8 @@ import {
 } from './job-queue.js';
 import type {
   BulkRedriveInput,
+  DeadLetterFilter,
+  ListDeadLettersQuery,
   ListJobsQuery,
   SubmitJobInput,
 } from './jobs.schema.js';
@@ -58,11 +60,12 @@ const outboxEntry = (job: Job, correlationId: string) => ({
   } satisfies OutboxMessage,
 });
 
-// The caller's dead letters matching a bulk re-drive filter. Every filter is
-// optional on its own; the schema requires at least one.
+// The caller's dead letters matching a filter, for the list and the bulk
+// re-drive alike. Every filter is optional on its own; the re-drive's schema
+// requires at least one.
 const deadLettersMatching = (
   userId: string,
-  filter: BulkRedriveInput,
+  filter: DeadLetterFilter,
 ): Prisma.JobWhereInput => {
   const { type, errorCode, deadLetteredFrom, deadLetteredTo } = filter;
 
@@ -346,10 +349,11 @@ export class JobsService {
         .map(([type]) => type);
 
       // Oldest first, so repeated calls work through a backlog in the order
-      // it died.
+      // it died — and in the dead-letter list's order, the id breaking ties,
+      // so the list shows them in the order they are taken.
       const batch = await tx.job.findMany({
         where: { AND: [where, { type: { notIn: full } }] },
-        orderBy: { finishedAt: 'asc' },
+        orderBy: [{ finishedAt: 'asc' }, { id: 'asc' }],
         take: filter.limit,
         select: { id: true, type: true },
       });
@@ -535,6 +539,50 @@ export class JobsService {
 
     return toPage(rows, limit, (job) => ({
       createdAt: job.createdAt.toISOString(),
+      id: job.id,
+    }));
+  }
+
+  /**
+   * The caller's dead letters matching a filter, oldest-dead first, one page
+   * per call (D11, D14).
+   *
+   * The filter and the order are `POST /jobs/retry`'s, so this is what a
+   * re-drive with the same filter works through, in the order it does. The
+   * re-drive's batch is its first `limit` once types at their cap are left
+   * out, and of a type with some room only as many as fit (D32).
+   *
+   * A scroll is not a snapshot: a job is stamped dead before its write
+   * commits, and can land behind a cursor already past it. To page through a
+   * fixed set, set `deadLetteredTo` a few seconds in the past.
+   */
+  async findDeadLetters(
+    userId: string,
+    { limit, cursor, ...filter }: ListDeadLettersQuery,
+  ) {
+    const rows = await this.prisma.job.findMany({
+      where: {
+        AND: [
+          deadLettersMatching(userId, filter),
+          // Strictly after the cursor in (finishedAt, id) order.
+          cursor
+            ? {
+                OR: [
+                  { finishedAt: { gt: cursor.finishedAt } },
+                  { finishedAt: cursor.finishedAt, id: { gt: cursor.id } },
+                ],
+              }
+            : {},
+        ],
+      },
+      orderBy: [{ finishedAt: 'asc' }, { id: 'asc' }],
+      take: limit + 1,
+    });
+
+    return toPage(rows, limit, (job) => ({
+      // A CHECK gives every finished job a finishedAt, and the list holds only
+      // dead letters.
+      finishedAt: (job.finishedAt as Date).toISOString(),
       id: job.id,
     }));
   }
