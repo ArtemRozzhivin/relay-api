@@ -798,8 +798,9 @@ of failing jobs.
 
 ### Tasks
 
-- [ ] **D.1 ·** `LlmProvider` **interface** + `FakeLlmProvider` — deterministic, no API key, and
-  able to simulate 429s and malformed JSON on demand.
+- [x] **D.1 ·** `LlmProvider` **interface** + `FakeLlmProvider` — deterministic, no API key, and
+  able to simulate 429s and malformed JSON on demand. A directive in a product's name asks for
+  each failure (§6.3d), so a test that runs real processes can ask for one through an import.
   ```
   _The fake is not a stand-in for the real one; it is the only way to test the failure paths the
   real one produces rarely and expensively._

@@ -663,6 +663,56 @@ fixed the file behind the same URL, and naming the sku again is how they ask.
 until its current URL is processed, `{ "status": "READY", "thumb", "medium", "large" }` with links
 signed for an hour on each read, or `{ "status": "FAILED", "error" }`.
 
+### 6.3d `ai.enrich` — a category and tags for a batch of products (PD)
+
+The payload names up to 20 of the caller's skus. For each, a language model is asked for a
+`category` from a fixed list and up to 5 `tags`, from the product's `name` and `description`. One
+request carries the whole batch, so the instructions are paid for once, not once per product.
+
+`apparel` · `footwear` · `accessories` · `beauty` · `home` · `kitchen` · `electronics` · `toys` ·
+`sports` · `books` · `food` · `other`
+
+`other` is in the list so a product that fits none has an honest answer: a model made to choose
+from a list without one picks a wrong category, and nothing could tell it from a right one.
+
+**The reply is untrusted input** (A19). It is text meant to be JSON —
+`{ "items": [{ "sku", "category", "tags" }] }` — and each item is checked against a schema on its
+own: a category outside the list, more than 5 tags, a tag over 30 characters, or an sku the request
+did not name is refused. A reply that is not JSON, and items that were refused or left out, get one
+corrective request that says what was wrong. Whatever is still wrong after it is recorded on its
+product as `enrichmentStatus = 'FAILED'` with the reason, and nothing else is written for it; as
+with images, a product's failure is not the job's (D31). _Built in D.3._
+
+**A provider's 429 is not a failure** (A20). Its `Retry-After` pauses the AI queue for that long,
+and the job waits without spending an attempt. These jobs run on a queue of their own, `relay-ai`,
+with a limiter and a low concurrency: a BullMQ limiter applies to a whole queue, so on `relay-jobs`
+it would slow imports and images too (D6a). _Built in D.2 and D.4._
+
+**An unchanged product costs nothing** (A21). A product records `enrichmentInputHash`, the hash of
+what it was enriched from — name, description and the version of the instructions — and one whose
+hash matches and whose status is `READY` is skipped without a request. The write is conditional on
+the row still holding the name and description that were sent, so an import that changed them
+meanwhile wins. _Built in D.5._
+
+**Each job records its cost:** `tokensIn`, `tokensOut` and `estimatedCostUsd`, over all its
+requests, corrective ones included. _Built in D.6._
+
+**The provider is an interface,** `LlmProvider`, and PD builds one implementation:
+`FakeLlmProvider`, deterministic, with no key and no cost. A real model fails rarely and costs
+money each time, so the fake is the only way to test those failures, and it produces each on
+demand, when a product's name holds a directive:
+
+| In the name | The fake |
+|---|---|
+| `[llm:malformed]` | answers every request holding it with prose and cut-off JSON |
+| `[llm:malformed-once]` | answers like that until the corrective request, which it answers correctly |
+| `[llm:off-taxonomy]` | gives that product `gadgets`, a category outside the list |
+| `[llm:busy]` | refuses the first request holding it with a 429 and a `Retry-After` of 1 s; per process |
+
+Otherwise it picks a category by a hash of the sku, and up to 3 tags from the words of the name.
+Its token counts are the characters sent and received, over four. A real provider would plug in
+behind the same interface; which one, and whether one is built, PD leaves open.
+
 ### 6.4 Validation
 
 Nest 12's first-party `StandardSchemaValidationPipe` with Zod schemas, registered globally.
@@ -2341,6 +2391,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-19 | §6.3d — `ai.enrich` specified, and D.1 built. A batch of up to 20 skus gets a category from a fixed list of 12 and up to 5 tags in one request; the reply is checked item by item, with one corrective request, and what is still wrong fails its product, not the job. A 429 pauses a queue of the job's own; an unchanged product is skipped by the hash of its input; each job records its tokens and cost. `LlmProvider` is the interface, and `FakeLlmProvider` the one implementation: deterministic, and failing on demand when a product's name holds a directive. A real provider is left open. |
 | 2026-11-19 | §13.4, D32 — the AWS budget alarm is set: email alerts at $5 a month, on the account that holds the bucket. The last of 8.3, and of phase 8. |
 | 2026-11-18 | §6.3c, §10.1, §13.4, §15.2 — replaced image folders, 8.8. `ImageFolderSweeper` lists `products/` every 6 hours in each worker and deletes a folder only when it is neither the product's current URL's nor the one its image was made from, and nothing in it has been written for a day; a product that no longer exists keeps none. Rows are read after the listing, a folder split across listing pages is judged whole, and a bulk delete's per-key refusals are thrown. The window left open — a URL switched back and re-rendered within one S3 request — is named. |
 | 2026-11-18 | §7.7, §12.1, §14, §15.2 — logs joined by `correlationId`, 8.7. Every line about a job carries it as a field in both processes: the API binds the request id under that name to each line it writes while handling the request, and the worker runs each job, its stall, its abandonment and the sweep's finishing of it in a log context naming the `correlationId` and `jobId`, adding `jobType` and `attempt` once claimed — whichever class writes the line. A re-drive's runs are logged under the re-drive's id. A succeeded attempt now logs that it succeeded. `status` dropped from §12.1's fields. A28 registered and automated. |
