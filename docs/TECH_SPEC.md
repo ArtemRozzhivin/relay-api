@@ -1558,8 +1558,8 @@ admin user (never the root user):
    `npm ci` runs install scripts. The region is not a secret; `ci.yml` sets it.
 4. A **cost budget** on the AWS account (D32) — what notices abuse spread across many accounts,
    which no per-account cap can. Billing and Cost Management → Budgets → Create budget →
-   *Customize* → *Cost budget*: monthly, a fixed $10, and two email alerts — actual cost past 80%,
-   and forecasted cost past 100%. An IAM user sees Billing only once the root user has turned on
+   *Customize* → *Cost budget*: monthly, alerting by email at $5 — the project's account is set this
+   way (2026-11-19). An IAM user sees Billing only once the root user has turned on
    *IAM user and role access to Billing information* in the account settings. Budgets read cost
    data a few times a day, so an alert arrives hours after the spend, not minutes.
 
@@ -2259,7 +2259,7 @@ re-drives. The lifecycle stays 7 days: a day would cut one account's worst case 
 to 2, which is cents, and cost every dead import older than a day its re-drive. The budget alarm
 (§13.4) covers what per-account caps cannot — many accounts at once, and the downloads one
 account's imports make over a day. **Trigger** for a daily allowance of import attempts per
-account: the alarm fires.
+account: the alarm fires. The alarm was set on 2026-11-19, at $5 a month.
 
 **D16 — a replay counts against the rate limit.** The limiter runs before the handler, so it
 cannot tell a replay from a new submit without a database read in front of it — the read the
@@ -2341,6 +2341,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-19 | §13.4, D32 — the AWS budget alarm is set: email alerts at $5 a month, on the account that holds the bucket. The last of 8.3, and of phase 8. |
 | 2026-11-18 | §6.3c, §10.1, §13.4, §15.2 — replaced image folders, 8.8. `ImageFolderSweeper` lists `products/` every 6 hours in each worker and deletes a folder only when it is neither the product's current URL's nor the one its image was made from, and nothing in it has been written for a day; a product that no longer exists keeps none. Rows are read after the listing, a folder split across listing pages is judged whole, and a bulk delete's per-key refusals are thrown. The window left open — a URL switched back and re-rendered within one S3 request — is named. |
 | 2026-11-18 | §7.7, §12.1, §14, §15.2 — logs joined by `correlationId`, 8.7. Every line about a job carries it as a field in both processes: the API binds the request id under that name to each line it writes while handling the request, and the worker runs each job, its stall, its abandonment and the sweep's finishing of it in a log context naming the `correlationId` and `jobId`, adding `jobType` and `attempt` once claimed — whichever class writes the line. A re-drive's runs are logged under the re-drive's id. A succeeded attempt now logs that it succeeded. `status` dropped from §12.1's fields. A28 registered and automated. |
 | 2026-11-18 | §4.3, §15.2 — the dead-letter metric now reads its partial index. As a Prisma `groupBy` it never had: Prisma sends the status as a parameter cast at run time, which the planner cannot match to the index's `WHERE`, so every scrape read every job. The count is raw SQL with the status written in, and an integration test checks its plan. §15.2 had claimed the index was verified in use; corrected. |

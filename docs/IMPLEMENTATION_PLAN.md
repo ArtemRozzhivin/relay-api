@@ -17,7 +17,7 @@ in a runnable, demonstrable state.
 - [x] **M5** · Queue and worker
 - [x] **M6** · Reliability
 - [x] **M7** · Realtime
-- [ ] **M8** · Observability and hardening
+- [x] **M8** · Observability and hardening
 - [x] **M9** · Test harness and CI
 - [ ] **M10** · Load testing
 - [ ] **M11** · Deployment
@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 → PD → PE → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD → PE → PF → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -386,17 +386,17 @@ Each step is motivated by the failure of the one before it.
   ```
   _Worker throughput is invisible from the API's registry._
   ```
-- [ ] **8.3 · Rate limiting and per-account caps** on the abuse-prone surface → resolve **D16**,
+- [x] **8.3 · Rate limiting and per-account caps** on the abuse-prone surface → resolve **D16**,
   build **D32**. The rate limits landed with 8.4, and D16 is decided — a replay counts. The caps
-  are built; the budget alarm is what remains.
+  are built, and the budget alarm is set.
   - [x] Rate limits on auth, submit and `POST /uploads` — and on both re-drives, with a baseline
     on every other route.
   - [x] Per-account caps on upload slips (20 a day), and on unfinished `import.csv` (3) and
     `image.process` (50) jobs, at submit and at both re-drives.
   - [x] Weigh a 1-day `uploads/` lifecycle against how long a dead import can then be re-driven —
     weighed, and kept at 7 days (D32).
-  - [ ] An AWS Budgets alarm on the account that holds the bucket — set up in the console, as
-    §13.4 step 4 describes.
+  - [x] An AWS Budgets alarm on the account that holds the bucket — set up in the console, as
+    §13.4 step 4 describes: email alerts at $5 a month.
   ```
   _Registration is public and a 50 MB slip is signed locally, and one upload can be submitted
   under any number of keys — each job downloading the whole file again. A request rate does not
