@@ -29,7 +29,6 @@ interface RunningJob {
 
   /** The ownership token claim() handed this delivery; every write carries it. */
   lease: number;
-  correlationId: string;
 
   /** What the row already says, so a retry neither re-reports nor erases it. */
   progress: Prisma.JsonValue | null;
@@ -56,7 +55,6 @@ class RunningJobContext implements ManagedJobContext {
   readonly lastAttempt: boolean;
   readonly checkpoint: Prisma.JsonValue | null;
   private readonly lease: number;
-  private readonly correlationId: string;
   private readonly stopping: () => boolean;
 
   // The highest count accepted so far, and the last `total`/`message` seen —
@@ -105,7 +103,6 @@ class RunningJobContext implements ManagedJobContext {
     this.lastAttempt = job.lastAttempt;
     this.checkpoint = job.checkpoint;
     this.lease = job.lease;
-    this.correlationId = job.correlationId;
     this.stopping = job.stopping;
 
     const stored = readProgress(job.progress);
@@ -239,7 +236,7 @@ class RunningJobContext implements ManagedJobContext {
   }
 
   private get prefix() {
-    return `Job ${this.jobId} attempt ${this.attempt} [correlationId=${this.correlationId}]`;
+    return `Job ${this.jobId} attempt ${this.attempt}`;
   }
 
   // Never rejects. Progress is presentational (D25), so losing a write must not

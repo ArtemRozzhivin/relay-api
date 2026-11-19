@@ -5,6 +5,7 @@ import type { TestingModule } from '@nestjs/testing';
 import { Logger } from '@nestjs/common';
 import { BullModule, getQueueToken } from '@nestjs/bullmq';
 import { Worker, type Job as QueueJob, type Queue } from 'bullmq';
+import { LoggerModule, PinoLogger } from 'nestjs-pino';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { RedisModule } from '../../src/redis/redis.module.js';
@@ -106,6 +107,7 @@ describe('the stranded-job sweep', () => {
         RedisModule,
         BullModule.forRoot({ connection, prefix }),
         BullModule.registerQueue({ name: JOBS_QUEUE }),
+        LoggerModule.forRoot({ pinoHttp: { level: 'silent' } }),
       ],
       providers: [JobTransitionService, JobEventsPublisher, StrandedJobSweeper],
     });
@@ -253,7 +255,7 @@ describe('the stranded-job sweep', () => {
   // nothing else is touched. This test's ids start ffffffff and so sort after
   // every other row, which puts page boundaries among them whatever else is
   // in the table.
-  it('asks about every candidate once, though it finishes the last row of a page', async () => {
+  it("asks about every candidate once, under its delivery's correlationId, though it finishes the last row of a page", async () => {
     const run = randomUUID().slice(0, 4);
     const id = (n: number) =>
       `ffffffff-${run}-4000-8000-${String(n).padStart(12, '0')}`;
@@ -280,7 +282,7 @@ describe('the stranded-job sweep', () => {
         jobId,
         queue: JOBS_QUEUE,
         jobName: 'MOCK',
-        payload: {},
+        payload: { jobId, correlationId: `sweep-${jobId}`, maxAttempts: 1 },
         publishedAt: jobId === unpublished ? null : new Date(),
       })),
     });
@@ -307,16 +309,33 @@ describe('the stranded-job sweep', () => {
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
 
+    // What every line about each of this test's jobs is logged under.
+    const contexts: unknown[] = [];
+    const runInContext = PinoLogger.prototype.runInContext;
+    const contextSpy = vi
+      .spyOn(PinoLogger.prototype, 'runInContext')
+      .mockImplementation(function (this: PinoLogger, fn, options) {
+        if (ours.has(options?.bindings?.jobId)) {
+          contexts.push(options?.bindings);
+        }
+
+        return runInContext.call(this, fn, options);
+      });
+
     try {
       await sweeper.sweep();
     } finally {
       spy.mockRestore();
       quiet.mockRestore();
+      contextSpy.mockRestore();
     }
 
     const candidates = ids.filter((jobId) => jobId !== unpublished);
 
     expect(asked).toEqual(candidates);
+    expect(contexts).toEqual(
+      candidates.map((jobId) => ({ correlationId: `sweep-${jobId}`, jobId })),
+    );
     expect(
       await prisma.job.count({
         where: { id: { in: candidates }, status: 'DEAD_LETTERED' },

@@ -10,6 +10,9 @@ export default defineConfig({
     globals: true,
     root: './',
     include: ['test/assertions/**/*.spec.ts'],
+    // Every file registers its accounts from one address, far past the
+    // limits, which the integration tests cover.
+    env: { RATE_LIMITS: 'false' },
     globalSetup: ['test/harness/global-setup.ts'],
     fileParallelism: false,
     testTimeout: 240_000,

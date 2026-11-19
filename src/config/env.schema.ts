@@ -4,6 +4,23 @@ const duration = z
   .string()
   .regex(/^\d+(ms|s|m|h|d)$/, 'expected a duration such as 15m, 24h or 30d');
 
+// Express's own forms: a hop count, or the proxies' addresses and subnets.
+// `true` is refused: it trusts every hop, so a client that writes its own
+// X-Forwarded-For chooses the address it is limited by.
+const trustProxy = z
+  .string()
+  .refine((raw) => raw.trim() !== 'true', {
+    message: 'name a hop count or the proxy addresses, not true',
+  })
+  .transform((raw) =>
+    /^\d+$/.test(raw.trim())
+      ? Number(raw)
+      : raw
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter(Boolean),
+  );
+
 export const sharedEnvSchema = z.object({
   NODE_ENV: z
     .enum(['development', 'test', 'production'])
@@ -17,6 +34,9 @@ export const sharedEnvSchema = z.object({
   AWS_REGION: z.string().min(1),
   S3_BUCKET: z.string().min(1),
   S3_ENDPOINT: z.url().optional(),
+  // Unset, the process serves no metrics: a port is opened only where a
+  // deployment asks for one.
+  METRICS_PORT: z.coerce.number().int().min(1).max(65535).optional(),
 });
 
 export const apiEnvSchema = sharedEnvSchema.extend({
@@ -34,6 +54,11 @@ export const apiEnvSchema = sharedEnvSchema.extend({
         .map((origin) => origin.trim())
         .filter(Boolean),
     ),
+  // Unset, a request's address is its socket's and X-Forwarded-For is ignored.
+  TRUST_PROXY: trustProxy.optional(),
+  // Off only in the tests, which register hundreds of accounts from one
+  // address. Never off in production.
+  RATE_LIMITS: z.stringbool().default(true),
   RELAY_FAULT_AFTER_COMMIT: z.stringbool().default(false),
   ARGONID_TIME_COST: z.coerce.number().int().positive().default(2),
   ARGONID_MEMORY_COST: z.coerce.number().int().positive().default(19456),

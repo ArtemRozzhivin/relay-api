@@ -238,7 +238,11 @@ describe('the job API contract', () => {
 
       await app.get(PrismaService).job.update({
         where: { id: jobId },
-        data: { status: 'DEAD_LETTERED', checkpoint: { records: 1000 } },
+        data: {
+          status: 'DEAD_LETTERED',
+          checkpoint: { records: 1000 },
+          finishedAt: new Date(),
+        },
       });
 
       return { token, jobId };
@@ -296,7 +300,11 @@ describe('the job API contract', () => {
       const jobId = created.data.id as string;
       const job = await app.get(PrismaService).job.update({
         where: { id: jobId },
-        data: { type: 'import.csv', status },
+        data: {
+          type: 'import.csv',
+          status,
+          finishedAt: status === 'SUCCEEDED' ? new Date() : null,
+        },
       });
 
       if (withReport) {

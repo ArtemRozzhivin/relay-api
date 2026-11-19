@@ -17,7 +17,7 @@ in a runnable, demonstrable state.
 - [x] **M5** · Queue and worker
 - [x] **M6** · Reliability
 - [x] **M7** · Realtime
-- [ ] **M8** · Observability and hardening
+- [x] **M8** · Observability and hardening
 - [x] **M9** · Test harness and CI
 - [ ] **M10** · Load testing
 - [ ] **M11** · Deployment
@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 → PD → PE → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD → PE → PF → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -370,7 +370,7 @@ Each step is motivated by the failure of the one before it.
 
 ### Tasks
 
-- [ ] **8.0 · A config-driven socket.io adapter** — the gateway's CORS is `{ origin: true }`,
+- [x] **8.0 · A config-driven socket.io adapter** — the gateway's CORS is `{ origin: true }`,
   which reflects any origin. Tighten it to `CORS_ORIGINS` once a browser client exists.
 
   ```
@@ -378,48 +378,63 @@ Each step is motivated by the failure of the one before it.
   another origin._
   ```
 
-- [ ] **8.1 · Prometheus** `/metrics` — queue depth, job duration histogram, failure rate, dead-letter count.
+- [x] **8.1 · Prometheus** `/metrics` — queue depth, job duration histogram, failure rate, dead-letter count.
   ```
   _Logs say what happened; metrics say how much and how often._
   ```
-- [ ] **8.2 · Metrics from both processes**, labelled by role.
+- [x] **8.2 · Metrics from both processes**, labelled by role.
   ```
   _Worker throughput is invisible from the API's registry._
   ```
-- [ ] **8.3 · Rate limiting and per-account caps** on the abuse-prone surface → resolve **D16**,
-  build **D32**.
-  - Rate limits on auth, submit and `POST /uploads`.
-  - Per-account caps on outstanding upload slips, and on unfinished `import.csv` and
-    `image.process` jobs — or one unfinished import per upload key and ETag.
-  - Weigh a 1-day `uploads/` lifecycle against how long a dead import can then be re-driven.
-  - An AWS Budgets alarm on the account that holds the bucket.
+- [x] **8.3 · Rate limiting and per-account caps** on the abuse-prone surface → resolve **D16**,
+  build **D32**. The rate limits landed with 8.4, and D16 is decided — a replay counts. The caps
+  are built, and the budget alarm is set.
+  - [x] Rate limits on auth, submit and `POST /uploads` — and on both re-drives, with a baseline
+    on every other route.
+  - [x] Per-account caps on upload slips (20 a day), and on unfinished `import.csv` (3) and
+    `image.process` (50) jobs, at submit and at both re-drives.
+  - [x] Weigh a 1-day `uploads/` lifecycle against how long a dead import can then be re-driven —
+    weighed, and kept at 7 days (D32).
+  - [x] An AWS Budgets alarm on the account that holds the bucket — set up in the console, as
+    §13.4 step 4 describes: email alerts at $5 a month.
   ```
   _Registration is public and a 50 MB slip is signed locally, and one upload can be submitted
   under any number of keys — each job downloading the whole file again. A request rate does not
   bound the bytes an account can hold. Re-verify_ `@nestjs/throttler`_'s Nest 12 support at
   this point rather than assuming it._
   ```
-- [ ] **8.4 ·** `trust proxy` configured before rate limiting is believed.
+- [x] **8.4 ·** `trust proxy` configured before rate limiting is believed.
   ```
   _Behind a proxy every client shares one IP unless the forwarded header is trusted._
   ```
-- [ ] **8.5 · helmet, CORS allowlist, body-size limits.**
+- [x] **8.5 · helmet, CORS allowlist, body-size limits.**
   ```
   _Cheap defence in depth;_ `*` _CORS is a dev convenience only._
   ```
-- [ ] **8.6 · Dead-letter inspection and bulk re-drive** → resolve **D11**. The re-drive half
+- [x] **8.6 · Dead-letter inspection and bulk re-drive** → resolve **D11**. The re-drive half
   landed in A.7; what remains is inspection — listing dead letters by error code and window, so
   an operator can see a batch before acting on it, beyond `dryRun`'s count.
+  - [x] `GET /jobs/dead-letters`: the bulk re-drive's filter and order, paged by
+    `(finishedAt, id)`; the re-drive breaks ties by `id` to match, and `Job.finishedAt` holds
+    milliseconds so the cursor carries it exactly. A job has a `finishedAt` exactly when it is
+    finished, and an index serves both queries.
   ```
   _A dead letter nobody can act on is just a slow data leak._
   ```
-- [ ] **8.7 · Verify** `correlationId` **joins API and worker logs** end to end.
+- [x] **8.7 · Verify** `correlationId` **joins API and worker logs** end to end.
+  - [x] Every line about a job carries `correlationId` as a field in both processes, whichever
+    class writes it. The worker's lines name `jobId` too, and `jobType` and `attempt` once the
+    attempt has claimed the job. A re-drive's runs are under the re-drive's id, joined to the
+    submit's by `jobId`. A28 reads both processes' JSON logs.
   ```
   _A correlation id that stops at the process boundary is decorative._
   ```
-- [ ] **8.8 · Delete the files of a product's replaced image** — a sweep over
+- [x] **8.8 · Delete the files of a product's replaced image** — a sweep over
   `products/<userId>/<productId>/` that deletes a hash folder only when it is not the hash of the
   product's current `imageSourceUrl` **and** none of its files was written in the last day (§6.3c).
+  - [x] `ImageFolderSweeper`, every 6 hours in each worker. It keeps the current `imageUrl`'s
+    folder too, since a URL switched back is re-rendered into its old folder; reads the rows after
+    the listing; and judges a folder split across listing pages whole.
   ```
   _Deleting the old folder when the new image is recorded races a URL switched back while a slow
   job finishes: its late delete takes the files the row points at again. A re-render rewrites the
@@ -428,9 +443,11 @@ Each step is motivated by the failure of the one before it.
 
 ### Done when
 
-- [ ] A scrapeable `/metrics` exists on both processes
-- [ ] Queue depth visibly rises and drains under load
-- [ ] One job's full story is retrievable from logs by `correlationId` alone
+- [x] A scrapeable `/metrics` exists on both processes — each on its own `METRICS_PORT`
+- [x] Queue depth visibly rises and drains under load — A27: 20 jobs with no worker, then one
+- [x] One job's full story is retrievable from logs by `correlationId` alone — A28: the submit
+  and every attempt under the submit's id; a re-drive's runs under the re-drive's id, joined by
+  `jobId`
 
 ---
 

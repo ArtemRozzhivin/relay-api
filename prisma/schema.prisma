@@ -24,6 +24,7 @@ model User {
   refreshTokens RefreshToken[]
   jobs          Job[]
   products      Product[]
+  uploadSlips   UploadSlip[]
 }
 
 model RefreshToken {
@@ -78,7 +79,8 @@ model Job {
   createdAt       DateTime  @default(now()) @db.Timestamptz(3)
   updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
   startedAt       DateTime? @db.Timestamptz(6)
-  finishedAt      DateTime? @db.Timestamptz(6)
+  /// Milliseconds, like `createdAt`: the dead-letter list's cursor carries it through a JS Date.
+  finishedAt      DateTime? @db.Timestamptz(3)
 
   user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   sideEffects SideEffect[]
@@ -87,6 +89,7 @@ model Job {
   @@unique([userId, idempotencyKey])
   @@index([userId, status, createdAt(sort: Desc), id(sort: Desc)])
   @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([userId, status, finishedAt, id])
 }
 
 model SideEffect {
@@ -115,6 +118,19 @@ model Outbox {
   publishedAt DateTime? @db.Timestamptz(6)
 
   job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+}
+
+/// An upload slip `POST /uploads` signed: nothing else records one, and an account may hold
+/// only so many (D32). Rows older than the window are deleted as the next slip is signed.
+model UploadSlip {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  key       String
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
 }
 
 /// A store's product, written by `import.csv`. A store knows it by its own `sku`, never by

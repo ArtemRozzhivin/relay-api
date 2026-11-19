@@ -20,7 +20,7 @@ const QUEUE_PREFIX = 'bull:relay-jobs';
 // previous test file still held it, the new one exited with EADDRINUSE, and the
 // health check was then satisfied by the old process — so a test could run
 // against a server started with entirely different environment variables.
-const freePort = () =>
+export const freePort = () =>
   new Promise<number>((resolve, reject) => {
     const probe = createServer();
 

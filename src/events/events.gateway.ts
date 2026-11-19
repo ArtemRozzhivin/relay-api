@@ -23,7 +23,8 @@ import { describeError } from '../common/errors/describe-error.js';
 
 export const userRoom = (userId: string) => `user:${userId}`;
 
-@WebSocketGateway({ namespace: 'events', cors: { origin: true } })
+// Its origins are configured in configure-app.ts.
+@WebSocketGateway({ namespace: 'events' })
 export class EventsGateway
   implements OnGatewayInit, OnGatewayConnection, OnModuleInit, OnModuleDestroy
 {
@@ -104,8 +105,6 @@ export class EventsGateway
   }
 
   async onModuleDestroy() {
-    await this.subscriber
-      ?.quit()
-      .catch(() => this.subscriber?.disconnect());
+    await this.subscriber?.quit().catch(() => this.subscriber?.disconnect());
   }
 }

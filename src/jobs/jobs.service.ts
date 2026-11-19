@@ -25,11 +25,20 @@ import {
 } from './job-queue.js';
 import type {
   BulkRedriveInput,
+  DeadLetterFilter,
+  ListDeadLettersQuery,
   ListJobsQuery,
   SubmitJobInput,
 } from './jobs.schema.js';
 import type { ApiEnv } from '../config/env.schema.js';
 import { requestHash } from './request-hash.js';
+import {
+  assertUnderCap,
+  isCapped,
+  roomLeft,
+  withinRoom,
+} from './unfinished-caps.js';
+import { lockAccount } from '../prisma/account-lock.js';
 import { toPage } from '../common/pagination/cursor.js';
 import { describeError } from '../common/errors/describe-error.js';
 
@@ -51,11 +60,12 @@ const outboxEntry = (job: Job, correlationId: string) => ({
   } satisfies OutboxMessage,
 });
 
-// The caller's dead letters matching a bulk re-drive filter. Every filter is
-// optional on its own; the schema requires at least one.
+// The caller's dead letters matching a filter, for the list and the bulk
+// re-drive alike. Every filter is optional on its own; the re-drive's schema
+// requires at least one.
 const deadLettersMatching = (
   userId: string,
-  filter: BulkRedriveInput,
+  filter: DeadLetterFilter,
 ): Prisma.JobWhereInput => {
   const { type, errorCode, deadLetteredFrom, deadLetteredTo } = filter;
 
@@ -110,6 +120,9 @@ export class JobsService {
    * different body.
    * @throws UploadNotFoundError (422) when an `import.csv` names a key that is
    * not one of the caller's uploads, or no longer exists.
+   * @throws TooManyUnfinishedJobsError (429) when the caller already has as many
+   * unfinished jobs of this type as it may (D32). A replay is answered as one
+   * all the same.
    */
   async submit({ userId, idempotencyKey, correlationId, input }: SubmitArgs) {
     await this.checkUpload(userId, idempotencyKey, input);
@@ -119,6 +132,12 @@ export class JobsService {
 
     try {
       committed = await this.prisma.$transaction(async (tx) => {
+        if (isCapped(input.type)) {
+          await lockAccount(tx, userId);
+        }
+
+        // Written before the cap is checked, so a replay fails here on the
+        // unique key and is answered as one even with the account at its cap.
         const job = await tx.job.create({
           data: {
             userId,
@@ -130,6 +149,8 @@ export class JobsService {
             maxAttempts: input.maxAttempts,
           },
         });
+
+        await assertUnderCap(tx, userId, job.type);
 
         const outbox = await tx.outbox.create({
           data: outboxEntry(job, correlationId),
@@ -236,6 +257,8 @@ export class JobsService {
    * @throws JobNotFoundError (404) when the job does not exist or is another
    * tenant's.
    * @throws JobNotDeadLetteredError (409) when the job is not dead-lettered.
+   * @throws TooManyUnfinishedJobsError (429) when the caller already has as many
+   * unfinished jobs of its type as it may (D32).
    */
   async redrive(
     userId: string,
@@ -246,6 +269,10 @@ export class JobsService {
     const existing = await this.findOne(userId, jobId);
 
     const requeued = await this.prisma.$transaction(async (tx) => {
+      if (isCapped(existing.type)) {
+        await lockAccount(tx, userId);
+      }
+
       const job = await this.transitions.redrive(existing.id, tx, {
         fromStart,
       });
@@ -253,6 +280,8 @@ export class JobsService {
       if (!job) {
         return null;
       }
+
+      await assertUnderCap(tx, userId, job.type);
 
       const outbox = await tx.outbox.create({
         data: outboxEntry(job, correlationId),
@@ -287,6 +316,11 @@ export class JobsService {
    * re-checks the status — but a re-driven job that dies again is a new dead
    * letter, and with no `deadLetteredTo` it matches again.
    *
+   * Capped types come back only as far as the caller's caps have room (D32),
+   * so a call can re-drive fewer than `limit` while more still match: the rest
+   * stay dead-lettered, counted in `remaining`, for a call made once some of
+   * the caller's jobs have finished.
+   *
    * @returns how many this call re-drove, and how many still match — call
    * again until `remaining` is 0, with `deadLetteredTo` set to when the loop
    * started so it works through a fixed set. With `dryRun`, nothing changes and
@@ -304,21 +338,33 @@ export class JobsService {
     }
 
     const redriven = await this.prisma.$transaction(async (tx) => {
-      // Oldest first, so repeated calls work through a backlog in the order
-      // it died.
-      const batch = await tx.job.findMany({
-        where,
-        orderBy: { finishedAt: 'asc' },
-        take: filter.limit,
-        select: { id: true },
-      });
+      await lockAccount(tx, userId);
 
-      if (batch.length === 0) {
+      const room = await roomLeft(tx, userId);
+      // Left out of the query, not only out of the batch: a backlog of
+      // imports at their cap would otherwise fill every batch, and the dead
+      // letters behind them would never be reached.
+      const full = [...room]
+        .filter(([, left]) => left <= 0)
+        .map(([type]) => type);
+
+      // Oldest first, so repeated calls work through a backlog in the order
+      // it died — and in the dead-letter list's order, the id breaking ties,
+      // so the list shows them in the order they are taken.
+      const batch = await tx.job.findMany({
+        where: { AND: [where, { type: { notIn: full } }] },
+        orderBy: [{ finishedAt: 'asc' }, { id: 'asc' }],
+        take: filter.limit,
+        select: { id: true, type: true },
+      });
+      const fits = withinRoom(batch, room);
+
+      if (fits.length === 0) {
         return [];
       }
 
       const jobs = await this.transitions.redriveMany(
-        batch.map(({ id }) => id),
+        fits.map(({ id }) => id),
         tx,
       );
 
@@ -493,6 +539,50 @@ export class JobsService {
 
     return toPage(rows, limit, (job) => ({
       createdAt: job.createdAt.toISOString(),
+      id: job.id,
+    }));
+  }
+
+  /**
+   * The caller's dead letters matching a filter, oldest-dead first, one page
+   * per call (D11, D14).
+   *
+   * The filter and the order are `POST /jobs/retry`'s, so this is what a
+   * re-drive with the same filter works through, in the order it does. The
+   * re-drive's batch is its first `limit` once types at their cap are left
+   * out, and of a type with some room only as many as fit (D32).
+   *
+   * A scroll is not a snapshot: a job is stamped dead before its write
+   * commits, and can land behind a cursor already past it. To page through a
+   * fixed set, set `deadLetteredTo` a few seconds in the past.
+   */
+  async findDeadLetters(
+    userId: string,
+    { limit, cursor, ...filter }: ListDeadLettersQuery,
+  ) {
+    const rows = await this.prisma.job.findMany({
+      where: {
+        AND: [
+          deadLettersMatching(userId, filter),
+          // Strictly after the cursor in (finishedAt, id) order.
+          cursor
+            ? {
+                OR: [
+                  { finishedAt: { gt: cursor.finishedAt } },
+                  { finishedAt: cursor.finishedAt, id: { gt: cursor.id } },
+                ],
+              }
+            : {},
+        ],
+      },
+      orderBy: [{ finishedAt: 'asc' }, { id: 'asc' }],
+      take: limit + 1,
+    });
+
+    return toPage(rows, limit, (job) => ({
+      // A CHECK gives every finished job a finishedAt, and the list holds only
+      // dead letters.
+      finishedAt: (job.finishedAt as Date).toISOString(),
       id: job.id,
     }));
   }

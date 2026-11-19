@@ -46,7 +46,9 @@ describe('bulk re-drive', () => {
       status,
       attempts: 3,
       error: { code, message: 'it died', attempt: 3 },
-      finishedAt,
+      // A job has a finishedAt exactly when it is finished (a CHECK).
+      finishedAt:
+        status === 'QUEUED' || status === 'RUNNING' ? null : finishedAt,
     });
 
     return created.id;

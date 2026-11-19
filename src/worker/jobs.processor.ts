@@ -1,7 +1,18 @@
 import { Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
-import { DelayedError, UnrecoverableError, type Job as QueueJob } from 'bullmq';
+import {
+  InjectQueue,
+  OnWorkerEvent,
+  Processor,
+  WorkerHost,
+} from '@nestjs/bullmq';
+import {
+  DelayedError,
+  UnrecoverableError,
+  type Job as QueueJob,
+  type Queue,
+} from 'bullmq';
+import { PinoLogger } from 'nestjs-pino';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
 import { JobContextFactory } from '../jobs/job-context.factory.js';
@@ -11,13 +22,14 @@ import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { AppError, TerminalJobError } from '../common/errors/app-error.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';
+import { JobMetrics, type AttemptOutcome } from './job-metrics.js';
 
 // The HTTP filter's rule, applied to a job's error: only an AppError's message
 // was written for the job's owner. Anything else — Prisma, S3, a socket — can
 // name a table, the principal a bucket refused, or an internal address, so the
 // owner is told only that it happened and where to point, and the worker's log
-// keeps what. The correlation id is the submit's request id, which the owner
-// already holds.
+// keeps what. The correlation id is the id of the request that queued the
+// attempt, a submit's or a re-drive's, which the owner already holds.
 const ownerMessage = (error: unknown, correlationId: string) =>
   error instanceof AppError
     ? error.message
@@ -40,11 +52,25 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     private readonly contexts: JobContextFactory,
     private readonly events: JobEventsPublisher,
     private readonly config: ConfigService<WorkerEnv, true>,
+    private readonly metrics: JobMetrics,
+    private readonly logContext: PinoLogger,
+    @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
   ) {
     super();
   }
 
-  async process(message: QueueJob<JobMessage>, token?: string) {
+  // Every line logged while the job runs carries its correlationId and id,
+  // whoever logs it — this class, the handler, a transition — so a search for
+  // the correlationId of a submit finds the runs it started (§12.1).
+  process(message: QueueJob<JobMessage>, token?: string) {
+    const { jobId, correlationId } = message.data;
+
+    return this.logContext.runInContext(() => this.run(message, token), {
+      bindings: { correlationId, jobId },
+    });
+  }
+
+  private async run(message: QueueJob<JobMessage>, token?: string) {
     const { jobId, correlationId } = message.data;
 
     // Before the claim, not after: a retry scheduled after the cancel request,
@@ -55,9 +81,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
     if (cancelled) {
       await this.events.jobUpdated(cancelled);
-      this.logger.log(
-        `Job ${jobId} cancelled before it ran [correlationId=${correlationId}]`,
-      );
+      this.logger.log(`Job ${jobId} cancelled before it ran`);
 
       return;
     }
@@ -79,10 +103,19 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     // job, and the catch below dead-letters by the same answer.
     const lastAttempt = attempt >= claimed.maxAttempts;
 
+    // Known only from the claim: the type is on the row, the attempt is this
+    // one. assign() throws outside a log context, so run() is process()'s alone.
+    this.logContext.assign({ jobType: claimed.type, attempt });
+
+    const endAttempt = this.metrics.startAttempt(claimed.type);
+    // Until a branch below records one: a transition that throws leaves the
+    // attempt with no outcome written, and the queue delivers the job again.
+    let outcome: AttemptOutcome = 'unrecorded';
+
     await this.events.jobUpdated(claimed);
 
     this.logger.log(
-      `Running job ${jobId} (${claimed.type}) attempt ${attempt}/${claimed.maxAttempts} [correlationId=${correlationId}]`,
+      `Running job ${jobId} (${claimed.type}) attempt ${attempt}/${claimed.maxAttempts}`,
     );
 
     const context = this.contexts.create({
@@ -91,7 +124,6 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       attempt,
       lastAttempt,
       lease,
-      correlationId,
       progress: claimed.progress,
       checkpoint: claimed.checkpoint,
       stopping: () => this.stopping,
@@ -108,8 +140,11 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
       const succeeded = await this.transitions.succeed(jobId, lease, result);
 
+      outcome = succeeded ? 'succeeded' : 'superseded';
+
       if (succeeded) {
         await this.events.jobUpdated(succeeded);
+        this.logger.log(`Job ${jobId} succeeded on attempt ${attempt}`);
       } else {
         this.logger.warn(
           `Job ${jobId} finished on attempt ${attempt} but that attempt no longer owns it`,
@@ -126,6 +161,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         const stopped = await this.transitions.cancel(jobId, lease);
 
         if (stopped) {
+          outcome = 'cancelled';
           await this.events.jobUpdated(stopped);
           this.logger.log(
             `Job ${jobId} cancelled at a safe point on attempt ${attempt}`,
@@ -139,6 +175,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           : null;
 
         if (released) {
+          outcome = 'handed_back';
           await this.events.jobUpdated(released);
           this.logger.log(
             `Job ${jobId} handed back at a safe point for the next worker; attempt ${attempt} not counted`,
@@ -153,6 +190,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
         // shouldStop() is also true for an attempt that lost the job; the
         // attempt that holds it now is the one entitled to finish it.
+        outcome = 'superseded';
         this.logger.warn(
           `Job ${jobId} stopped on attempt ${attempt}, which no longer owns it`,
         );
@@ -180,6 +218,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
           attempt,
         });
 
+        outcome = dead ? 'dead_lettered' : 'superseded';
+
         if (dead) {
           await this.events.jobUpdated(dead);
 
@@ -201,6 +241,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
         attempt,
       });
 
+      outcome = requeued ? 'retrying' : 'superseded';
+
       if (!requeued) {
         this.logger.warn(
           `Job ${jobId} failed on attempt ${attempt}, which no longer owns it; retry not scheduled`,
@@ -214,6 +256,8 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
       }
 
       throw cause;
+    } finally {
+      endAttempt(outcome);
     }
   }
 
@@ -238,8 +282,12 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
 
     // Registered as a bare event listener, so nothing holds this promise or
     // waits for it on shutdown; tracking it is what makes onModuleDestroy able
-    // to finish a dead-letter that is in flight when SIGTERM arrives.
-    const task = this.finalise(jobId, correlationId, error);
+    // to finish a dead-letter that is in flight when SIGTERM arrives. Outside
+    // process() as well, so outside its log context: it opens its own.
+    const task = this.logContext.runInContext(
+      () => this.finalise(jobId, correlationId, error),
+      { bindings: { correlationId, jobId } },
+    );
 
     this.finalising.add(task);
     void task.finally(() => this.finalising.delete(task));
@@ -282,10 +330,20 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     await Promise.allSettled(this.finalising);
   }
 
+  // Given only the queue entry's id, so the entry is read for the ids to log
+  // under: a stall is the line a search for a lost run most needs. Logged
+  // without them if the entry cannot be read, never not at all.
   @OnWorkerEvent('stalled')
-  onStalled(jobId: string) {
-    this.logger.warn(
-      `Job ${jobId} stalled; the queue will redeliver it or abandon it`,
+  async onStalled(entryId: string) {
+    const entry = await this.queue.getJob(entryId).catch(() => undefined);
+    const { jobId, correlationId } = entry?.data ?? {};
+
+    this.logContext.runInContext(
+      () =>
+        this.logger.warn(
+          `Job ${jobId ?? entryId} stalled; the queue will redeliver it or abandon it`,
+        ),
+      { bindings: { correlationId, jobId } },
     );
   }
 }

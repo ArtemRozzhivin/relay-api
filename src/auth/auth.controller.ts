@@ -1,4 +1,5 @@
 import { Body, Controller, HttpCode, Post } from '@nestjs/common';
+import { hours, minutes } from '@nestjs/throttler';
 import { AuthService } from './auth.service.js';
 import {
   loginSchema,
@@ -11,11 +12,14 @@ import {
 import { Public } from './decorators/public.decorator.js';
 import { CurrentUser } from './decorators/current-user.decorator.js';
 import { type AuthenticatedUser } from './auth.types.js';
+import { RateLimit } from '../common/rate-limit/rate-limit.js';
 
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
+  // Each guess costs an Argon2 hash, and a person mistypes a few times, not ten.
+  @RateLimit(10, minutes(1))
   @Public()
   @Post('/login')
   @HttpCode(200)
@@ -25,6 +29,9 @@ export class AuthController {
     return result;
   }
 
+  // Each account brings limits of its own, so this bounds how many fresh sets
+  // of limits one address can mint.
+  @RateLimit(5, hours(1))
   @Public()
   @Post('/register')
   async register(@Body({ schema: registerSchema }) body: RegisterInput) {
@@ -33,6 +40,9 @@ export class AuthController {
     return result;
   }
 
+  // A client refreshes once per access token; this bounds the database work
+  // of one address replaying stale ones.
+  @RateLimit(60, minutes(1))
   @Public()
   @Post('/refresh')
   @HttpCode(200)

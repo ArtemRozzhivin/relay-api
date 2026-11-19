@@ -7,10 +7,16 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
 import type { Queue } from 'bullmq';
+import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
-import { JOBS_QUEUE, messageId, type JobMessage } from '../jobs/job-queue.js';
+import {
+  JOBS_QUEUE,
+  messageId,
+  type JobMessage,
+  type OutboxMessage,
+} from '../jobs/job-queue.js';
 import type { JobStatus } from '../generated/prisma/enums.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';
@@ -66,6 +72,7 @@ export class StrandedJobSweeper
     private readonly events: JobEventsPublisher,
     private readonly config: ConfigService<WorkerEnv, true>,
     @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
+    private readonly logContext: PinoLogger,
   ) {}
 
   // A plain timer rather than @Interval: SchedulerRegistry clears its timers
@@ -106,7 +113,7 @@ export class StrandedJobSweeper
           outbox: {
             orderBy: { id: 'desc' },
             take: 1,
-            select: { id: true, publishedAt: true },
+            select: { id: true, publishedAt: true, payload: true },
           },
         },
       });
@@ -121,9 +128,18 @@ export class StrandedJobSweeper
         // direct path marks the row published only after the worker may
         // already have claimed it.
         if (latest && (status === 'RUNNING' || latest.publishedAt !== null)) {
-          await this.finishIfStranded(
-            { id, status, lease, outboxId: latest.id },
-            now,
+          // The delivery's own correlationId, a re-drive's when a re-drive
+          // queued it, so the line that ends the job joins the run it ends
+          // (§12.1). Json in the schema: an OutboxMessage by agreement.
+          const { correlationId } = latest.payload as unknown as OutboxMessage;
+
+          await this.logContext.runInContext(
+            () =>
+              this.finishIfStranded(
+                { id, status, lease, outboxId: latest.id },
+                now,
+              ),
+            { bindings: { correlationId, jobId: id } },
           );
         }
       }

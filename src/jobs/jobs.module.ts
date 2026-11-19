@@ -7,6 +7,7 @@ import { JobCoreModule } from './job-core.module.js';
 import { JOBS_QUEUE } from './job-queue.js';
 import { OutboxRelayService } from './outbox-relay.service.js';
 import { StorageModule } from '../storage/storage.module.js';
+import { QueueMetrics } from './queue-metrics.js';
 
 @Module({
   imports: [
@@ -16,6 +17,6 @@ import { StorageModule } from '../storage/storage.module.js';
     BullModule.registerQueue({ name: JOBS_QUEUE }),
   ],
   controllers: [JobsController],
-  providers: [JobsService, OutboxRelayService],
+  providers: [JobsService, OutboxRelayService, QueueMetrics],
 })
 export class JobsModule {}

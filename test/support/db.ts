@@ -65,7 +65,7 @@ export const createThrowawayUser = async (
   return user.id;
 };
 
-/** Deletes test users; their jobs, products and outbox rows go with them. */
+/** Deletes test users; their jobs, products, upload slips and outbox rows go with them. */
 export const deleteUsers = (prisma: PrismaClient, ids: string[]) =>
   prisma.user.deleteMany({ where: { id: { in: ids } } });
 
@@ -86,6 +86,13 @@ export const seedJob = (
       correlationId: 'test',
       // A row built as attempt N of its first life has had N claims.
       lease: data.attempts ?? 0,
+      // A job has a finishedAt exactly when it is finished (a CHECK).
+      finishedAt:
+        data.status === undefined ||
+        data.status === 'QUEUED' ||
+        data.status === 'RUNNING'
+          ? null
+          : new Date(),
       ...data,
     },
   });

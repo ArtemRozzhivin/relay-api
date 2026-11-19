@@ -5,6 +5,7 @@ export type ErrorKind =
   | 'NOT_FOUND'
   | 'CONFLICT'
   | 'UNPROCESSABLE'
+  | 'LIMIT_REACHED'
   | 'INTERNAL';
 
 export abstract class AppError extends Error {
@@ -143,5 +144,28 @@ export class JobAlreadyFinishedError extends AppError {
 
   constructor() {
     super('Only an unfinished job can be cancelled');
+  }
+}
+
+// 429, as a rate limit is: nothing is wrong with the request, and the same one
+// succeeds later. But no Retry-After — the place frees when one of the
+// account's jobs finishes, and only the jobs know when that is.
+export class TooManyUnfinishedJobsError extends AppError {
+  readonly kind = 'LIMIT_REACHED' as const;
+  readonly code = 'TOO_MANY_UNFINISHED_JOBS';
+
+  constructor(type: string, cap: number) {
+    super(
+      `At most ${cap} ${type} jobs can be unfinished at once; send this one when one of them finishes`,
+    );
+  }
+}
+
+export class TooManyUploadsError extends AppError {
+  readonly kind = 'LIMIT_REACHED' as const;
+  readonly code = 'TOO_MANY_UPLOADS';
+
+  constructor(perDay: number) {
+    super(`At most ${perDay} uploads can be started in 24 hours`);
   }
 }

@@ -184,7 +184,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `createdAt` | `timestamptz(3)` | Milliseconds, not microseconds: the list's cursor carries it through a JS `Date`, which holds no finer, and a rounded cursor would skip a job created microseconds after the one a page ended on (D14) |
 | `updatedAt` | `timestamptz(6)` | |
 | `startedAt` | `timestamptz(6)?` | The latest claim. Cleared by a re-drive |
-| `finishedAt` | `timestamptz(6)?` | Terminal transition |
+| `finishedAt` | `timestamptz(3)?` | Terminal transition. Milliseconds, like `createdAt`: the dead-letter list's cursor carries it through a JS `Date` too (D14) |
 
 **Indexes**
 
@@ -193,9 +193,25 @@ every line of application code is wrong; constraints listed as **APP** are polic
 - `(userId, createdAt DESC, id DESC)` and `(userId, status, createdAt DESC, id DESC)` — the job
   list's order without and with a status filter, so a page is a range of an index rather than a
   sort of every job the caller has (D14).
+- `(userId, status, finishedAt, id)` — the dead-letter list's order and the bulk re-drive's, so a
+  page or a batch is a range of an index rather than a sort of every dead letter the account has
+  (D11, D14). Measured over one account's 20 000 dead letters: the first page 0.06 ms against
+  10.1 ms, a re-drive batch of 1000 0.23 ms against 5.6 ms. Not partial: Prisma sends the status
+  as `CAST($1::text AS "JobStatus")`, which the planner cannot match to an index's `WHERE`, so a
+  partial index on dead letters was never chosen.
 - `(status)` partial `WHERE status IN ('QUEUED','RUNNING')` — operational "what is in flight".
+- `(type)` partial `WHERE status = 'DEAD_LETTERED'` — the dead-letter count every metrics scrape
+  takes across all accounts (§12.3), which no index leading with `userId` can serve. That count
+  is written in SQL with the status in it, for the reason above: as a Prisma query it read every
+  job.
 
 **DB** `CHECK (attempts >= 0)`.
+
+**DB** `CHECK ((status IN ('QUEUED','RUNNING')) = (finishedAt IS NULL))` — a job has a
+`finishedAt` exactly when it is finished. Every transition into `SUCCEEDED`, `DEAD_LETTERED` or
+`CANCELLED` stamps it, and a re-drive, the one way back, clears it. The dead-letter list's cursor
+relies on it: a dead letter without `finishedAt` would sort last, end a page on a value the
+cursor cannot carry, and be re-driven without ever being listed.
 
 > `attempts <= maxAttempts` was specified and had to be dropped — it is unsatisfiable. The two
 > counters count different things: `Job.attempts` is incremented by `claim()` on **every
@@ -301,6 +317,21 @@ image variants (C), enrichment (D) — in their own migrations.
 > and nothing has been measured yet. Adding a Redis projection later is easy; removing one after
 > code depends on it is not. Revisit at D12 if `GET /jobs/:id` is ever *measured* slow.
 
+### 4.8 `UploadSlip` — phase 8
+
+One row per slip `POST /uploads` signs, so an account's slips can be counted (D32). Nothing else
+records one: the file it allows goes straight to S3, past the API.
+
+| Column | Type | Constraints / notes |
+|---|---|---|
+| `id` | `uuid` | PK |
+| `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE` |
+| `key` | `text` | The key the slip was signed for |
+| `createdAt` | `timestamptz(6)` | |
+
+**DB** index `(userId, createdAt)`. Signing a slip deletes the caller's rows older than a day, so
+the table holds a day's worth per account at most.
+
 ---
 
 ## 5. Job state machine
@@ -399,15 +430,16 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/auth/login` | — | `200` | Access + refresh pair |
 | `POST` | `/auth/refresh` | refresh token | `200` | Rotation: presented token revoked, new pair issued |
 | `POST` | `/auth/logout` | refresh token | `204` | Idempotent — revoking an already-revoked token is a no-op |
-| `POST` | `/jobs` | access | **`202`** / `422` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded. See §6.3 |
+| `POST` | `/jobs` | access | **`202`** / `422` / `429` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded; `429 TOO_MANY_UNFINISHED_JOBS` when the caller already has 3 `import.csv` or 50 `image.process` jobs queued or running — a replay is answered as one all the same (D32). See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
+| `GET` | `/jobs/dead-letters` | access | `200` | The caller's dead letters, oldest-dead first, matching `POST /jobs/retry`'s filter — `?type=`, `?errorCode=`, `?deadLetteredFrom=`, `?deadLetteredTo=`, none required — in the order a re-drive with the same filter takes them. The re-drive skips a type at its cap, and later dead letters take its places (D32). Paged like `/jobs`: `?limit=` (1–100), `?cursor=` → `{ items, nextCursor }`. Send an offset's `+` as `%2B`: a query string reads `+` as a space, and the instant is refused. A scroll is not a snapshot; to page through a fixed set, set `deadLetteredTo` a few seconds in the past. See D11 |
 | `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) |
-| `POST` | `/jobs/:id/retry` | access | `202` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. Phase 6. See D6b, D26 |
-| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. See D11 |
+| `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
+| `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. Read a batch before sending it with `GET /jobs/dead-letters`. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
-| `POST` | `/uploads` | access | `200` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. See §6.3a |
+| `POST` | `/uploads` | access | `200` / `429` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. `429 TOO_MANY_UPLOADS` past 20 in 24 hours (D32). See §6.3a |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
 
@@ -451,6 +483,10 @@ that is not on the row, that stops being true and a stored-response table become
 `202`, not `200` or `201`: the work has been *accepted*, not *done*. The client polls
 `GET /jobs/:id` or listens on the socket.
 
+**Capped types.** An account can have 3 `import.csv` and 50 `image.process` jobs queued or
+running at once (D32, §15.2). One more is `429 TOO_MANY_UNFINISHED_JOBS`, with no `Retry-After`:
+the place frees when one of the account's own jobs finishes, which `job.updated` reports.
+
 **Payload per type.** The union in §6.4 is the authority; unknown keys are a `400`.
 
 | Type | Field | Range | Default |
@@ -486,8 +522,10 @@ POST /uploads                      (no body)
 - **S3 enforces the signed policy itself**: that key, a size of 1 byte to `maxBytes` (50 MB), and
   the 5-minute expiry. Breaking any of them is S3's answer, not ours: `403` for a changed key or
   an expired slip, `400 EntityTooLarge` / `EntityTooSmall` for the size.
-- `200`, not `201`: nothing exists yet, and nothing on the API side records the request. An upload
-  the client never follows with a job is an orphan; the bucket's lifecycle rule removes it.
+- `200`, not `201`: nothing exists yet. What the API records is that a slip was given (§4.8): an
+  account can start **20 uploads in any 24 hours**, and the next is `429 TOO_MANY_UPLOADS` (D32).
+  An upload the client never follows with a job is an orphan; the bucket's lifecycle rule removes
+  it.
 
 ### 6.3b `import.csv` — the file and what comes back
 
@@ -577,7 +615,8 @@ A resumed import reports its checkpoint as its first `processed`.
 
 The payload names up to 50 of the caller's skus: a batch, because one job per product makes a
 20 000-product catalog 20 000 jobs, and one job for the catalog lets a single slow image hold up
-the rest. For each product whose current `imageUrl` has no `READY` result yet, the worker
+the rest. An account can have 50 batches queued or running (D32), so a catalog of 400 sends its
+next batch as one finishes. For each product whose current `imageUrl` has no `READY` result yet, the worker
 downloads it through the guard (§7.9) — `jpeg`, `png`, `webp`, `gif` or `avif`, at most 10 MB, 15 s
 — and makes three WebP sizes with `sharp`: `thumb` 200, `medium` 600 and `large` 1200 pixels wide,
 upright by their EXIF orientation, never enlarged, without the source's metadata, which can carry
@@ -590,12 +629,12 @@ the new image rather than over it; the key is otherwise fixed, so a re-run overw
 files with the same bytes and needs no ledger. The files are written first and the product
 recorded `READY` second, and only while `imageUrl` still equals the URL that was processed — a
 crash between the two leaves files nothing points at yet, never a row pointing at missing files,
-and an import that replaced the URL meanwhile wins. A replaced URL's old files stay in the bucket
-for now. Deleting them when the new image is recorded is not safe: if the seller switches back to
-the old URL while a slow job is still finishing, that job's late delete removes the files the row
-points at again. A sweep that deletes a folder only when it is not the current URL's **and** has
-not been written for a day is planned instead (M8.8): a re-render rewrites the folder, so its age
-says no job is using it.
+and an import that replaced the URL meanwhile wins. A replaced URL's old files are not deleted
+when the new image is recorded: if the seller switches back to the old URL while a slow job is
+still finishing, that job's late delete would remove the files the row points at again. A sweep
+in the worker deletes a folder instead, only when it is neither the current URL's nor the one the
+image was made from, **and** nothing in it has been written for a day: a re-render rewrites the
+folder, so its age says no job is using it (8.8, §15.2).
 
 Between products the job reports `processed` out of `total` and honours a cancellation, so a
 stopped batch has recorded whole images only. A product already `READY` for its current URL is
@@ -872,7 +911,8 @@ socket, so it follows the HTTP filter's rule: only an `AppError`'s message — w
 owner, as `TerminalJobError`'s and `RetryableJobError`'s are — is stored as it is. Anything else
 (Prisma naming a table, S3 naming the principal it refused, a socket naming an internal address) is
 stored as `Internal error; the worker's log has it under correlationId <id>`, and the worker logs
-the text. The correlation id is the submit's request id, which the owner already holds. A `failed`
+the text. The correlation id is the id of the request that queued the attempt — the submit's, or a
+re-drive's — which the owner already holds (§15.2, 8.7). A `failed`
 event's message is stored only when it is an `UnrecoverableError`: BullMQ's own (a stall past the
 limit) or the processor's, already made safe.
 
@@ -1260,7 +1300,8 @@ WorkerModule  (bootstrap: NestFactory.createApplicationContext)
 ├── JobCoreModule
 ├── BullModule.registerQueue({ name: 'relay-jobs' })                 // CONSUMER
 ├── JobsProcessor           (WorkerHost)
-└── StrandedJobSweeper      (finishes jobs the queue stopped delivering, §7.6)
+├── StrandedJobSweeper      (finishes jobs the queue stopped delivering, §7.6)
+└── ImageFolderSweeper      (deletes image folders no product uses, §6.3c)
 
 JobCoreModule  (imported by BOTH roots: the domain, with no queue and no transport)
 ├── imports RedisModule, StorageModule, ProductsModule, OutboundModule
@@ -1289,14 +1330,23 @@ Registered via **provider tokens**, not `app.useGlobalX(new X())` — the token 
 the DI container, so a guard or filter can inject `PrismaService`. The `new X()` form cannot
 inject anything, which is discovered the moment a guard needs a DB read.
 
+All of them in `AppModule`, the guards in the order they run:
+
 | Token | Provider |
 |---|---|
 | `APP_PIPE` | `StandardSchemaValidationPipe` |
 | `APP_GUARD` | `JwtAuthGuard` (opt out per-route with `@Public()`) |
-| `APP_GUARD` | `RolesGuard` (`@Roles('ADMIN')`) |
+| `APP_GUARD` | `RateLimitGuard` (a baseline; a stricter limit per-route with `@RateLimit()`). After the JWT guard, so it counts a signed-in caller by account (§15.2) |
 | `APP_INTERCEPTOR` | `ResponseEnvelopeInterceptor` |
-| `APP_INTERCEPTOR` | `LoggingInterceptor` (request id, timing) |
 | `APP_FILTER` | `DomainExceptionFilter` |
+
+Request logging — the request id and timing — is pino-http's module middleware, not an
+interceptor. `RolesGuard` and `@Roles()` exist for a first admin-only route and are not registered
+until one does.
+
+What must run before Nest's own middleware — `trust proxy`, request metrics, the request id,
+helmet, CORS, the body parser — and the socket's adapter are applied by `configureApp()` instead,
+from `main.ts` and from the tests that boot `AppModule` alike (§15.2).
 
 ### 10.3 Lifecycle order — where it bites
 
@@ -1337,11 +1387,14 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `RELAY_FAULT_SKIP_ABANDON` | bool | — | ✓ | Tests only (A5d). Default `false` |
 | `JOB_MAX_ATTEMPTS` | int | ✓ | ✓ | Default ceiling |
 | `LOG_LEVEL` | enum | ✓ | ✓ | |
-| `CORS_ORIGINS` | csv | ✓ | — | |
+| `CORS_ORIGINS` | csv | ✓ | — | The origins a browser may call from, over HTTP and the socket alike. Empty: none (§15.2) |
+| `TRUST_PROXY` | hops or csv? | ✓ | — | The proxy whose `X-Forwarded-For` names the client: a hop count, or its addresses (`loopback`, a subnet). Unset: none, and the address is the connection's. `true` is refused (§15.2) |
+| `RATE_LIMITS` | bool | ✓ | — | Default `true`. `false` only in the test tiers, which register every account from one address |
 | `ARGONID_TIME_COST` / `ARGONID_MEMORY_COST` | int | ✓ | — | Defaults `2` and `19456` (KiB): OWASP's minimum for Argon2id. Every registration and login pays it, so raise them as far as the host's latency allows, never lower |
 | `AWS_REGION` | str | ✓ | ✓ | The bucket's region (D29) |
 | `S3_BUCKET` | str | ✓ | ✓ | The dev bucket locally and in CI, the prod bucket when deployed |
 | `S3_ENDPOINT` | url? | ✓ | ✓ | Only for an S3-compatible emulator; unset for AWS |
+| `METRICS_PORT` | int? | ✓ | ✓ | Unset: the process serves no metrics. Set per process — an API and a worker on one host need two (§12.3) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | str | ✓ | ✓ | Read by the AWS SDK itself, not by the config schema, so a host with a role needs neither. Resolved at boot, so a missing key fails startup |
 
 **The two processes deliberately do not share a config surface.** The worker holding JWT secrets
@@ -1357,11 +1410,12 @@ it never uses is needless blast radius. One schema, two required-sets.
 
 **The correlation id must cross the process boundary.** A request id that stops at the API makes
 submit and processing unjoinable in logs — which is precisely the moment you need them joined.
-The path: request id → `Job.correlationId` → queue message (§8.3) → the worker's child logger for
-that job.
+The path: request id → `Job.correlationId` → queue message (§8.3) → the worker's log context for
+that run.
 
-Standard fields on every worker log line: `correlationId`, `jobId`, `jobType`, `attempt`,
-`status`.
+Fields on every line about a job, in both processes: `correlationId`. In the worker, `jobId` too,
+and `jobType` and `attempt` once the attempt has claimed the job. Built in 8.7 (§15.2), proven by
+A28.
 
 ### 12.2 Health
 
@@ -1377,6 +1431,26 @@ out of rotation.
 either `MicroserviceHealthIndicator` with `Transport.REDIS` (which pulls in
 `@nestjs/microservices`) or a small custom indicator running `PING`. **v1: a custom indicator** —
 it is ~15 lines and avoids a dependency added purely for a health check.
+
+### 12.3 Metrics
+
+Each process serves `GET /metrics` in Prometheus's text format on `METRICS_PORT` — its own port,
+never the API's — and serves nothing when it is unset. Every series carries `role` (`api` or
+`worker`), and each process also exports Node's runtime metrics: event-loop lag, heap, CPU, GC.
+
+| Metric | From | What it is |
+|---|---|---|
+| `relay_job_attempt_duration_seconds{type, outcome}` | worker | A histogram of every claimed attempt, from its claim to its outcome. `outcome` is `succeeded`, `retrying`, `dead_lettered`, `cancelled`, `handed_back` (stopped for a shutdown, uncounted), `superseded` (another attempt had taken the job over) or `unrecorded` (the outcome could not be written; the queue delivers the job again) |
+| `relay_queue_depth{state}` | API | Unfinished jobs by where they wait: `outbox` (committed, not yet queued), `waiting`, `prioritized`, `delayed`, `active`. Read when scraped |
+| `relay_dead_letters{type}` | API | Dead-lettered jobs nobody has re-driven, every type listed. Read when scraped |
+| `relay_http_request_duration_seconds{method, route, status}` | API | A histogram of every response, from the first middleware. `route` is the matched pattern (`/jobs/:id`), or `unmatched` for a `404` or a body the parser refused |
+
+The failure rate is computed by Prometheus from the histogram's count, not exported:
+
+```
+sum(rate(relay_job_attempt_duration_seconds_count{outcome=~"retrying|dead_lettered"}[5m]))
+  / sum(rate(relay_job_attempt_duration_seconds_count[5m]))
+```
 
 ---
 
@@ -1412,6 +1486,9 @@ Verified 2026-09-01 against the official NestJS, BullMQ, and Prisma documentatio
 | `ipaddr.js` | 2.x | Classifies a resolved address as public or not, for the guarded downloader (§7.9) |
 | `zod` | 4.x | |
 | `nestjs-pino` + `pino` + `pino-http` | 5.x / 10.x / 11.x | pino 10 is required by nestjs-pino 5 |
+| `helmet` | 8.x | Security headers on every response (§15.2) |
+| `@nestjs/throttler` | 6.7.x | Rate limits, with its in-memory storage (§15.2) |
+| `@prometheus-io/client` | 0.16.x | The metrics registry (§12.3). Formerly `prom-client`, renamed when the Prometheus project adopted it |
 | `argon2` | latest | `Bun.password` does not exist on Node |
 | `ioredis` | latest | Now an **optional** peer of BullMQ v6, so declare it explicitly |
 | `vitest` | latest | **Not Jest** — see below |
@@ -1448,7 +1525,8 @@ admin user (never the root user):
    not expire: `uploads/` and `reports/` expire after 7 days, `fixtures/` (written by the tests)
    after 1, and incomplete multipart uploads are aborted after 1 day across the bucket. The tests
    that make product images delete their own account's `products/` folder when they finish
-   (`test/support/product-images.ts`), since no rule ever will.
+   (`test/support/product-images.ts`), since no rule ever will; in a running system the worker's
+   sweep deletes the folders no product uses (§6.3c).
 
    A **CORS rule** too, once a browser uploads (the dashboard, PG): S3 answers a presigned POST
    from another origin only if the bucket allows it. Scripts and the tests need none, which is why
@@ -1478,6 +1556,12 @@ admin user (never the root user):
    `AWS_REGION` and `S3_BUCKET`. CI reads the bucket and the key pair from repository secrets,
    and only on the two test steps that reach S3 — every step runs code from `node_modules`, and
    `npm ci` runs install scripts. The region is not a secret; `ci.yml` sets it.
+4. A **cost budget** on the AWS account (D32) — what notices abuse spread across many accounts,
+   which no per-account cap can. Billing and Cost Management → Budgets → Create budget →
+   *Customize* → *Cost budget*: monthly, alerting by email at $5 — the project's account is set this
+   way (2026-11-19). An IAM user sees Billing only once the root user has turned on
+   *IAM user and role access to Billing information* in the account settings. Budgets read cost
+   data a few times a day, so an alert arrives hours after the spend, not minutes.
 
 **After pulling a change that touches `prisma/`:**
 
@@ -1539,6 +1623,8 @@ cases.
 | **A24** | **The parent cannot be lost.** Crash between the last child committing and the parent being enqueued | The relay publishes the parent's outbox row; the pipeline finalizes exactly once | PE |
 | **A25** | **Revocation is immediate.** Revoke a key, then use it | `401`, with no process restart | PF |
 | **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
+| **A27** | **The backlog can be watched.** Submit 20 jobs with no worker running, then start one | Scraped from the API's own metrics port, `relay_queue_depth` rises by 20 and falls back to where it began; the worker's `relay_job_attempt_duration_seconds_count{outcome="succeeded"}` reaches 20. A job dead-lettered after it raises `relay_dead_letters` and counts as `dead_lettered` on the worker | 8 |
+| **A28** | **A job's story is found by one id.** Under a chosen `X-Request-Id`, submit a job that fails twice, then re-drive it under another; and one that succeeds. Both processes log JSON, as in production | Under the submit's id: the API's lines for the submit, and every worker line of both attempts, the handler's included, each naming the job, its type and its attempt, ending in the dead letter. No line about the job is without it. The re-drive's runs are under the re-drive's id, none under the submit's. A succeeded job's lines end in one saying so | 8 |
 
 **A6 is written to fail against the phase-5 design.** The commit-then-enqueue gap is a knowingly
 accepted risk; A6 quantifies it rather than leaving it undocumented.
@@ -1553,13 +1639,14 @@ Specifying them now would produce prose that is wrong by the time it is used.
 
 | Phase | Objective | Exit criterion | Detail written |
 |---|---|---|---|
-| **8 · Observability & hardening** | Prometheus `/metrics` from both processes: queue depth, duration histogram, failure rate, dead-letter count. Rate limiting, per-account caps on S3-backed work (D32), `trust proxy`, helmet, CORS allowlist, body limits. Dead-letter inspection and re-drive | Queue depth observably rises and drains under load; one job's full story is retrievable from logs by `correlationId` alone | Start of phase 8 |
+| **8 · Observability & hardening** | Prometheus `/metrics` from both processes: queue depth, duration histogram, failure rate, dead-letter count. Rate limiting, per-account caps on S3-backed work (D32), `trust proxy`, helmet, CORS allowlist, body limits. Dead-letter inspection and re-drive | Queue depth observably rises and drains under load; one job's full story is retrievable from logs by `correlationId` alone | **§15.2** |
 | **9 · Test harness & CI** | The shared harness, fixtures and CI — **not** the tests themselves, which are written with the code throughout (§14). A1–A7 become automated cases including process kill/restart | `npm run test:all` reproduces every reliability assertion with no manual steps; CI green from a clean checkout | **§15.1** |
 | **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a closed with measurements attached, D10's repeated on the target host | Start of phase 10 |
 | **11 · Deploy** | One VPS: Docker running API + worker, Caddy for auto-HTTPS, `ufw`, managed Postgres, restart policies, migrations as a release step. Multi-instance socket.io (D13) becomes real here | HTTPS on a real domain; a reboot restores both processes unattended; a restore from backup has been rehearsed | Start of phase 11 |
 
 **Note for phase 8:** `@nestjs/throttler` 6.5.0 declares peers stopping at Nest 11. Re-verify its
-support at that point rather than pinning the assumption now.
+support at that point rather than pinning the assumption now. **Re-verified 2026-11-12:** 6.7.1
+declares Nest 12 (§15.2).
 
 ### 15.1 Test tiers — written 2026-10-26
 
@@ -1626,6 +1713,242 @@ Only logging reads `NODE_ENV` and nothing reads the Node version, so this is lat
 broken — but CI is the stricter of the two and the field should be widened or the local runtime
 aligned.
 
+### 15.2 Phase 8 — written 2026-11-12
+
+Built in this order, each step with its tests: the HTTP edge (8.0, 8.5); metrics from both
+processes (8.1, 8.2); `trust proxy`, then rate limits and per-account caps (8.4, 8.3 — D16, D32);
+dead-letter inspection (8.6); the correlation id across both processes' logs (8.7); the sweep of
+replaced image folders (8.8). Each section below is written when its step lands.
+
+Two dependencies were re-verified at the start of the phase:
+
+- `@nestjs/throttler` 6.7.1 declares Nest 12 as a peer.
+- `prom-client` was deprecated in August 2026 for `@prometheus-io/client` — the same library,
+  adopted by the Prometheus project. Phase 8 uses the new name.
+
+#### The HTTP edge — 8.0, 8.5
+
+One function, `configureApp()`, sets the edge up — in `main.ts` and in every in-process test
+that boots `AppModule`, so those tests run against the edge that ships. In the order a request
+meets it:
+
+| Step | Why there |
+|---|---|
+| Request id | The body parser rejects a request before Nest's module middleware — pino-http among them — ever runs. Without an id assigned first, every `400` and `413` from the parser answered with `requestId: "undefined"` |
+| helmet | Security headers on every response, and no `X-Powered-By: Express` |
+| CORS (`CORS_ORIGINS`) | Before the parser: a browser reads an error only from a response that carries its CORS headers, so a `413` would otherwise reach a dashboard as an opaque network failure |
+| JSON body parser, 64 KB | The largest body a route takes is an `image.process` batch — 50 SKUs, about 30 KB even with every character sent as a `\u` escape. JSON only: no route reads a form |
+
+- **An empty `CORS_ORIGINS` admits no browser origin.** A request without an `Origin` — a
+  script, `curl`, the harness — is not affected: CORS is enforced by browsers, not by the server.
+- **The socket uses the same list,** through an `IoAdapter` subclass. A gateway's decorator is
+  evaluated when its file is imported, before any configuration exists, so `origin: true` there
+  could not have been replaced by configuration. The `cors` option binds only a browser's polling
+  requests; a WebSocket upgrade is not subject to CORS. That is accepted rather than patched with
+  an `allowRequest` origin check: a socket authenticates with a bearer token in its handshake,
+  not an ambient cookie, so a foreign page has nothing to ride on.
+- **A body the parser refuses keeps its status.** The parser's errors are `http-errors` objects,
+  and Nest converts only invalid JSON (a `SyntaxError`) into an `HttpException`. The exception
+  filter passed the rest through as an internal error: every body over the limit answered `500`
+  and was logged as an unhandled exception. It now maps any error marked `expose: true` to its
+  own status — `413 PAYLOAD_TOO_LARGE`, `415`.
+
+#### Metrics from both processes — 8.1, 8.2
+
+What is exported is listed in §12.3. How:
+
+- **A port of their own, off unless set.** Not a route on the API: the edge's CORS and the rate
+  limits of 8.3 would apply to Prometheus, and a firewall could not close metrics while leaving
+  the API open. The worker has no other HTTP server anyway. Off by default because a port that
+  answers anyone is opened only where a deployment asks for it — and because the API and a
+  worker read one `.env` locally, where a shared default would have the second fail to bind.
+  The port opens from `main.ts` and `worker.ts`, not on bootstrap, so a test that compiles a
+  module binds nothing.
+- **A port that cannot be bound stops the process at startup,** like any misconfiguration, rather
+  than leaving it running unscraped.
+- **The backlog gauges come from the API alone.** They describe the whole system — Postgres and
+  Redis read the same from anywhere — so every worker exporting them would make a sum count the
+  backlog once per worker. They are read at scrape time, not kept up to date by the code that
+  changes them: a count kept in memory drifts from the database the moment a process dies
+  between a write and its increment.
+- **A source that cannot be read drops its series from that scrape.** One failing `collect()`
+  fails the registry's whole answer, so each is caught: with Redis down, the queue states vanish
+  while the outbox, the dead letters and the process's own metrics still arrive. Dropped, not
+  zeroed and not left stale: a gap on a graph reads "unknown", a zero reads "empty".
+- **One histogram, not a histogram and a counter.** A histogram's `_count` per label set is a
+  counter, so the attempts by outcome — the failure rate's numerator and denominator — come with
+  the durations.
+- **`(type) WHERE status = 'DEAD_LETTERED'`,** a partial index (§4.3), because the dead-letter
+  count runs every scrape across all accounts. The count is raw SQL with the status written in:
+  Prisma sends the status as `CAST($1::text AS "JobStatus")`, worked out only when the query
+  runs, so the planner cannot match it to the index's `WHERE` and read every job instead. An
+  integration test checks the plan names the index. *Corrected 2026-11-18: this bullet had said
+  `EXPLAIN` showed Prisma's own query using the index; it never did.*
+- **BullMQ's own `exportPrometheusMetrics()` was not used:** it returns text of its own, outside
+  the registry, without the `role` label or the outbox stage before the queue.
+- **Request metrics came with the rate limits** (below), where `429`s by route are the number
+  worth having.
+
+#### The client's address and rate limits — 8.4, 8.3
+
+The first half of 8.3. Per-account caps on S3 work (D32) are its second.
+
+Every route has a baseline; the ones where one request costs real work set a stricter limit.
+Limits are per route: a caller refused on one still reaches the others.
+
+| Route | Counted per | Limit | Why |
+|---|---|---|---|
+| Any other route | account, or address before sign-in | 300 a minute | Five a second, where a dashboard polling every couple of seconds uses one. Reads are indexed and pages hold at most 100 |
+| `POST /auth/login` | address | 10 a minute | Each guess costs an Argon2 hash |
+| `POST /auth/register` | address | 5 an hour | Each account brings limits of its own, so this bounds how many fresh sets one address mints |
+| `POST /auth/refresh` | address | 60 a minute | The database work of one address replaying stale tokens |
+| `POST /jobs` | account | 60 a minute | Each accepted job is worker time; many images go in one `image.process` batch |
+| `POST /jobs/:id/retry` | account | 60 a minute | A re-drive runs a job again, as a submit does — and a job that always fails could otherwise be re-driven without end |
+| `POST /jobs/retry` | account | 10 a minute | Each call re-drives up to 1000 dead letters |
+| `POST /uploads` | account | 10 a minute | Each slip lets its holder store up to 50 MB |
+
+- **Over the limit: `429 TOO_MANY_REQUESTS`, with `Retry-After` in seconds** — exposed through
+  CORS, since a dashboard has to read it to know when to try again. The request that goes over,
+  and every one for a window after it, is refused. Every request counts, a replay (D16) and one
+  then refused by validation alike: the limiter runs before the pipes.
+- **Global, like the JWT guard.** A route added later is limited by the baseline without anyone
+  remembering to; `@RateLimit()` only makes a route stricter.
+- **Per account once signed in, per address before.** The limiter is registered after
+  `JwtAuthGuard`, in `AppModule` beside it — global guards run in the order they are registered —
+  so it knows the account: a new address does not reset an account's count, and an office behind
+  one address does not share one. A flood of requests with no valid token is refused by the JWT
+  guard before it is counted, at the cost of one signature check each.
+- **The address is the connection's unless `TRUST_PROXY` names the proxy.** Behind Caddy
+  (phase 11) every connection comes from the proxy, and every client would share one limit. But
+  trusting `X-Forwarded-For` from anything other than the proxy lets a client write its own
+  address — a fresh limit on every request — so it is off unless set, and `true`, which trusts
+  every hop, is refused at startup. The proxy's addresses are safer than a hop count, which also
+  believes a client that reaches the API around the proxy.
+- **Counters live in the API's memory.** Exact while one API instance runs, which phase 11 does;
+  a restart resets them. A second instance is the trigger to move them to Redis — and since
+  `@nest-lab/throttler-storage-redis` does not declare Nest 12, to a storage of our own.
+- **A flood shield at the proxy is left to phase 11.** The proxy sees addresses, not accounts, so
+  it can only cap requests per address across every route — coarser than this, and refused before
+  Node spends anything. Caddy needs a plugin for it, built in with `xcaddy`; nginx has `limit_req`.
+- **`RATE_LIMITS=false` in the test tiers only.** Every test file registers its accounts from one
+  address, far past the registration limit; the integration tests of the limits switch them on.
+- **Request metrics** (§12.3) are timed from the first middleware, so a body the parser refuses
+  is counted too. A request no controller took is `unmatched`: Nest mounts module middleware —
+  the logger — as a wildcard route, `{/*splat}`, so `req.route` is not empty for it, and no
+  controller's route has a wildcard.
+
+#### Per-account caps — 8.3 (D32)
+
+The second half of 8.3. A rate limit bounds how often an account asks; a cap bounds how much it
+holds at once.
+
+| What | Cap per account | Over it | Why |
+|---|---|---|---|
+| `import.csv` queued or running | 3 | `429 TOO_MANY_UNFINISHED_JOBS` | Each holds one download of up to 50 MB, and a store imports one catalog at a time |
+| `image.process` queued or running | 50 batches | `429 TOO_MANY_UNFINISHED_JOBS` | 2 500 products in flight; a larger catalog sends its next batch as one finishes |
+| Upload slips | 20 in any 24 hours | `429 TOO_MANY_UPLOADS` | Room many times over for a store re-uploading after a mistake. With the 7-day lifecycle, one account holds at most about 8 GB |
+
+- **`MOCK` and `CHARGE` have no cap:** they do no S3 work, and the submit rate bounds them.
+- **Every way back to work is capped:** a submit, a re-drive, and a bulk re-drive — without the
+  last, one call would bring a thousand dead imports back at once. A bulk re-drive brings back a
+  capped type only as far as there is room, and the rest stay dead-lettered, in `remaining`. A
+  type already at its cap is left out of the query, not only out of the batch: older dead imports
+  would otherwise fill every batch, and the dead letters behind them would never be reached.
+- **`429`, without `Retry-After`.** As with a rate limit, nothing is wrong with the request and
+  the same one succeeds later — but when depends on the account's own jobs, which `job.updated`
+  reports.
+- **A replay is still a replay** (D1). The job is written before the cap is checked, so a replay
+  fails first, on its unique key, and is answered with the job it already has.
+- **Counting and writing are one step, under a lock per account:** `pg_advisory_xact_lock`, keyed
+  by the account and held until the transaction ends. Two requests that each counted one free
+  place would otherwise both take it. Other accounts never wait on it, and a `MOCK` or `CHARGE`
+  submit never takes it. Fired together over HTTP, two requests never overlap — each transaction
+  lasts a couple of milliseconds — so the tests hold the lock themselves with the last place
+  filled, and check that the request under test waits and then refuses.
+- **A slip is a row** (§4.8): counting needs a record, and there was none. Counting the files
+  under the account's prefix in S3 instead would cost an S3 call per slip, miss slips not yet
+  used, and need gigabytes of real uploads to test.
+- **The `uploads/` lifecycle stays 7 days.** A day would cut what one account can hold from about
+  8 GB to about 2 GB, but a dead import more than a day old could no longer be re-driven — its
+  file gone, the seller would have to upload it again. One account's worst case costs cents a
+  month either way; many accounts at once is what the budget alarm is for (§13.4).
+- **What the caps do not bound: downloads over a day.** Three imports at a time, each reading one
+  50 MB file, can follow one another for as long as the account keeps submitting or re-driving
+  them. From the phase-11 VPS, outside AWS, S3 bills that transfer, at about $0.09 a GB. The
+  budget alarm is the backstop; a daily allowance of import attempts per account is the next step
+  if it ever fires.
+
+#### Logs joined by correlationId — 8.7
+
+The request id is the job's `correlationId` (§6.1), and every line about the job carries it as a
+field, in both processes. One search returns the request that queued a job and every attempt the
+worker made of it (A28).
+
+| Line | Fields |
+|---|---|
+| Any line the API writes while it handles a request | `correlationId` |
+| The line that closes a request | `correlationId`, the whole `req` and `res`, `userId` |
+| Any line the worker writes while it runs a job: the processor's, the handler's, anything they call | `correlationId`, `jobId`; `jobType` and `attempt` once the attempt has claimed the job |
+| A job that stalled, or that the queue abandoned and the `failed` event or the sweep finished | `correlationId`, `jobId` |
+
+- **A stall is read back from the queue.** BullMQ's `stalled` event names only the queue entry,
+  so the worker reads the entry for the ids — one Redis read, on a rare event. It is the line a
+  search for a lost run most needs.
+- **A context, not a logger passed along.** The worker opens a log context for each run with
+  nestjs-pino's `runInContext`, the counterpart of what pino-http does for each request, and any
+  `Logger` used inside it writes the fields, however deep. A logger passed by hand reaches only the
+  code it is passed to; a handler's lines and a transition's would fall outside.
+- **One name in both processes.** pino-http calls the request id `reqId` and binds the whole
+  request to every line. The API binds only the id, as `correlationId`, and leaves the request to
+  the line that closes it.
+- **A re-drive is a request of its own.** The runs it starts are logged under its id, not the
+  submit's, and so is the sweep's line for a delivery a re-drive queued: an id answers "what did
+  this request cause", and `jobId` joins a job's lives. `Job.correlationId` stays the submit's.
+- **A story ends in a line.** A succeeded attempt logs that it succeeded; a search used to end at
+  "Running job".
+- **The id is the client's when it sends one** (`X-Request-Id`), so it can be quoted back. A job
+  that failed for an internal reason shows its owner the id the worker logged the reason under
+  (§7.7).
+- `status` had been listed as a standard field and is not one: it changes during an attempt, so
+  a field bound when the attempt starts would be wrong by its end, and each line says what
+  happened.
+
+#### Replaced image folders — 8.8
+
+A product's image lives in a folder named by the hash of the URL it was made from (§6.3c), so an
+import that changes the URL leaves the old folder behind, and `products/` never expires (§13.4).
+`ImageFolderSweeper` lists `products/` every 6 hours and deletes a folder when both hold:
+
+| Kept while | Why |
+|---|---|
+| it is the folder of the URL the image was made from (`imageSourceUrl`) | the row points at it: the seller's image |
+| it is the folder of the product's current URL (`imageUrl`), made or not | a job may be making it now — a URL switched back to an old one rewrites that old folder |
+| anything in it was written within the last day | a re-render rewrites every file, so a day of quiet says no job is using it |
+
+- **The rows are read after the listing,** so a URL changed while the listing ran is seen. What is
+  left open: a URL switched back after that read, whose job then downloads, renders and writes the
+  folder before the delete is sent — a whole job inside one S3 request. Closing it would take a
+  folder per render recorded on the row, or a versioned bucket; neither is worth it for that.
+- **A folder whose product no longer exists is deleted,** so an account's images go some time after
+  the account does.
+- **A folder is judged whole.** A listing page can end partway through one, so it is held until a
+  key of the next folder shows it complete; otherwise an old file could go while a newer one in
+  the same folder is still being written.
+- **Keys of any other shape are left alone:** only what the image handler writes is the sweep's to
+  judge.
+- **Every worker sweeps.** Deletes are idempotent, and the cost is one listing of the bucket per
+  worker per run, at $0.005 a thousand keys. No lock was added for it.
+- **The first sweep comes 6 hours after the worker starts,** so a worker restarted more often than
+  that never sweeps, and old folders wait for one that stays up. Sweeping at start would be worse:
+  CI starts workers on an empty database against the real bucket, and would judge every folder in
+  it unused. Storage is all a late sweep costs.
+- **S3 answers a bulk delete with 200 and lists what it refused,** so the refusals are checked and
+  thrown; read as success, the sweep would count as deleted folders that are still there.
+- **The integration test sweeps one account's prefix only.** The bucket is shared with every other
+  run; a sweep of all of `products/` from a test would judge their images by its own database's
+  rows.
+- The IAM policy already allows `s3:ListBucket` and `s3:DeleteObject` (§13.4).
+
 ---
 
 ## 16. Open decisions register
@@ -1657,13 +1980,13 @@ to settle it.
 | D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
 | D10 | ~~Worker concurrency tuning; sandboxed processors~~ | Measured event-loop blocking in the worker | **DECIDED 2026-11-09** — concurrency 5, renders in-process; image work leaves the event loop alone, measured below. Re-measured on the target host in phase 10 |
-| D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox |
+| D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox. Inspection **built 2026-11-18**: `GET /jobs/dead-letters` |
 | D12 | Status cache in Redis | A **measured** slow `GET /jobs/:id`. Never before | — |
 | D13 | socket.io Redis adapter + sticky sessions | A second API instance | 11 |
-| D14 | ~~Cursor pagination~~ | A list endpoint where offset pagination measurably hurts | **DECIDED 2026-11-09** — keyset cursors on `/jobs` and `/products`, measured below |
+| D14 | ~~Cursor pagination~~ | A list endpoint where offset pagination measurably hurts | **DECIDED 2026-11-09** — keyset cursors on `/jobs` and `/products`, measured below; `/jobs/dead-letters` since 2026-11-18 |
 | D15 | ~~Job types beyond `MOCK` / `CHARGE`~~ | A real use case | **DECIDED 2026-10-26** — the real-job proposal is that use case: `import.csv`, `image.process`, then PD–PE (below) |
-| D16 | Do replays bypass the rate limiter? | A client retrying with the same key gets `429` for a job already accepted | 8 |
-| D32 | ~~Limits on the work an account can put on S3~~ | Registration is public and `POST /uploads` signs without limit | **DECIDED 2026-11-11** — planned now, built in phase 8 (M8.3). Below |
+| D16 | ~~Do replays bypass the rate limiter?~~ | A client retrying with the same key gets `429` for a job already accepted | **DECIDED 2026-11-13** — no: a replay counts like any request, and its retry after `Retry-After` is answered with the accepted job. Below |
+| D32 | ~~Limits on the work an account can put on S3~~ | Registration is public and `POST /uploads` signs without limit | **DECIDED 2026-11-11** — planned now, built in phase 8 (M8.3). **Built 2026-11-16** (§15.2). Below |
 
 ### Forced earlier than planned by the real-job proposal
 
@@ -1798,7 +2121,7 @@ Three details the implementation settled:
 
 **D14 — lists page with an opaque cursor, never an offset.**
 A page starts strictly after the last item the previous one held — `(createdAt, id)` for jobs,
-newest first; `sku` for products — and the response carries that position as `nextCursor`. Three
+newest first; `(finishedAt, id)` for dead letters, oldest first; `sku` for products — and the response carries that position as `nextCursor`. Three
 things an offset gets wrong: a deep page reads and discards every row before it; a row inserted
 mid-scroll shifts the rest, so the next page repeats one already shown; and `total` is a
 `count(*)` over every matching row on every page. Measured on the last page of 20 000 rows,
@@ -1809,7 +2132,7 @@ locally: products **6.3 ms** by offset, a sequential scan and a sort of all 20 0
 The cursor carries the **values**, not a reference to a row. Prisma's own cursor names a row and
 skips it with `OFFSET 1`, so once that row leaves the filter — paging `?status=QUEUED` past a job
 that has since started — it skips a real row instead. Carrying the values through JavaScript is
-why `Job.createdAt` holds milliseconds (§4.3), and why `id` breaks ties, which a millisecond
+why `Job.createdAt` and `Job.finishedAt` hold milliseconds (§4.3), and why `id` breaks ties, which a millisecond
 clock makes common. A cursor's length limit is computed from the longest values its position
 holds, with JSON's six-character escape of a control character as the worst case, so a list
 never refuses a cursor it issued. It is base64url JSON and deliberately unsigned: every list is filtered to the
@@ -1857,6 +2180,18 @@ At least one filter is required — an empty body is what a client bug sends —
 counts without writing. A filter matching nothing answers `202 { redriven: 0, remaining: 0 }`:
 the caller asked for a set, and an empty set is a complete answer, unlike a cancel naming one
 job that had already finished.
+**Inspection — built 2026-11-18 (8.6).** `dryRun` says how many; `GET /jobs/dead-letters` says
+which, with each job's `error` and attempts, before anything is re-driven. It is a route of its
+own, not more filters on `GET /jobs`: that list is newest-submitted first while a re-drive works
+oldest-dead first, and an error code or a window of deaths means nothing for a job still running.
+It reads the re-drive's filter through the same function and pages in the re-drive's order,
+`(finishedAt, id)` — `id` was added to the re-drive's order for it, since jobs dying in the same
+millisecond had come back in no fixed order. What the list cannot show is the caps: the re-drive
+leaves a type at its cap out of the query, so later dead letters take that type's places in the
+batch, and a type with some room is cut short (D32). Nor is a scroll a snapshot: `finishedAt` is
+stamped before the write commits, so a job can land behind a cursor already past it, and a fixed
+set is paged with `deadLetteredTo` a few seconds in the past. Unlike the re-drive the list needs
+no filter: reading every dead letter changes nothing.
 
 **D28 — a reused key with a different body is a `422`, decided by a fingerprint.**
 D1 settled who mints the key, its scope and its lifetime, and never what a replay must match: a
@@ -1917,6 +2252,19 @@ limits on auth and submit alone bound requests, not bytes. Phase 8 adds a rate l
 `image.process` jobs; an AWS Budgets alarm; and weighs a 1-day `uploads/` lifecycle, which would
 also shorten how long a dead import can be re-driven (§6.2). Nothing is deployed, so until phase
 11 the risk is latent.
+
+**Built 2026-11-16** (§15.2): 3 unfinished imports, 50 unfinished image batches and 20 upload
+slips a day per account, counted under a lock per account and enforced at submit and at both
+re-drives. The lifecycle stays 7 days: a day would cut one account's worst case from about 8 GB
+to 2, which is cents, and cost every dead import older than a day its re-drive. The budget alarm
+(§13.4) covers what per-account caps cannot — many accounts at once, and the downloads one
+account's imports make over a day. **Trigger** for a daily allowance of import attempts per
+account: the alarm fires. The alarm was set on 2026-11-19, at $5 a month.
+
+**D16 — a replay counts against the rate limit.** The limiter runs before the handler, so it
+cannot tell a replay from a new submit without a database read in front of it — the read the
+limit exists to bound. Nothing is lost by counting it: a client refused `429` for a replay retries
+after `Retry-After` with the same key and is answered with the job already accepted (D1).
 
 **D10 — image work does not stall the worker: concurrency stays 5, renders stay in-process.**
 First written as: `sharp` fills the 4-thread libuv pool, which delays all async I/O, BullMQ's lock
@@ -1993,6 +2341,15 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-19 | §13.4, D32 — the AWS budget alarm is set: email alerts at $5 a month, on the account that holds the bucket. The last of 8.3, and of phase 8. |
+| 2026-11-18 | §6.3c, §10.1, §13.4, §15.2 — replaced image folders, 8.8. `ImageFolderSweeper` lists `products/` every 6 hours in each worker and deletes a folder only when it is neither the product's current URL's nor the one its image was made from, and nothing in it has been written for a day; a product that no longer exists keeps none. Rows are read after the listing, a folder split across listing pages is judged whole, and a bulk delete's per-key refusals are thrown. The window left open — a URL switched back and re-rendered within one S3 request — is named. |
+| 2026-11-18 | §7.7, §12.1, §14, §15.2 — logs joined by `correlationId`, 8.7. Every line about a job carries it as a field in both processes: the API binds the request id under that name to each line it writes while handling the request, and the worker runs each job, its stall, its abandonment and the sweep's finishing of it in a log context naming the `correlationId` and `jobId`, adding `jobType` and `attempt` once claimed — whichever class writes the line. A re-drive's runs are logged under the re-drive's id. A succeeded attempt now logs that it succeeded. `status` dropped from §12.1's fields. A28 registered and automated. |
+| 2026-11-18 | §4.3, §15.2 — the dead-letter metric now reads its partial index. As a Prisma `groupBy` it never had: Prisma sends the status as a parameter cast at run time, which the planner cannot match to the index's `WHERE`, so every scrape read every job. The count is raw SQL with the status written in, and an integration test checks its plan. §15.2 had claimed the index was verified in use; corrected. |
+| 2026-11-18 | §4.3, §6.2, D11, D14 — dead-letter inspection, 8.6. `GET /jobs/dead-letters` lists the caller's dead letters by the bulk re-drive's own filter and in its order, a cursor page at a time, so a batch can be read before it is re-driven; no filter is required. The bulk re-drive breaks ties by `id`, so jobs that died in the same millisecond are taken in the order the list shows them. `Job.finishedAt` narrowed to milliseconds, as `createdAt` was: at microseconds the next page would start before the job the last one ended on. A job has a `finishedAt` exactly when it is finished (a `CHECK`), and `(userId, status, finishedAt, id)` makes a page or a re-drive batch an index range: 0.06 ms against 10 ms over 20 000 dead letters. A partial index was measured and never chosen, because Prisma sends the status as a cast parameter. |
+| 2026-11-16 | §4.8, §6.2, §6.3, §6.3a, §6.3c, §13.4, §15.2, D32 — per-account caps, the second half of 8.3. An account can have 3 `import.csv` and 50 `image.process` jobs queued or running, checked at submit and at both re-drives, and start 20 uploads a day, now recorded in `UploadSlip`; over any of them is `429`, without `Retry-After`. Each count and its write run under a per-account advisory lock. The `uploads/` lifecycle stays 7 days, and a budget alarm on the AWS account is a setup step. |
+| 2026-11-13 | §10.2, §11, §12.3, §13.2, §15.2, D16 — `trust proxy` and rate limits: 8.4 and the first half of 8.3. A global limiter gives every route a baseline of 300 a minute per caller; login, registration and refresh are limited further per address, and submit, both re-drives and `POST /uploads` per account. A `429` carries a `Retry-After` a browser can read. `TRUST_PROXY` names the proxy; unset, `X-Forwarded-For` is ignored, and `true` is refused. **D16 decided:** a replay counts. Request metrics by route and status, where a request no controller took is `unmatched` — which needed Nest's middleware route, `{/*splat}`, told apart from a controller's. §10.2 listed a `RolesGuard` that is not registered and a `LoggingInterceptor` that does not exist; it lists the registrations there are. |
+| 2026-11-12 | §4.3, §11, §12.3, §13.2, §14, §15.2 — metrics from both processes, each on its own `METRICS_PORT` and labelled by `role`: the worker times every attempt by type and outcome, the API reads the backlog — the outbox and each queue state — and the dead letters by type when scraped. A source that cannot be read drops its series instead of failing the scrape. A partial index serves the dead-letter count. A27 registered and automated. |
+| 2026-11-12 | §10.2, §11, §13.2, §15, §15.2 — phase 8's detail begun, and the HTTP edge built: one `configureApp()` for `main.ts` and the in-process tests, applying the request id, helmet, CORS from `CORS_ORIGINS` — over HTTP and, through an adapter, the socket, whose decorator had reflected any origin — and a 64 KB JSON-only parser. Two defects the new tests found: every body over the limit answered `500` and logged an unhandled exception, because Nest converts only invalid JSON and the filter took the parser's other errors for crashes; and a request the parser refused answered with `requestId: "undefined"`, because the parser runs before pino-http assigns one. `@nestjs/throttler` re-verified for Nest 12; `prom-client` is now `@prometheus-io/client`. |
 | 2026-11-11 | §14, §15.1 — A13 automated. Its criterion moved from peak RSS to live memory: RSS counted garbage V8 had not yet collected and swung between +45 and +82 MB on identical runs, failing the band named for it. Live memory after a forced collection, with a full-size warm-up, reads +2–3 MB for 18 000 more rows against a band of 18 MB, and +62 MB for a worker that buffers the file. |
 | 2026-11-11 | Header, §2, §3, §4.3, §6, §6.2, §7.5, §8.2, §10.1, §11, §13.2, §13.4, §15, §15.1, §16, D6b, D15, D32 — an alignment pass. `Job.error` is `{ code, reason?, message, attempt? }` with `ATTEMPT_FAILED` while a retry is coming; nothing ever wrote `retryable`. `startedAt` is the latest claim. Routes have no `/api/v1` prefix. The queue options and backoff are the ones `jobOptions()` builds. §3, §10.1 and §13.2 gain S3, the upload and product modules, the sweeper and PB–PC's packages; §2 lists the real job types and D15 is closed by them. The Argon2id settings are documented as OWASP's minimum, not test-speed values. A bulk re-drive always resumes, and an import whose upload expired dies again. The bucket needs a CORS rule once a browser uploads (M11.8). **D32 decided:** caps on the work an account can put on S3 are planned now and built in phase 8 (M8.3). |
 | 2026-11-11 | §13.4, §14, §15.1 — CI hands the AWS keys only to the two test steps that reach S3, not to every step: `npm ci` runs every dependency's install script. §13.4 had said CI reads the region from secrets; `ci.yml` sets it. A12b's flush case reports itself inconclusive when the job ran longer than one progress window, where it had passed without proving the flush. Integration specs share their setup (`test/support/db.ts`, `test/support/http.ts`); copies had drifted, and only some validated their env or deleted their users. |

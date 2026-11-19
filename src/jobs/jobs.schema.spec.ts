@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   JOB_TYPES,
   bulkRedriveSchema,
+  listDeadLettersSchema,
   listJobsSchema,
   mockPayloadSchema,
   submitJobSchema,
@@ -202,5 +203,71 @@ describe('bulkRedriveSchema', () => {
     expect(
       bulkRedriveSchema.safeParse({ type: 'MOCK', limit: 0 }).success,
     ).toBe(false);
+  });
+});
+
+describe('listDeadLettersSchema', () => {
+  const position = (fields: Record<string, string>) =>
+    Buffer.from(JSON.stringify(fields)).toString('base64url');
+
+  // Reading every dead letter changes nothing, unlike re-driving them all.
+  it('accepts no filter at all, which the re-drive refuses', () => {
+    expect(listDeadLettersSchema.safeParse({}).success).toBe(true);
+    expect(bulkRedriveSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('reads the filter the re-drive reads', () => {
+    expect(
+      listDeadLettersSchema.parse({
+        type: 'MOCK',
+        errorCode: 'DELIVERY_ABANDONED',
+        deadLetteredFrom: '2026-11-18T04:00:00+02:00',
+        deadLetteredTo: '2026-11-18T03:00:00Z',
+      }),
+    ).toMatchObject({
+      type: 'MOCK',
+      errorCode: 'DELIVERY_ABANDONED',
+      deadLetteredFrom: new Date('2026-11-18T02:00:00Z'),
+      deadLetteredTo: new Date('2026-11-18T03:00:00Z'),
+    });
+  });
+
+  it.each([
+    [
+      'a window that ends before it starts',
+      {
+        deadLetteredFrom: '2026-11-18T03:00:00Z',
+        deadLetteredTo: '2026-11-18T02:00:00Z',
+      },
+    ],
+    ['a time without a timezone', { deadLetteredFrom: '2026-11-18T02:00:00' }],
+    ['an error code no job dies with', { errorCode: 'ATTEMPT_FAILED' }],
+    // A re-drive option sent to the list is a client that meant the other
+    // route.
+    ['a re-drive option', { dryRun: 'true' }],
+    ['a page over 100', { limit: '101' }],
+  ])('refuses %s', (_label, query) => {
+    expect(listDeadLettersSchema.safeParse(query).success).toBe(false);
+  });
+
+  it('reads a cursor as the instant and id the last page ended on', () => {
+    const cursor = position({
+      finishedAt: '2026-11-18T02:00:00.123Z',
+      id: '0318b953-7c93-4af3-ba9b-d51c30a11d8b',
+    });
+
+    expect(listDeadLettersSchema.parse({ cursor }).cursor).toEqual({
+      finishedAt: new Date('2026-11-18T02:00:00.123Z'),
+      id: '0318b953-7c93-4af3-ba9b-d51c30a11d8b',
+    });
+  });
+
+  it("refuses the job list's cursor", () => {
+    const cursor = position({
+      createdAt: '2026-11-18T02:00:00.123Z',
+      id: '0318b953-7c93-4af3-ba9b-d51c30a11d8b',
+    });
+
+    expect(listDeadLettersSchema.safeParse({ cursor }).success).toBe(false);
   });
 });
