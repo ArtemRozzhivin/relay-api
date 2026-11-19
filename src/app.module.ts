@@ -1,6 +1,6 @@
 import { Module, StandardSchemaValidationPipe } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
-import { APP_FILTER, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
+import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { apiEnvSchema, type ApiEnv } from './config/env.schema.js';
@@ -9,11 +9,22 @@ import { RedisModule } from './redis/redis.module.js';
 import { HealthModule } from './health/health.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { JobsModule } from './jobs/jobs.module.js';
+import { EventsModule } from './events/events.module.js';
+import { UploadsModule } from './uploads/uploads.module.js';
+import { ProductsModule } from './products/products.module.js';
 import { BullModule } from '@nestjs/bullmq';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { DomainExceptionFilter } from './common/filters/domain-exception.filter.js';
 import { ResponseEnvelopeInterceptor } from './common/interceptors/response-envelope.interceptor.js';
 import { LoggerModule } from 'nestjs-pino';
 import { buildLoggerParams } from './common/logging/logger.params.js';
+import { MetricsModule } from './metrics/metrics.module.js';
+import { HttpMetrics } from './metrics/http-metrics.js';
+import {
+  RateLimitGuard,
+  rateLimitOptions,
+} from './common/rate-limit/rate-limit.js';
+import { JwtAuthGuard } from './auth/guards/jwt-auth.guard.js';
 
 @Module({
   imports: [
@@ -33,18 +44,38 @@ import { buildLoggerParams } from './common/logging/logger.params.js';
         connection: { url: config.get('REDIS_URL', { infer: true }) },
       }),
     }),
+    MetricsModule.forRoot('api'),
+    ThrottlerModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: rateLimitOptions,
+    }),
     PrismaModule,
     RedisModule,
     HealthModule,
     AuthModule,
     JobsModule,
+    EventsModule,
+    UploadsModule,
+    ProductsModule,
   ],
   controllers: [AppController],
   providers: [
     AppService,
+    HttpMetrics,
     {
       provide: APP_PIPE,
       useClass: StandardSchemaValidationPipe,
+    },
+    // Both here, in this order: global guards run in the order they are
+    // registered, and the limiter counts a signed-in caller by the account
+    // the JWT guard has just read.
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: RateLimitGuard,
     },
     {
       provide: APP_FILTER,

@@ -1,13 +1,22 @@
 import { Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
+import { ScheduleModule } from '@nestjs/schedule';
 import { JobsController } from './jobs.controller.js';
 import { JobsService } from './jobs.service.js';
 import { JobCoreModule } from './job-core.module.js';
 import { JOBS_QUEUE } from './job-queue.js';
+import { OutboxRelayService } from './outbox-relay.service.js';
+import { StorageModule } from '../storage/storage.module.js';
+import { QueueMetrics } from './queue-metrics.js';
 
 @Module({
-  imports: [JobCoreModule, BullModule.registerQueue({ name: JOBS_QUEUE })],
+  imports: [
+    JobCoreModule,
+    StorageModule,
+    ScheduleModule.forRoot(),
+    BullModule.registerQueue({ name: JOBS_QUEUE }),
+  ],
   controllers: [JobsController],
-  providers: [JobsService],
+  providers: [JobsService, OutboxRelayService, QueueMetrics],
 })
 export class JobsModule {}

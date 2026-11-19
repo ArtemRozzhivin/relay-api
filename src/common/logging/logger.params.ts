@@ -1,24 +1,27 @@
-import { randomUUID } from 'node:crypto';
 import type { ConfigService } from '@nestjs/config';
 import type { Request } from 'express';
 import type { Params } from 'nestjs-pino';
 import type { ApiEnv, SharedEnv } from '../../config/env.schema.js';
+import { assignRequestId } from './request-id.js';
 
 export function buildLoggerParams(config: ConfigService<ApiEnv, true>): Params {
   const nodeEnv = config.get('NODE_ENV', { infer: true });
 
   return {
     pinoHttp: {
-      level: nodeEnv === 'test' ? 'silent' : config.get('LOG_LEVEL', { infer: true }),
+      level:
+        nodeEnv === 'test'
+          ? 'silent'
+          : config.get('LOG_LEVEL', { infer: true }),
 
-      genReqId: (req, res) => {
-        const inbound = req.headers['x-request-id'];
-        const id = typeof inbound === 'string' && inbound ? inbound : randomUUID();
+      genReqId: assignRequestId,
 
-        res.setHeader('X-Request-Id', id);
-
-        return id;
-      },
+      // Every line logged while a request is handled carries its id, and under
+      // the worker's name for it: one search for a correlationId finds the
+      // request and the job runs it started (§12.1). The whole request goes on
+      // the line that closes it, not on each line before.
+      quietReqLogger: true,
+      customAttributeKeys: { reqId: 'correlationId' },
 
       redact: {
         paths: ['req.headers.authorization', 'req.headers.cookie'],
@@ -49,7 +52,10 @@ export function buildWorkerLoggerParams(
 
   return {
     pinoHttp: {
-      level: nodeEnv === 'test' ? 'silent' : config.get('LOG_LEVEL', { infer: true }),
+      level:
+        nodeEnv === 'test'
+          ? 'silent'
+          : config.get('LOG_LEVEL', { infer: true }),
       base: { role: 'worker' },
       transport:
         nodeEnv === 'production'
