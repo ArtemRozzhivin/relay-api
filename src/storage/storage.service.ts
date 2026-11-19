@@ -6,8 +6,10 @@ import {
 import { ConfigService } from '@nestjs/config';
 import type { Readable } from 'node:stream';
 import {
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   NoSuchKey,
   S3Client,
   S3ServiceException,
@@ -41,6 +43,15 @@ export interface DownloadLink {
   url: string;
   expiresAt: Date;
 }
+
+/** One object as a listing shows it. */
+export interface ListedObject {
+  key: string;
+  lastModified: Date;
+}
+
+// S3's limit for one request, both for a page of a listing and for a delete.
+const KEYS_PER_REQUEST = 1000;
 
 @Injectable()
 export class StorageService implements OnModuleInit, OnModuleDestroy {
@@ -216,5 +227,59 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
     );
 
     return { url, expiresAt };
+  }
+
+  /**
+   * Every object under `prefix`, in key order, a page at a time. The next page
+   * is asked for only once the caller has handled this one, so a listing of
+   * any length holds one page in memory.
+   */
+  async *listPages(prefix: string): AsyncGenerator<ListedObject[]> {
+    let token: string | undefined;
+
+    do {
+      const page = await this.client.send(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: prefix,
+          ContinuationToken: token,
+          MaxKeys: KEYS_PER_REQUEST,
+        }),
+      );
+
+      yield (page.Contents ?? []).flatMap(({ Key, LastModified }) =>
+        Key && LastModified ? [{ key: Key, lastModified: LastModified }] : [],
+      );
+
+      token = page.NextContinuationToken;
+    } while (token);
+  }
+
+  /**
+   * Deletes objects by key. A key that is already gone counts as deleted.
+   *
+   * @throws when S3 refuses any of them. S3 answers 200 and lists the
+   * refusals, so they are checked here; the others in the request are gone.
+   */
+  async deleteObjects(keys: readonly string[]) {
+    for (let start = 0; start < keys.length; start += KEYS_PER_REQUEST) {
+      const { Errors: refused = [] } = await this.client.send(
+        new DeleteObjectsCommand({
+          Bucket: this.bucket,
+          Delete: {
+            Objects: keys
+              .slice(start, start + KEYS_PER_REQUEST)
+              .map((Key) => ({ Key })),
+            Quiet: true,
+          },
+        }),
+      );
+
+      if (refused.length > 0) {
+        throw new Error(
+          `S3 refused to delete ${refused.length} object(s), the first ${refused[0]!.Key} with ${refused[0]!.Code}`,
+        );
+      }
+    }
   }
 }

@@ -629,12 +629,12 @@ the new image rather than over it; the key is otherwise fixed, so a re-run overw
 files with the same bytes and needs no ledger. The files are written first and the product
 recorded `READY` second, and only while `imageUrl` still equals the URL that was processed — a
 crash between the two leaves files nothing points at yet, never a row pointing at missing files,
-and an import that replaced the URL meanwhile wins. A replaced URL's old files stay in the bucket
-for now. Deleting them when the new image is recorded is not safe: if the seller switches back to
-the old URL while a slow job is still finishing, that job's late delete removes the files the row
-points at again. A sweep that deletes a folder only when it is not the current URL's **and** has
-not been written for a day is planned instead (M8.8): a re-render rewrites the folder, so its age
-says no job is using it.
+and an import that replaced the URL meanwhile wins. A replaced URL's old files are not deleted
+when the new image is recorded: if the seller switches back to the old URL while a slow job is
+still finishing, that job's late delete would remove the files the row points at again. A sweep
+in the worker deletes a folder instead, only when it is neither the current URL's nor the one the
+image was made from, **and** nothing in it has been written for a day: a re-render rewrites the
+folder, so its age says no job is using it (8.8, §15.2).
 
 Between products the job reports `processed` out of `total` and honours a cancellation, so a
 stopped batch has recorded whole images only. A product already `READY` for its current URL is
@@ -1300,7 +1300,8 @@ WorkerModule  (bootstrap: NestFactory.createApplicationContext)
 ├── JobCoreModule
 ├── BullModule.registerQueue({ name: 'relay-jobs' })                 // CONSUMER
 ├── JobsProcessor           (WorkerHost)
-└── StrandedJobSweeper      (finishes jobs the queue stopped delivering, §7.6)
+├── StrandedJobSweeper      (finishes jobs the queue stopped delivering, §7.6)
+└── ImageFolderSweeper      (deletes image folders no product uses, §6.3c)
 
 JobCoreModule  (imported by BOTH roots: the domain, with no queue and no transport)
 ├── imports RedisModule, StorageModule, ProductsModule, OutboundModule
@@ -1524,7 +1525,8 @@ admin user (never the root user):
    not expire: `uploads/` and `reports/` expire after 7 days, `fixtures/` (written by the tests)
    after 1, and incomplete multipart uploads are aborted after 1 day across the bucket. The tests
    that make product images delete their own account's `products/` folder when they finish
-   (`test/support/product-images.ts`), since no rule ever will.
+   (`test/support/product-images.ts`), since no rule ever will; in a running system the worker's
+   sweep deletes the folders no product uses (§6.3c).
 
    A **CORS rule** too, once a browser uploads (the dashboard, PG): S3 answers a presigned POST
    from another origin only if the bucket allows it. Scripts and the tests need none, which is why
@@ -1910,6 +1912,42 @@ worker made of it (A28).
 - `status` had been listed as a standard field and is not one: it changes during an attempt, so
   a field bound when the attempt starts would be wrong by its end, and each line says what
   happened.
+
+#### Replaced image folders — 8.8
+
+A product's image lives in a folder named by the hash of the URL it was made from (§6.3c), so an
+import that changes the URL leaves the old folder behind, and `products/` never expires (§13.4).
+`ImageFolderSweeper` lists `products/` every 6 hours and deletes a folder when both hold:
+
+| Kept while | Why |
+|---|---|
+| it is the folder of the URL the image was made from (`imageSourceUrl`) | the row points at it: the seller's image |
+| it is the folder of the product's current URL (`imageUrl`), made or not | a job may be making it now — a URL switched back to an old one rewrites that old folder |
+| anything in it was written within the last day | a re-render rewrites every file, so a day of quiet says no job is using it |
+
+- **The rows are read after the listing,** so a URL changed while the listing ran is seen. What is
+  left open: a URL switched back after that read, whose job then downloads, renders and writes the
+  folder before the delete is sent — a whole job inside one S3 request. Closing it would take a
+  folder per render recorded on the row, or a versioned bucket; neither is worth it for that.
+- **A folder whose product no longer exists is deleted,** so an account's images go some time after
+  the account does.
+- **A folder is judged whole.** A listing page can end partway through one, so it is held until a
+  key of the next folder shows it complete; otherwise an old file could go while a newer one in
+  the same folder is still being written.
+- **Keys of any other shape are left alone:** only what the image handler writes is the sweep's to
+  judge.
+- **Every worker sweeps.** Deletes are idempotent, and the cost is one listing of the bucket per
+  worker per run, at $0.005 a thousand keys. No lock was added for it.
+- **The first sweep comes 6 hours after the worker starts,** so a worker restarted more often than
+  that never sweeps, and old folders wait for one that stays up. Sweeping at start would be worse:
+  CI starts workers on an empty database against the real bucket, and would judge every folder in
+  it unused. Storage is all a late sweep costs.
+- **S3 answers a bulk delete with 200 and lists what it refused,** so the refusals are checked and
+  thrown; read as success, the sweep would count as deleted folders that are still there.
+- **The integration test sweeps one account's prefix only.** The bucket is shared with every other
+  run; a sweep of all of `products/` from a test would judge their images by its own database's
+  rows.
+- The IAM policy already allows `s3:ListBucket` and `s3:DeleteObject` (§13.4).
 
 ---
 
@@ -2303,6 +2341,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-18 | §6.3c, §10.1, §13.4, §15.2 — replaced image folders, 8.8. `ImageFolderSweeper` lists `products/` every 6 hours in each worker and deletes a folder only when it is neither the product's current URL's nor the one its image was made from, and nothing in it has been written for a day; a product that no longer exists keeps none. Rows are read after the listing, a folder split across listing pages is judged whole, and a bulk delete's per-key refusals are thrown. The window left open — a URL switched back and re-rendered within one S3 request — is named. |
 | 2026-11-18 | §7.7, §12.1, §14, §15.2 — logs joined by `correlationId`, 8.7. Every line about a job carries it as a field in both processes: the API binds the request id under that name to each line it writes while handling the request, and the worker runs each job, its stall, its abandonment and the sweep's finishing of it in a log context naming the `correlationId` and `jobId`, adding `jobType` and `attempt` once claimed — whichever class writes the line. A re-drive's runs are logged under the re-drive's id. A succeeded attempt now logs that it succeeded. `status` dropped from §12.1's fields. A28 registered and automated. |
 | 2026-11-18 | §4.3, §15.2 — the dead-letter metric now reads its partial index. As a Prisma `groupBy` it never had: Prisma sends the status as a parameter cast at run time, which the planner cannot match to the index's `WHERE`, so every scrape read every job. The count is raw SQL with the status written in, and an integration test checks its plan. §15.2 had claimed the index was verified in use; corrected. |
 | 2026-11-18 | §4.3, §6.2, D11, D14 — dead-letter inspection, 8.6. `GET /jobs/dead-letters` lists the caller's dead letters by the bulk re-drive's own filter and in its order, a cursor page at a time, so a batch can be read before it is re-driven; no filter is required. The bulk re-drive breaks ties by `id`, so jobs that died in the same millisecond are taken in the order the list shows them. `Job.finishedAt` narrowed to milliseconds, as `createdAt` was: at microseconds the next page would start before the job the last one ended on. A job has a `finishedAt` exactly when it is finished (a `CHECK`), and `(userId, status, finishedAt, id)` makes a page or a re-drive batch an index range: 0.06 ms against 10 ms over 20 000 dead letters. A partial index was measured and never chosen, because Prisma sends the status as a cast parameter. |

@@ -429,9 +429,12 @@ Each step is motivated by the failure of the one before it.
   ```
   _A correlation id that stops at the process boundary is decorative._
   ```
-- [ ] **8.8 · Delete the files of a product's replaced image** — a sweep over
+- [x] **8.8 · Delete the files of a product's replaced image** — a sweep over
   `products/<userId>/<productId>/` that deletes a hash folder only when it is not the hash of the
   product's current `imageSourceUrl` **and** none of its files was written in the last day (§6.3c).
+  - [x] `ImageFolderSweeper`, every 6 hours in each worker. It keeps the current `imageUrl`'s
+    folder too, since a URL switched back is re-rendered into its old folder; reads the rows after
+    the listing; and judges a folder split across listing pages whole.
   ```
   _Deleting the old folder when the new image is recorded races a URL switched back while a slow
   job finishes: its late delete takes the files the row points at again. A re-render rewrites the

@@ -17,8 +17,16 @@ export const mintUploadKey = (userId: string) =>
 export const UPLOAD_KEY_PATTERN =
   /^uploads\/[0-9a-f-]{36}\/[0-9a-f-]{36}\.csv$/;
 
+/** Where every account's product images live. */
+export const PRODUCT_IMAGES_ROOT = 'products/';
+
 /** Where every image made for an account's products lives. */
-export const productImagesPrefix = (userId: string) => `products/${userId}/`;
+export const productImagesPrefix = (userId: string) =>
+  `${PRODUCT_IMAGES_ROOT}${userId}/`;
+
+/** The folder name the sizes made from one source URL share. */
+export const imageSourceHash = (sourceUrl: string) =>
+  createHash('sha256').update(sourceUrl).digest('hex').slice(0, 16);
 
 /**
  * Where one size of a product's image lives. Under the URL it was made from as
@@ -33,10 +41,38 @@ export const productImageKey = (
   sourceUrl: string,
   size: string,
 ) =>
-  `${productImagesPrefix(userId)}${productId}/${createHash('sha256')
-    .update(sourceUrl)
-    .digest('hex')
-    .slice(0, 16)}/${size}.webp`;
+  `${productImagesPrefix(userId)}${productId}/${imageSourceHash(sourceUrl)}/${size}.webp`;
+
+const PRODUCT_IMAGE_KEY =
+  /^products\/([0-9a-f-]{36})\/([0-9a-f-]{36})\/([0-9a-f]{16})\/[^/]+$/;
+
+/**
+ * What a key {@link productImageKey} built names: the account, the product,
+ * and the folder of one source URL's sizes.
+ *
+ * @returns `null` for a key of any other shape, which nothing here wrote.
+ */
+export const readProductImageKey = (key: string) => {
+  const match = PRODUCT_IMAGE_KEY.exec(key);
+
+  if (!match) {
+    return null;
+  }
+
+  // Three groups, none optional, so a match has all three.
+  const [userId, productId, sourceHash] = match.slice(1) as [
+    string,
+    string,
+    string,
+  ];
+
+  return {
+    userId,
+    productId,
+    sourceHash,
+    folder: `${productImagesPrefix(userId)}${productId}/${sourceHash}/`,
+  };
+};
 
 /**
  * Where an import's error report lives: one per job, so a re-run overwrites
