@@ -87,7 +87,13 @@ describe('the dead-letter metric', () => {
           count - (before[type] ?? 0),
         ]),
       ),
-    ).toEqual({ MOCK: 2, CHARGE: 1, 'import.csv': 0, 'image.process': 0 });
+    ).toEqual({
+      MOCK: 2,
+      CHARGE: 1,
+      'import.csv': 0,
+      'image.process': 0,
+      'ai.enrich': 0,
+    });
   });
 
   // Every scrape runs it across all accounts, so reading every job would cost

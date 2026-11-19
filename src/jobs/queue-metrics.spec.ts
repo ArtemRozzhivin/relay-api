@@ -82,6 +82,7 @@ describe('QueueMetrics', () => {
       CHARGE: 0,
       'import.csv': 0,
       'image.process': 0,
+      'ai.enrich': 0,
     });
   });
 

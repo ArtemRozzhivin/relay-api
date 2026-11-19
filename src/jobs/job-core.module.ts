@@ -9,9 +9,11 @@ import { MockJobHandler } from './handlers/mock.handler.js';
 import { ChargeJobHandler } from './handlers/charge.handler.js';
 import { ImportCsvJobHandler } from './handlers/import-csv.handler.js';
 import { ImageProcessJobHandler } from './handlers/image-process.handler.js';
+import { AiEnrichJobHandler } from './handlers/ai-enrich.handler.js';
 import { StorageModule } from '../storage/storage.module.js';
 import { ProductsModule } from '../products/products.module.js';
 import { OutboundModule } from '../outbound/outbound.module.js';
+import { EnrichmentModule } from '../enrichment/enrichment.module.js';
 import type { JobType } from './jobs.schema.js';
 
 // Keyed by type rather than listed: `Record<JobType, …>` makes a job type with
@@ -23,12 +25,19 @@ const HANDLERS: Record<JobType, Type<RunnableJobHandler>> = {
   CHARGE: ChargeJobHandler,
   'import.csv': ImportCsvJobHandler,
   'image.process': ImageProcessJobHandler,
+  'ai.enrich': AiEnrichJobHandler,
 };
 
 const handlerProviders = Object.values(HANDLERS);
 
 @Module({
-  imports: [RedisModule, StorageModule, ProductsModule, OutboundModule],
+  imports: [
+    RedisModule,
+    StorageModule,
+    ProductsModule,
+    OutboundModule,
+    EnrichmentModule,
+  ],
   providers: [
     JobTransitionService,
     JobHandlerRegistry,

@@ -38,6 +38,15 @@ export const imageProcessPayloadSchema = z.object({
     .max(50),
 });
 
+// Fewer than an image batch: the whole batch goes to the model in one request,
+// whose size and price grow with every product in it.
+export const aiEnrichPayloadSchema = z.object({
+  skus: z
+    .array(storableText().trim().min(1).max(SKU_MAX_LENGTH))
+    .min(1)
+    .max(20),
+});
+
 export const chargePayloadSchema = z.object({
   amountCents: z.coerce.number().int().positive(),
   reference: storableText().min(1).max(200),
@@ -72,6 +81,13 @@ export const submitJobSchema = z.discriminatedUnion('type', [
     .object({
       type: z.literal('image.process'),
       payload: imageProcessPayloadSchema.strict(),
+      maxAttempts: maxAttemptsSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('ai.enrich'),
+      payload: aiEnrichPayloadSchema.strict(),
       maxAttempts: maxAttemptsSchema,
     })
     .strict(),

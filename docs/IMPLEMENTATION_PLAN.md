@@ -811,8 +811,10 @@ of failing jobs.
   _A BullMQ limiter is per-queue, so the rate limit itself forces the split — not a starvation
   measurement, which is what D6a was waiting for._
   ```
-- [ ] **D.3 · Zod-validate every item** — one corrective retry, then
-  `enrichmentStatus = 'failed'`; a category outside the enum is rejected.
+- [x] **D.3 · Zod-validate every item** — one corrective retry, then
+  `enrichmentStatus = 'failed'`; a category outside the enum is rejected. Built before D.2, which
+  needs a job to carry. `category` is a Postgres enum, and the write is conditional on the text
+  the model was given — D.5's second half.
   ```
   _A hallucinated category is indistinguishable from a valid one until something checks. This is
   the lesson of the phase._
@@ -829,7 +831,7 @@ of failing jobs.
 
 ### Done when
 
-- [ ] **A19 passes** — malformed or out-of-schema output never reaches the database
+- [x] **A19 passes** — malformed or out-of-schema output never reaches the database
 - [ ] **A20 passes** — simulated 429s slow the queue; no job fails because of one
 - [ ] **A21 passes** — re-running enrichment on unchanged products issues zero provider calls
 

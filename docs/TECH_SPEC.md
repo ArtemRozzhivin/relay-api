@@ -283,6 +283,11 @@ code it gives each item it sells), never by our `id`, so the SKU is the key an i
 | `imageStatus` | `text?` | `READY` or `FAILED`: what `image.process` concluded about `imageSourceUrl` (§6.3c). **DB** `CHECK` |
 | `imageSourceUrl` | `text?` | The `imageUrl` that conclusion is about. Set exactly when `imageStatus` is (**DB** `CHECK`). Once an import replaces `imageUrl`, the two differ and the image reads as not processed yet — nothing has to clear the old conclusion |
 | `imageError` | `text?` | Why the image at `imageSourceUrl` could not be used. **DB** `CHECK`: only when `FAILED` |
+| `enrichmentStatus` | `text?` | `READY` or `FAILED`: what `ai.enrich` concluded from the input `enrichmentInputHash` names (§6.3d). **DB** `CHECK` |
+| `enrichmentInputHash` | `text?` | SHA-256 of the name, description and instructions' version the conclusion was made from. Set exactly when `enrichmentStatus` is (**DB** `CHECK`). Once an import changes the text, the hash no longer matches and the product reads as not enriched yet — nothing has to clear the old conclusion |
+| `enrichmentError` | `text?` | Why the model's answer could not be used. **DB** `CHECK`: only when `FAILED` |
+| `category` | `ProductCategory?` | A Postgres enum of the 12 categories, so no value outside them can be stored. **DB** `CHECK`: set exactly when `READY` |
+| `tags` | `text[]` | Up to 5, empty unless `READY` (**DB** `CHECK`s); each at most 30 characters, which the handler checks |
 | `createdAt` / `updatedAt` | `timestamptz(6)` | |
 
 **DB** `UNIQUE (userId, sku)` — per store, because two stores' `A-1` are unrelated. This is what
@@ -435,7 +440,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
 | `GET` | `/jobs/dead-letters` | access | `200` | The caller's dead letters, oldest-dead first, matching `POST /jobs/retry`'s filter — `?type=`, `?errorCode=`, `?deadLetteredFrom=`, `?deadLetteredTo=`, none required — in the order a re-drive with the same filter takes them. The re-drive skips a type at its cap, and later dead letters take its places (D32). Paged like `/jobs`: `?limit=` (1–100), `?cursor=` → `{ items, nextCursor }`. Send an offset's `+` as `%2B`: a query string reads `+` as a space, and the instant is refused. A scroll is not a snapshot; to page through a fixed set, set `deadLetteredTo` a few seconds in the past. See D11 |
-| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) |
+| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) and `enrichment` (§6.3d) |
 | `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. Read a batch before sending it with `GET /jobs/dead-letters`. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
@@ -692,7 +697,7 @@ it would slow imports and images too (D6a). _Built in D.2 and D.4._
 what it was enriched from — name, description and the version of the instructions — and one whose
 hash matches and whose status is `READY` is skipped without a request. The write is conditional on
 the row still holding the name and description that were sent, so an import that changed them
-meanwhile wins. _Built in D.5._
+meanwhile wins. _The conditional write is built in D.3, the skip in D.5._
 
 **Each job records its cost:** `tokensIn`, `tokensOut` and `estimatedCostUsd`, over all its
 requests, corrective ones included. _Built in D.6._
@@ -712,6 +717,18 @@ demand, when a product's name holds a directive:
 Otherwise it picks a category by a hash of the sku, and up to 3 tags from the words of the name.
 Its token counts are the characters sent and received, over four. A real provider would plug in
 behind the same interface; which one, and whether one is built, PD leaves open.
+
+The corrective request names only the products that need it, each with its reason, and only the
+text the model needs — sku, name and description, never an id or the owner. A failure clears any
+category and tags the product had: they were made from older text. In `GET /products`, each
+product's `enrichment` is `{ "status": "PENDING" }` until there is a conclusion for the text it
+has now — never enriched, or changed since — then `{ "status": "READY", "category", "tags" }` or
+`{ "status": "FAILED", "error" }`.
+
+```jsonc
+// result
+{ "requested": 3, "enriched": 1, "failed": 1, "superseded": 0, "notFound": ["X-9"] }
+```
 
 ### 6.4 Validation
 
@@ -1665,7 +1682,7 @@ cases.
 | **A16** | **A hostile image URL reaches nothing private.** `http://localhost`, `http://169.254.169.254`, and a public DNS name resolving to a private address | All three rejected **after resolution, before connect**; the product fails, the batch does not | PC |
 | **A17** | **A permanent error does not burn the budget.** One batch: an image, a 404, a page, undecodable bytes, the metadata address | `attempts = 1` at `SUCCEEDED`; the four products `FAILED`, each with its reason; no backoff was waited (D31) | PC |
 | **A18** | **Image batches do not self-stall.** Five batches of 20 of the heaviest image the limits allow, at the worker's concurrency of 5, timed by a probe inside the real worker | Zero `stalled` events and every product `READY`; event-loop delay and Redis round trip under 1 s, against the 15 s a renewal may be late. A single 40 s main-thread freeze fails it with 5 stalls (D10) | PC |
-| **A19** | **LLM output is untrusted input.** Fake provider returns malformed JSON and an out-of-enum category | Nothing is written for those items; `enrichmentStatus = 'failed'` with a reason; the DB holds no value outside the taxonomy | PD |
+| **A19** | **LLM output is untrusted input.** The fake model answers one batch with a category outside the list, and another with cut-off JSON, the corrective request included | Both jobs `SUCCEEDED` on attempt 1. Nothing is written for those products: `enrichmentStatus = 'FAILED'` with the reason, no category, no tags, and the reason shown in `GET /products`; the other product in the batch is `READY`. No `category` in the table is outside the list | PD |
 | **A20** | **Rate limits slow the queue, not the jobs.** Fake provider returns 429 with `Retry-After` | No job reaches `DEAD_LETTERED` because of a 429; the queue's throughput drops and recovers | PD |
 | **A21** | **Re-enrichment of unchanged products is free.** Run enrichment twice | Provider call count on the second run **= 0**; `estimatedCostUsd` unchanged | PD |
 | **A22** | **A failed child does not fail the pipeline.** Force one enrichment batch to fail | `Pipeline.status = 'completed_with_errors'`; sibling batches completed; the failed batch is re-drivable; no `Job` row carries `completed_with_errors` | PE |
@@ -2391,6 +2408,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-19 | §4.7, §6.2, §6.3d, §14 — `ai.enrich` built, D.3. `Product` gains `enrichmentStatus`, `enrichmentInputHash`, `enrichmentError`, `category` — a Postgres enum, so nothing outside the list can be stored — and `tags`, with `CHECK`s that only a `READY` product has an answer. One request per batch; each item of the reply is checked on its own, and the products without a usable answer get one corrective request, then `FAILED` with the reason. Recorded only while the product has the text the model was given. `GET /products` shows each product's `enrichment`. Built before D.2: the queue split needs the job to carry. A19 automated. |
 | 2026-11-19 | §6.3d — `ai.enrich` specified, and D.1 built. A batch of up to 20 skus gets a category from a fixed list of 12 and up to 5 tags in one request; the reply is checked item by item, with one corrective request, and what is still wrong fails its product, not the job. A 429 pauses a queue of the job's own; an unchanged product is skipped by the hash of its input; each job records its tokens and cost. `LlmProvider` is the interface, and `FakeLlmProvider` the one implementation: deterministic, and failing on demand when a product's name holds a directive. A real provider is left open. |
 | 2026-11-19 | §13.4, D32 — the AWS budget alarm is set: email alerts at $5 a month, on the account that holds the bucket. The last of 8.3, and of phase 8. |
 | 2026-11-18 | §6.3c, §10.1, §13.4, §15.2 — replaced image folders, 8.8. `ImageFolderSweeper` lists `products/` every 6 hours in each worker and deletes a folder only when it is neither the product's current URL's nor the one its image was made from, and nothing in it has been written for a day; a product that no longer exists keeps none. Rows are read after the listing, a folder split across listing pages is judged whole, and a bulk delete's per-key refusals are thrown. The window left open — a URL switched back and re-rendered within one S3 request — is named. |
