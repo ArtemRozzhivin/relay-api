@@ -1,26 +1,17 @@
-import { Logger, type OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  InjectQueue,
-  OnWorkerEvent,
-  Processor,
-  WorkerHost,
-} from '@nestjs/bullmq';
-import {
-  DelayedError,
-  UnrecoverableError,
-  type Job as QueueJob,
-  type Queue,
-} from 'bullmq';
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
+import { DelayedError, UnrecoverableError, type Job as QueueJob } from 'bullmq';
 import { PinoLogger } from 'nestjs-pino';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
 import { JobContextFactory } from '../jobs/job-context.factory.js';
 import { JobCancelledError } from '../jobs/job-handler.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
-import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
+import { AI_QUEUE, JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
+import { JobQueues } from '../jobs/job-queues.js';
 import { AppError, TerminalJobError } from '../common/errors/app-error.js';
-import type { WorkerEnv } from '../config/env.schema.js';
+import { workerEnvSchema, type WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';
 import { JobMetrics, type AttemptOutcome } from './job-metrics.js';
 
@@ -35,11 +26,15 @@ const ownerMessage = (error: unknown, correlationId: string) =>
     ? error.message
     : `Internal error; the worker's log has it under correlationId ${correlationId}`;
 
-@Processor(JOBS_QUEUE, {
-  concurrency: Number(process.env.WORKER_CONCURRENCY ?? 5),
-})
-export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
-  private readonly logger = new Logger(JobsProcessor.name);
+/**
+ * Runs the jobs one queue delivers. Each queue has a subclass below, which
+ * says which queue and how fast; everything a delivery goes through is here,
+ * the same for both.
+ */
+@Injectable()
+abstract class QueueProcessor extends WorkerHost implements OnModuleDestroy {
+  // The subclass's name, so a line says which queue's processor wrote it.
+  private readonly logger = new Logger(this.constructor.name);
   private readonly finalising = new Set<Promise<void>>();
 
   // Set when shutdown begins: from then on, every running handler is told to
@@ -54,7 +49,7 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     private readonly config: ConfigService<WorkerEnv, true>,
     private readonly metrics: JobMetrics,
     private readonly logContext: PinoLogger,
-    @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
+    private readonly queues: JobQueues,
   ) {
     super();
   }
@@ -335,7 +330,10 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
   // without them if the entry cannot be read, never not at all.
   @OnWorkerEvent('stalled')
   async onStalled(entryId: string) {
-    const entry = await this.queue.getJob(entryId).catch(() => undefined);
+    const entry = await this.queues
+      .named(this.worker.name)
+      .getJob(entryId)
+      .catch(() => undefined);
     const { jobId, correlationId } = entry?.data ?? {};
 
     this.logContext.runInContext(
@@ -347,3 +345,28 @@ export class JobsProcessor extends WorkerHost implements OnModuleDestroy {
     );
   }
 }
+
+// Read as this module loads, before ConfigModule has started: load-env.ts has
+// put .env into the environment by then. Parsed by the env schema, so each has
+// the default and bounds ConfigModule then checks it against.
+const { shape } = workerEnvSchema;
+
+@Processor(JOBS_QUEUE, {
+  concurrency: shape.WORKER_CONCURRENCY.parse(process.env.WORKER_CONCURRENCY),
+})
+export class JobsProcessor extends QueueProcessor {}
+
+// The limiter is the provider's rate limit. BullMQ keeps it in Redis for the
+// whole queue, so more workers do not raise it; the concurrency is per worker.
+@Processor(AI_QUEUE, {
+  concurrency: shape.AI_WORKER_CONCURRENCY.parse(
+    process.env.AI_WORKER_CONCURRENCY,
+  ),
+  limiter: {
+    max: shape.AI_QUEUE_LIMIT_MAX.parse(process.env.AI_QUEUE_LIMIT_MAX),
+    duration: shape.AI_QUEUE_LIMIT_DURATION_MS.parse(
+      process.env.AI_QUEUE_LIMIT_DURATION_MS,
+    ),
+  },
+})
+export class AiJobsProcessor extends QueueProcessor {}

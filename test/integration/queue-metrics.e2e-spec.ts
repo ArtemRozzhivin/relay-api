@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { TestingModule } from '@nestjs/testing';
 import { Registry } from '@prometheus-io/client';
-import type { Queue } from 'bullmq';
 import { Prisma } from '../../src/generated/prisma/client.js';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
@@ -9,6 +8,7 @@ import {
   DEAD_LETTERS_BY_TYPE,
   QueueMetrics,
 } from '../../src/jobs/queue-metrics.js';
+import type { JobQueues } from '../../src/jobs/job-queues.js';
 import {
   createTestModule,
   createThrowawayUser,
@@ -41,10 +41,10 @@ describe('the dead-letter metric', () => {
     prisma = moduleRef.get(PrismaService);
     registry = new Registry();
 
-    // The queue's series are not under test here.
-    const queue = { getJobCounts: async () => ({}) } as unknown as Queue;
+    // The queues' series are not under test here.
+    const queues = { all: () => [] } as unknown as JobQueues;
 
-    new QueueMetrics(registry, prisma, queue);
+    new QueueMetrics(registry, prisma, queues);
   });
 
   afterAll(async () => {

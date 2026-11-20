@@ -1,9 +1,10 @@
 import { Logger } from '@nestjs/common';
 import { Registry } from '@prometheus-io/client';
-import type { Queue } from 'bullmq';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PrismaService } from '../prisma/prisma.service.js';
 import { QueueMetrics } from './queue-metrics.js';
+import { AI_QUEUE, JOBS_QUEUE } from './job-queue.js';
+import type { JobQueues } from './job-queues.js';
 
 const down = () => Promise.reject(new Error('connect ECONNREFUSED'));
 
@@ -12,25 +13,36 @@ const sources = () => {
   const fail = { postgres: false, redis: false };
 
   const prisma = {
-    outbox: { count: () => (fail.postgres ? down() : Promise.resolve(3)) },
+    // Unpublished rows by the queue they name; none for relay-ai.
+    outbox: {
+      groupBy: () =>
+        fail.postgres
+          ? down()
+          : Promise.resolve([{ queue: JOBS_QUEUE, _count: { _all: 3 } }]),
+    },
     // Only the dead-letter count is a raw query.
     $queryRaw: () =>
       fail.postgres ? down() : Promise.resolve([{ type: 'MOCK', count: 2 }]),
   } as unknown as PrismaService;
 
-  const queue = {
-    getJobCounts: () =>
-      fail.redis
-        ? down()
-        : Promise.resolve({
-            waiting: 5,
-            prioritized: 0,
-            delayed: 1,
-            active: 2,
-          }),
-  } as unknown as Queue;
+  const holding = (counts: Record<string, number>) => ({
+    getJobCounts: () => (fail.redis ? down() : Promise.resolve(counts)),
+  });
 
-  return { fail, prisma, queue };
+  const queues = {
+    all: () => [
+      [
+        JOBS_QUEUE,
+        holding({ waiting: 5, prioritized: 0, delayed: 1, active: 2 }),
+      ],
+      [
+        AI_QUEUE,
+        holding({ waiting: 4, prioritized: 0, delayed: 0, active: 1 }),
+      ],
+    ],
+  } as unknown as JobQueues;
+
+  return { fail, prisma, queues };
 };
 
 // What one scrape would show of `name`, as `{ label: value }`.
@@ -47,6 +59,22 @@ const scrape = async (registry: Registry, name: string, label: string) => {
   );
 };
 
+// The backlog one scrape would show, as `{ queue: { state: value } }`.
+const depth = async (registry: Registry) => {
+  await registry.metrics();
+
+  const { values } = await registry.getSingleMetric('relay_queue_depth')!.get();
+  const byQueue: Record<string, Record<string, number>> = {};
+
+  for (const { labels, value } of values) {
+    const { queue, state } = labels as Record<string, string>;
+
+    byQueue[queue] = { ...byQueue[queue], [state]: value };
+  }
+
+  return byQueue;
+};
+
 describe('QueueMetrics', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -55,22 +83,31 @@ describe('QueueMetrics', () => {
 
   const setup = () => {
     const registry = new Registry();
-    const { fail, prisma, queue } = sources();
+    const { fail, prisma, queues } = sources();
 
-    new QueueMetrics(registry, prisma, queue);
+    new QueueMetrics(registry, prisma, queues);
 
     return { registry, fail };
   };
 
-  it('reads the backlog from the outbox and the queue', async () => {
+  it("reads each queue's backlog from the outbox and the queue", async () => {
     const { registry } = setup();
 
-    expect(await scrape(registry, 'relay_queue_depth', 'state')).toEqual({
-      outbox: 3,
-      waiting: 5,
-      prioritized: 0,
-      delayed: 1,
-      active: 2,
+    expect(await depth(registry)).toEqual({
+      [JOBS_QUEUE]: {
+        outbox: 3,
+        waiting: 5,
+        prioritized: 0,
+        delayed: 1,
+        active: 2,
+      },
+      [AI_QUEUE]: {
+        outbox: 0,
+        waiting: 4,
+        prioritized: 0,
+        delayed: 0,
+        active: 1,
+      },
     });
   });
 
@@ -93,11 +130,9 @@ describe('QueueMetrics', () => {
     await registry.metrics();
     fail.postgres = true;
 
-    expect(await scrape(registry, 'relay_queue_depth', 'state')).toEqual({
-      waiting: 5,
-      prioritized: 0,
-      delayed: 1,
-      active: 2,
+    expect(await depth(registry)).toEqual({
+      [JOBS_QUEUE]: { waiting: 5, prioritized: 0, delayed: 1, active: 2 },
+      [AI_QUEUE]: { waiting: 4, prioritized: 0, delayed: 0, active: 1 },
     });
     expect(await scrape(registry, 'relay_dead_letters', 'type')).toEqual({});
     expect(Logger.prototype.warn).toHaveBeenCalled();
@@ -109,8 +144,9 @@ describe('QueueMetrics', () => {
     await registry.metrics();
     fail.redis = true;
 
-    expect(await scrape(registry, 'relay_queue_depth', 'state')).toEqual({
-      outbox: 3,
+    expect(await depth(registry)).toEqual({
+      [JOBS_QUEUE]: { outbox: 3 },
+      [AI_QUEUE]: { outbox: 0 },
     });
   });
 });

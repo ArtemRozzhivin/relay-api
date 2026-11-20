@@ -4,7 +4,8 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { JobsController } from './jobs.controller.js';
 import { JobsService } from './jobs.service.js';
 import { JobCoreModule } from './job-core.module.js';
-import { JOBS_QUEUE } from './job-queue.js';
+import { AI_QUEUE, JOBS_QUEUE } from './job-queue.js';
+import { JobQueues } from './job-queues.js';
 import { OutboxRelayService } from './outbox-relay.service.js';
 import { StorageModule } from '../storage/storage.module.js';
 import { QueueMetrics } from './queue-metrics.js';
@@ -14,9 +15,9 @@ import { QueueMetrics } from './queue-metrics.js';
     JobCoreModule,
     StorageModule,
     ScheduleModule.forRoot(),
-    BullModule.registerQueue({ name: JOBS_QUEUE }),
+    BullModule.registerQueue({ name: JOBS_QUEUE }, { name: AI_QUEUE }),
   ],
   controllers: [JobsController],
-  providers: [JobsService, OutboxRelayService, QueueMetrics],
+  providers: [JobsService, OutboxRelayService, QueueMetrics, JobQueues],
 })
 export class JobsModule {}

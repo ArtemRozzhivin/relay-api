@@ -248,7 +248,7 @@ Closes the commit-then-enqueue gap (D5). Written in the same transaction as the 
 |---|---|---|
 | `id` | `bigserial` | PK. Serial, not uuid — the relay publishes in insertion order, skipping a row it cannot publish rather than stopping at it, so one bad row never holds back the rest |
 | `jobId` | `uuid` | **DB** FK → `Job` |
-| `queue` / `jobName` | `text` | Destination |
+| `queue` / `jobName` | `text` | Destination: the queue the job's type is delivered through when the row is written (§8.1), and its type. Every delivery of the row — direct, relay, sweep, cancel — goes to that queue |
 | `payload` | `jsonb` | The queue message (§8.3) |
 | `createdAt` | `timestamptz(6)` | |
 | `publishedAt` | `timestamptz(6)?` | `NULL` = pending |
@@ -691,7 +691,9 @@ with images, a product's failure is not the job's (D31). _Built in D.3._
 **A provider's 429 is not a failure** (A20). Its `Retry-After` pauses the AI queue for that long,
 and the job waits without spending an attempt. These jobs run on a queue of their own, `relay-ai`,
 with a limiter and a low concurrency: a BullMQ limiter applies to a whole queue, so on `relay-jobs`
-it would slow imports and images too (D6a). _Built in D.2 and D.4._
+it would slow imports and images too (D6a). By default 20 jobs may start a minute, across every
+worker — at most two requests each, under a provider's usual 50 a minute — and 2 run at once in
+each worker (§8.4). _The queue is built in D.2, the 429 in D.4._
 
 **An unchanged product costs nothing** (A21). A product records `enrichmentInputHash`, the hash of
 what it was enriched from — name, description and the version of the instructions — and one whose
@@ -1078,7 +1080,11 @@ seller list which internal names exist, one URL at a time.
 
 ### 8.1 Queues
 
-One queue, `relay-jobs`, with the BullMQ **job name** set to the `Job.type`.
+Two queues, with the BullMQ **job name** set to the `Job.type`: `relay-ai` for `ai.enrich`, and
+`relay-jobs` for every other type. `queueFor(type)` decides, when the job's outbox row is written,
+and the row records it, so a delivery goes where its row says whatever a later deploy routes the
+type to. A row naming a queue the running deploy does not know stays unpublished, holding nothing
+else back.
 
 > **Corrected 2026-10-16:** originally specified as `relay:jobs`. BullMQ v6 rejects a queue name
 > containing `:`, which it reserves as its Redis key separator (`Error: Queue name cannot
@@ -1086,8 +1092,9 @@ One queue, `relay-jobs`, with the BullMQ **job name** set to the `Job.type`.
 
 > **DECISION — D6a · One queue or one per type?**
 >
-> **Status: DEFERRED — phase 10.** Trigger: the load test shows one job type starving another.
-> Undecidable before that measurement. One queue for v1.
+> **Status: RESOLVED for `ai.enrich` (PD, 2026-11-19); open for the rest — phase 10.** A provider's
+> rate limit forced the split before any starvation was measured: a BullMQ limiter is per queue.
+> Every other type stays on `relay-jobs` until the load test shows one starving another.
 >
 > - **(a) One queue, job name = type.** Simplest. One slow type starves the others — worker
 >   concurrency is shared across all types.
@@ -1099,7 +1106,8 @@ One queue, `relay-jobs`, with the BullMQ **job name** set to the `Job.type`.
 > **Recommendation:** (a) for v1. With two mock job types there is nothing to isolate, and the
 > trigger for splitting is measurable (§16). Do not pre-build isolation you cannot observe.
 >
-> **Resolution:** open — see Status above.
+> **Resolution:** (b) for `ai.enrich` alone, `relay-ai` with a limiter of its own (A29); (a) for
+> the rest until phase 10's measurement.
 
 ### 8.2 Job options
 
@@ -1135,18 +1143,28 @@ rides along so the worker's logs join the submitting request's logs (§12.1).
 
 | Setting | v1 value |
 |---|---|
-| Concurrency | `5` per worker process (`WORKER_CONCURRENCY`) |
+| Concurrency | `relay-jobs`: `5` per worker process (`WORKER_CONCURRENCY`); `relay-ai`: `2` (`AI_WORKER_CONCURRENCY`) |
+| Rate limit | `relay-ai` only: `AI_QUEUE_LIMIT_MAX` jobs start per `AI_QUEUE_LIMIT_DURATION_MS`, 20 a minute by default. Kept in Redis for the whole queue, so more workers do not raise it |
 | Instances | 1 in dev; ≥2 in the load test, to prove no double-processing |
-| Registration | `BullModule.registerQueue({ name: 'relay-jobs' })` **+** a `WorkerHost` class — in the worker root only |
+| Registration | `BullModule.registerQueue` for both queues **+** a `WorkerHost` class per queue — in the worker root only |
 
 Processor shape is BullMQ v6 / `@nestjs/bullmq` v12:
 
 ```ts
-@Processor('relay-jobs')
-export class JobsProcessor extends WorkerHost {
-  async process(job: Job<JobMessage>): Promise<unknown> { /* … */ }
+abstract class QueueProcessor extends WorkerHost {
+  async process(job: Job<JobMessage>): Promise<unknown> { /* … the same for every queue */ }
 }
+
+@Processor(JOBS_QUEUE, { concurrency })
+export class JobsProcessor extends QueueProcessor {}
+
+@Processor(AI_QUEUE, { concurrency, limiter: { max, duration } })
+export class AiJobsProcessor extends QueueProcessor {}
 ```
+
+A processor's options are read as its module loads, before `ConfigModule` has read `.env`, so the
+worker's entry point loads `.env` first (`load-env.ts`); a variable already in the environment
+wins. Each is parsed by the env schema, so it has the default and bounds the schema gives it.
 
 Not the `@Process()`-decorated-method style — that is the legacy `@nestjs/bull` API and does
 not apply here.
@@ -1356,7 +1374,7 @@ AppModule  (bootstrap: NestFactory.create)
 ├── JobsModule              → JobsController, JobsService, OutboxRelayService
 │    ├── imports JobCoreModule, StorageModule
 │    ├── imports ScheduleModule.forRoot()                            // the relay's tick
-│    └── imports BullModule.registerQueue({ name: 'relay-jobs' })   // PRODUCER ONLY
+│    └── imports BullModule.registerQueue relay-jobs, relay-ai       // PRODUCER ONLY
 ├── EventsModule            → EventsGateway (+ the bridge subscriber, D8)
 ├── HealthModule            → Terminus: Postgres + Redis
 ├── UploadsModule           → UploadsController, UploadsService (signs upload slips)
@@ -1365,8 +1383,10 @@ AppModule  (bootstrap: NestFactory.create)
 WorkerModule  (bootstrap: NestFactory.createApplicationContext)
 ├── ConfigModule / LoggerModule / PrismaModule   (same modules, worker env schema)
 ├── JobCoreModule
-├── BullModule.registerQueue({ name: 'relay-jobs' })                 // CONSUMER
-├── JobsProcessor           (WorkerHost)
+├── BullModule.registerQueue relay-jobs, relay-ai                    // CONSUMER
+├── JobsProcessor           (WorkerHost, relay-jobs)
+├── AiJobsProcessor         (WorkerHost, relay-ai: a limiter and low concurrency, §8.4)
+├── JobQueues               (both queues by name, for whatever reads an entry: §8.1)
 ├── StrandedJobSweeper      (finishes jobs the queue stopped delivering, §7.6)
 └── ImageFolderSweeper      (deletes image folders no product uses, §6.3c)
 
@@ -1449,6 +1469,9 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `ACCESS_TOKEN_TTL` | duration | ✓ | — | Default `15m` |
 | `REFRESH_TOKEN_TTL` | duration | ✓ | — | Default `30d` |
 | `WORKER_CONCURRENCY` | int | — | ✓ | Default 5 |
+| `AI_WORKER_CONCURRENCY` | int 1–20 | — | ✓ | Default 2. `relay-ai` jobs at once per worker (§8.4) |
+| `AI_QUEUE_LIMIT_MAX` | int ≥1 | — | ✓ | Default 20. `relay-ai` jobs that may start per window, across every worker |
+| `AI_QUEUE_LIMIT_DURATION_MS` | int ≥100 | — | ✓ | Default 60000. The window |
 | `RELAY_SWEEP_INTERVAL_MS` | int ≥1000 | — | ✓ | Default 60000. The stranded-job sweep (§7.6) |
 | `RELAY_FAULT_AFTER_COMMIT` | bool | ✓ | — | Tests only (A6). Default `false` |
 | `RELAY_FAULT_SKIP_ABANDON` | bool | — | ✓ | Tests only (A5d). Default `false` |
@@ -1508,7 +1531,7 @@ never the API's — and serves nothing when it is unset. Every series carries `r
 | Metric | From | What it is |
 |---|---|---|
 | `relay_job_attempt_duration_seconds{type, outcome}` | worker | A histogram of every claimed attempt, from its claim to its outcome. `outcome` is `succeeded`, `retrying`, `dead_lettered`, `cancelled`, `handed_back` (stopped for a shutdown, uncounted), `superseded` (another attempt had taken the job over) or `unrecorded` (the outcome could not be written; the queue delivers the job again) |
-| `relay_queue_depth{state}` | API | Unfinished jobs by where they wait: `outbox` (committed, not yet queued), `waiting`, `prioritized`, `delayed`, `active`. Read when scraped |
+| `relay_queue_depth{queue,state}` | API | Unfinished jobs by queue and where they wait: `outbox` (committed, not yet queued), `waiting`, `prioritized`, `delayed`, `active`. Read when scraped |
 | `relay_dead_letters{type}` | API | Dead-lettered jobs nobody has re-driven, every type listed. Read when scraped |
 | `relay_http_request_duration_seconds{method, route, status}` | API | A histogram of every response, from the first middleware. `route` is the matched pattern (`/jobs/:id`), or `unmatched` for a `404` or a body the parser refused |
 
@@ -1692,6 +1715,7 @@ cases.
 | **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
 | **A27** | **The backlog can be watched.** Submit 20 jobs with no worker running, then start one | Scraped from the API's own metrics port, `relay_queue_depth` rises by 20 and falls back to where it began; the worker's `relay_job_attempt_duration_seconds_count{outcome="succeeded"}` reaches 20. A job dead-lettered after it raises `relay_dead_letters` and counts as `dead_lettered` on the worker | 8 |
 | **A28** | **A job's story is found by one id.** Under a chosen `X-Request-Id`, submit a job that fails twice, then re-drive it under another; and one that succeeds. Both processes log JSON, as in production | Under the submit's id: the API's lines for the submit, and every worker line of both attempts, the handler's included, each naming the job, its type and its attempt, ending in the dead letter. No line about the job is without it. The re-drive's runs are under the re-drive's id, none under the submit's. A succeeded job's lines end in one saying so | 8 |
+| **A29** | **A provider's rate limit slows only its own jobs.** The AI queue limited to 1 job a second; 4 `ai.enrich` jobs, then 3 `MOCK` jobs, queued before the worker starts | Every job `SUCCEEDED`, and every `ai.enrich` outbox row names `relay-ai`. The `ai.enrich` jobs started at least a window apart; every `MOCK` job finished before the second `ai.enrich` job started | PD |
 
 **A6 is written to fail against the phase-5 design.** The commit-then-enqueue gap is a knowingly
 accepted risk; A6 quantifies it rather than leaving it undocumented.
@@ -2044,7 +2068,7 @@ to settle it.
 | D7 | ~~Claim guard; crash reconciliation; authoritative attempt counter~~ | — | **DECIDED (phase 6)** — claim `QUEUED`/`RUNNING`; BullMQ redelivery reconciles; `Job.attempts` is authoritative. §7.6 |
 | D6b | ~~What a dead letter physically is~~ | — | **DECIDED (phase 6)** — `DEAD_LETTERED` + `error` on the `Job` row. §4.6 |
 | D8 | ~~Who emits the WS event; how it crosses the process boundary~~ | — | **DECIDED 2026-10-26** — the worker `PUBLISH`es a domain event to `relay:job-updated`; the API subscribes on a duplicated connection and fans out to `user:<userId>`. §9.3 |
-| D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
+| D6a | One queue, or one per job type | The load test shows one job type starving another | 10 — **decided for `ai.enrich`** (PD): `relay-ai`, forced by the provider's rate limit. §8.1 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
 | D10 | ~~Worker concurrency tuning; sandboxed processors~~ | Measured event-loop blocking in the worker | **DECIDED 2026-11-09** — concurrency 5, renders in-process; image work leaves the event loop alone, measured below. Re-measured on the target host in phase 10 |
 | D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox. Inspection **built 2026-11-18**: `GET /jobs/dead-letters` |
@@ -2408,6 +2432,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-19 | §4.5, §6.3d, §8.1, §8.4, §10.1, §11, §12, §14, §16 — `relay-ai`, D.2; D6a decided for `ai.enrich`. A job's queue is chosen by its type when its outbox row is written, and recorded there: the direct path, the relay, the sweep, cancel and the stall log all read the entry from that queue. The worker runs a processor per queue — the logic shared, the options apart — and `relay-ai`'s has a limiter, 20 jobs a minute across every worker, and 2 at once per worker. `relay_queue_depth` gains a `queue` label. The worker loads `.env` before its modules, so a processor option set there — `WORKER_CONCURRENCY` included, which `.env` could not set before — takes effect. A29 registered and automated. |
 | 2026-11-19 | §4.7, §6.2, §6.3d, §14 — `ai.enrich` built, D.3. `Product` gains `enrichmentStatus`, `enrichmentInputHash`, `enrichmentError`, `category` — a Postgres enum, so nothing outside the list can be stored — and `tags`, with `CHECK`s that only a `READY` product has an answer. One request per batch; each item of the reply is checked on its own, and the products without a usable answer get one corrective request, then `FAILED` with the reason. Recorded only while the product has the text the model was given. `GET /products` shows each product's `enrichment`. Built before D.2: the queue split needs the job to carry. A19 automated. |
 | 2026-11-19 | §6.3d — `ai.enrich` specified, and D.1 built. A batch of up to 20 skus gets a category from a fixed list of 12 and up to 5 tags in one request; the reply is checked item by item, with one corrective request, and what is still wrong fails its product, not the job. A 429 pauses a queue of the job's own; an unchanged product is skipped by the hash of its input; each job records its tokens and cost. `LlmProvider` is the interface, and `FakeLlmProvider` the one implementation: deterministic, and failing on demand when a product's name holds a directive. A real provider is left open. |
 | 2026-11-19 | §13.4, D32 — the AWS budget alarm is set: email alerts at $5 a month, on the account that holds the bucket. The last of 8.3, and of phase 8. |

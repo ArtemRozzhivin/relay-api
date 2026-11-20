@@ -1,7 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
-import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
 import {
   ErrorReportNotFoundError,
@@ -17,12 +15,12 @@ import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
 import { Prisma, type Job } from '../generated/prisma/client.js';
 import {
-  JOBS_QUEUE,
   jobOptions,
   messageId,
-  type JobMessage,
+  queueFor,
   type OutboxMessage,
 } from './job-queue.js';
+import { JobQueues } from './job-queues.js';
 import type {
   BulkRedriveInput,
   DeadLetterFilter,
@@ -51,7 +49,7 @@ const REPORT_LINK_SECONDS = 300;
 // however a job reached the queue.
 const outboxEntry = (job: Job, correlationId: string) => ({
   jobId: job.id,
-  queue: JOBS_QUEUE,
+  queue: queueFor(job.type),
   jobName: job.type,
   payload: {
     jobId: job.id,
@@ -106,7 +104,7 @@ export class JobsService {
     private readonly events: JobEventsPublisher,
     private readonly config: ConfigService<ApiEnv, true>,
     private readonly storage: StorageService,
-    @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
+    private readonly queues: JobQueues,
   ) {}
 
   /**
@@ -231,11 +229,13 @@ export class JobsService {
   // tick. Should anything here fail, the outbox row stays unpublished and the
   // relay delivers it instead.
   private async publishNow(job: Job, outboxId: bigint, correlationId: string) {
-    await this.queue.add(
-      job.type,
-      { jobId: job.id, correlationId },
-      jobOptions(job.id, outboxId, job.maxAttempts),
-    );
+    await this.queues
+      .named(queueFor(job.type))
+      .add(
+        job.type,
+        { jobId: job.id, correlationId },
+        jobOptions(job.id, outboxId, job.maxAttempts),
+      );
 
     this.logger.log(`Enqueued job ${job.id} (${job.type})`);
 
@@ -450,7 +450,7 @@ export class JobsService {
     const outbox = await this.prisma.outbox.findFirst({
       where: { jobId },
       orderBy: { id: 'desc' },
-      select: { id: true },
+      select: { id: true, queue: true },
     });
 
     if (!outbox) {
@@ -458,7 +458,7 @@ export class JobsService {
     }
 
     try {
-      await this.queue.remove(messageId(jobId, outbox.id));
+      await this.queues.named(outbox.queue).remove(messageId(jobId, outbox.id));
     } catch (error) {
       this.logger.warn(
         `Could not remove cancelled job ${jobId} from the queue: ${describeError(error)}`,

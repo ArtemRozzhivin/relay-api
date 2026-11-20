@@ -805,8 +805,10 @@ of failing jobs.
   _The fake is not a stand-in for the real one; it is the only way to test the failure paths the
   real one produces rarely and expensively._
   ```
-- [ ] **D.2 · A separate** `relay-ai` **queue with a** `limiter` **(resolves D6a)** and low
-  concurrency.
+- [x] **D.2 · A separate** `relay-ai` **queue with a** `limiter` **(resolves D6a)** and low
+  concurrency. The outbox row records each job's queue, and everything that reads an entry reads
+  it there; one processor class per queue, sharing the logic. A29 proves the limit slows only
+  `ai.enrich`.
   ```
   _A BullMQ limiter is per-queue, so the rate limit itself forces the split — not a starvation
   measurement, which is what D6a was waiting for._

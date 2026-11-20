@@ -1,6 +1,6 @@
 import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
-import { UnrecoverableError, type Job as QueueJob, type Queue } from 'bullmq';
+import { UnrecoverableError, type Job as QueueJob, type Worker } from 'bullmq';
 import { type Histogram, Registry } from '@prometheus-io/client';
 import type { PinoLogger, RunInContextOptions } from 'nestjs-pino';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,7 +12,8 @@ import type { Job, Prisma } from '../generated/prisma/client.js';
 import type { JobContextFactory } from '../jobs/job-context.factory.js';
 import type { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import type { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
-import type { JobMessage } from '../jobs/job-queue.js';
+import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
+import type { JobQueues } from '../jobs/job-queues.js';
 import type { JobTransitionService } from '../jobs/job-transition.service.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 import { JobCancelledError } from '../jobs/job-handler.js';
@@ -103,8 +104,17 @@ const processorFor = ({
       assign: (fields: Record<string, unknown>) =>
         Object.assign(logContexts.at(-1)!, fields),
     } as unknown as PinoLogger,
-    { getJob: async () => message } as unknown as Queue,
+    {
+      named: (name: string) =>
+        name === JOBS_QUEUE ? { getJob: async () => message } : undefined,
+    } as unknown as JobQueues,
   );
+
+  // The worker @nestjs/bullmq attaches at start-up, as much of it as the
+  // processor reads.
+  vi.spyOn(processor, 'worker', 'get').mockReturnValue({
+    name: JOBS_QUEUE,
+  } as Worker);
 
   return { processor, errors, contexts, logContexts, registry };
 };
