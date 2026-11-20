@@ -829,17 +829,20 @@ of failing jobs.
   ```
   _Backpressure, not failure: the job has not failed, the provider is busy._
   ```
-- [ ] **D.5 ·** `enrichmentInputHash` **skip** + conditional update on write.
+- [x] **D.5 ·** `enrichmentInputHash` **skip** + conditional update on write. A `FAILED` product
+  is asked again. The first reply's answers are recorded before the corrective request, so a 429
+  on it costs only the rest. A21 counts the model requests in the worker's log.
   ```
   _Re-running must cost nothing for unchanged products, and must never overwrite newer data._
   ```
-- [ ] **D.6 · Track** `tokensIn`, `tokensOut`, `estimatedCostUsd` per job.
+- [ ] **D.6 · Track** `tokensIn`, `tokensOut`, `estimatedCostUsd` per job, and add A21's cost
+  check.
 
 ### Done when
 
 - [x] **A19 passes** — malformed or out-of-schema output never reaches the database
 - [x] **A20 passes** — simulated 429s slow the queue; no job fails because of one
-- [ ] **A21 passes** — re-running enrichment on unchanged products issues zero provider calls
+- [x] **A21 passes** — re-running enrichment on unchanged products issues zero provider calls
 
 ---
 

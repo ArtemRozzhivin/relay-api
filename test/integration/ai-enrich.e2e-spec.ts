@@ -16,7 +16,9 @@ import { ProductsService } from '../../src/products/products.service.js';
 import { EnrichmentModule } from '../../src/enrichment/enrichment.module.js';
 import {
   LLM_PROVIDER,
+  LlmRateLimitError,
   type LlmProvider,
+  type LlmRequest,
 } from '../../src/enrichment/llm-provider.js';
 import { CATEGORIES } from '../../src/enrichment/taxonomy.js';
 import { AiEnrichJobHandler } from '../../src/jobs/handlers/ai-enrich.handler.js';
@@ -114,6 +116,7 @@ describe('the ai.enrich handler', () => {
       enriched: 2,
       failed: 0,
       superseded: 0,
+      alreadyReady: 0,
       notFound: ['GONE'],
     });
     expect(enrich).toHaveBeenCalledOnce();
@@ -252,6 +255,90 @@ describe('the ai.enrich handler', () => {
     await expect(run(userId, ['DESK', 'CHAIR'])).resolves.toMatchObject({
       enriched: 2,
     });
+  });
+
+  // A21's handler half. The skus each request named, in order.
+  const asked = (enrich: { mock: { calls: [LlmRequest][] } }) =>
+    enrich.mock.calls.map(([request]) =>
+      request.products.map(({ sku }) => sku),
+    );
+
+  it('asks nothing about a product already enriched from the text it has', async () => {
+    const userId = await store(['MUG', 'Mug'], ['CUP', 'Cup']);
+
+    await run(userId, ['MUG', 'CUP']);
+
+    const before = await stored(userId);
+    const enrich = vi.spyOn(llm, 'enrich');
+
+    expect(await run(userId, ['MUG', 'CUP'])).toMatchObject({
+      enriched: 0,
+      alreadyReady: 2,
+    });
+    expect(enrich).not.toHaveBeenCalled();
+    expect(await stored(userId)).toEqual(before);
+  });
+
+  it('asks again about a product whose text changed since, and only it', async () => {
+    const userId = await store(['MUG', 'Mug'], ['CUP', 'Cup']);
+
+    await run(userId, ['MUG', 'CUP']);
+    await prisma.product.updateMany({
+      where: { userId, sku: 'CUP' },
+      data: { description: 'Now with a saucer' },
+    });
+
+    const enrich = vi.spyOn(llm, 'enrich');
+
+    expect(await run(userId, ['MUG', 'CUP'])).toMatchObject({
+      enriched: 1,
+      alreadyReady: 1,
+    });
+    expect(asked(enrich)).toEqual([['CUP']]);
+  });
+
+  it('asks again about a product that failed, from the same text', async () => {
+    const userId = await store(['LAMP', 'Lamp [llm:malformed]']);
+
+    await run(userId, ['LAMP']);
+
+    const enrich = vi.spyOn(llm, 'enrich');
+
+    expect(await run(userId, ['LAMP'])).toMatchObject({
+      failed: 1,
+      alreadyReady: 0,
+    });
+    expect(asked(enrich)).toEqual([['LAMP'], ['LAMP']]);
+  });
+
+  // The corrective request is the one most likely to meet a 429, being the
+  // second in a row; what the first answered is not paid for twice.
+  it('keeps what the first reply answered when the corrective request finds the model busy', async () => {
+    const userId = await store(
+      ['MUG', 'Mug'],
+      ['GADGET', 'Gadget [llm:off-taxonomy]'],
+    );
+    const real = llm.enrich.bind(llm);
+    const enrich = vi
+      .spyOn(llm, 'enrich')
+      .mockImplementationOnce(real)
+      .mockRejectedValueOnce(new LlmRateLimitError(1000));
+
+    await expect(run(userId, ['MUG', 'GADGET'])).rejects.toBeInstanceOf(
+      JobRateLimitedError,
+    );
+    expect(await stored(userId)).toMatchObject({
+      MUG: { status: 'READY' },
+      GADGET: { status: null },
+    });
+
+    enrich.mockClear();
+
+    expect(await run(userId, ['MUG', 'GADGET'])).toMatchObject({
+      failed: 1,
+      alreadyReady: 1,
+    });
+    expect(asked(enrich)).toEqual([['GADGET'], ['GADGET']]);
   });
 
   it('clears an earlier category when a later run fails', async () => {

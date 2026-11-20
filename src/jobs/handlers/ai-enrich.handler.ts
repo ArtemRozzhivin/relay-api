@@ -8,12 +8,15 @@ import {
   LlmRateLimitError,
   type EnrichmentInput,
   type LlmProvider,
-  type LlmRequest,
 } from '../../enrichment/llm-provider.js';
 import {
   checkReply,
   type CheckedReply,
+  type Enrichment,
 } from '../../enrichment/enrichment-reply.js';
+import { hashEnrichmentInput } from '../../enrichment/enrichment-input.js';
+
+type Target = Awaited<ReturnType<ProductsService['forEnrichment']>>[number];
 
 const correctionFor = (problems: Map<string, string>) =>
   [...problems].map(([sku, problem]) => `${sku}: ${problem}`).join('\n');
@@ -37,35 +40,46 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
   ) {
     const requested = [...new Set(skus)];
     const found = await this.products.forEnrichment(context.userId, requested);
-    const { answers, problems } = await this.ask(
-      // Only what the model needs: an id or an owner in the request would be
-      // sent to the provider for nothing.
-      found.map(({ sku, name, description }) => ({ sku, name, description })),
+
+    // READY for the text it has now: asking again would pay for an answer it
+    // already holds, which is what makes a re-run of an unchanged catalog
+    // free (A21). A FAILED one is asked again: a model answers differently
+    // from one request to the next, and naming the sku again is how its owner
+    // asks.
+    const todo = found.filter(
+      (product) =>
+        !(
+          product.enrichmentStatus === 'READY' &&
+          product.enrichmentInputHash === hashEnrichmentInput(product)
+        ),
     );
 
     let enriched = 0;
     let failed = 0;
     let superseded = 0;
 
-    for (const product of found) {
-      const answer = answers.get(product.sku);
+    const record = async (
+      product: Target,
+      outcome: { answer: Enrichment } | { problem: string },
+    ) => {
       // Recorded only while the product still has the text the model was
       // given; an import that changed it meanwhile wins.
-      const recorded = answer
-        ? await this.products.recordEnrichmentReady(
-            context.userId,
-            product,
-            answer,
-          )
-        : await this.products.recordEnrichmentFailed(
-            context.userId,
-            product,
-            problems.get(product.sku)!,
-          );
+      const recorded =
+        'answer' in outcome
+          ? await this.products.recordEnrichmentReady(
+              context.userId,
+              product,
+              outcome.answer,
+            )
+          : await this.products.recordEnrichmentFailed(
+              context.userId,
+              product,
+              outcome.problem,
+            );
 
       if (!recorded) {
         superseded += 1;
-      } else if (answer) {
+      } else if ('answer' in outcome) {
         enriched += 1;
       } else {
         failed += 1;
@@ -73,8 +87,36 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
 
       void context.reportProgress({
         processed: enriched + failed + superseded,
-        total: found.length,
+        total: todo.length,
       });
+    };
+
+    const first = await this.ask(context, todo);
+
+    // Before the corrective request, not after it: a 429 on that request runs
+    // the job again, and the run after it skips what is recorded here.
+    for (const product of todo) {
+      const answer = first.answers.get(product.sku);
+
+      if (answer) {
+        await record(product, { answer });
+      }
+    }
+
+    const again = todo.filter(({ sku }) => first.problems.has(sku));
+    const second = await this.ask(
+      context,
+      again,
+      correctionFor(first.problems),
+    );
+
+    for (const product of again) {
+      const answer = second.answers.get(product.sku);
+
+      await record(
+        product,
+        answer ? { answer } : { problem: second.problems.get(product.sku)! },
+      );
     }
 
     const foundSkus = new Set(found.map(({ sku }) => sku));
@@ -84,53 +126,52 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
       enriched,
       failed,
       superseded,
+      alreadyReady: found.length - todo.length,
       notFound: requested.filter((sku) => !foundSkus.has(sku)),
     };
   }
 
   /**
-   * Asks the model about `products`, then once more about those its reply
-   * gave no usable answer for, saying what was wrong (§6.3d).
+   * Asks the model about `products`, and checks its reply (§6.3d). With
+   * `correction`, it is the one corrective request a batch gets, saying what
+   * was wrong with the reply before. Asks nothing about no products.
    *
    * @throws JobRateLimitedError when the provider is busy, or anything else
    * the provider throws, which fails the attempt.
    */
-  private async ask(products: EnrichmentInput[]): Promise<CheckedReply> {
+  private async ask(
+    context: JobContext,
+    products: Target[],
+    correction?: string,
+  ): Promise<CheckedReply> {
     if (products.length === 0) {
       return { answers: new Map(), problems: new Map() };
     }
 
-    const first = checkReply(
-      (await this.request({ products })).text,
-      products.map(({ sku }) => sku),
+    context.log(
+      correction === undefined
+        ? `asking the model about ${products.length} product(s)`
+        : `asking the model again about ${products.length} product(s), saying what was wrong`,
     );
 
-    if (first.problems.size === 0) {
-      return first;
-    }
-
-    const again = products.filter(({ sku }) => first.problems.has(sku));
-    const second = checkReply(
-      (
-        await this.request({
-          products: again,
-          correction: correctionFor(first.problems),
-        })
-      ).text,
-      again.map(({ sku }) => sku),
+    // Only what the model needs: an id or an owner in the request would be
+    // sent to the provider for nothing.
+    const sent: EnrichmentInput[] = products.map(
+      ({ sku, name, description }) => ({ sku, name, description }),
     );
 
-    return {
-      answers: new Map([...first.answers, ...second.answers]),
-      problems: second.problems,
-    };
-  }
-
-  // A busy model pauses the queue rather than failing the attempt (§6.3d).
-  private async request(request: LlmRequest) {
     try {
-      return await this.llm.enrich(request);
+      const { text } = await this.llm.enrich({
+        products: sent,
+        ...(correction === undefined ? {} : { correction }),
+      });
+
+      return checkReply(
+        text,
+        products.map(({ sku }) => sku),
+      );
     } catch (error) {
+      // A busy model pauses the queue rather than failing the attempt.
       throw error instanceof LlmRateLimitError
         ? new JobRateLimitedError(error.retryAfterMs)
         : error;

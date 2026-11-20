@@ -695,17 +695,20 @@ the same busy provider — hands the attempt back, and puts the entry back at th
 A wait under a second is taken as a second. The pause lives in the limiter's own key, so it also
 ends the window that was running: after it, the count starts again. Only a queue with a limiter can
 be paused, so on `relay-jobs` the same error is an ordinary failure. A 429 on the corrective
-request runs the whole batch again, the first request included. These jobs run on a queue of their own, `relay-ai`,
-with a limiter and a low concurrency: a BullMQ limiter applies to a whole queue, so on `relay-jobs`
+request runs the job again, which asks only about what the first reply left without an answer:
+what it did answer was recorded before the corrective request. These jobs run on a queue of their
+own, `relay-ai`, with a limiter and a low concurrency: a BullMQ limiter applies to a whole queue, so on `relay-jobs`
 it would slow imports and images too (D6a). By default 20 jobs may start a minute, across every
 worker — at most two requests each, under a provider's usual 50 a minute — and 2 run at once in
 each worker (§8.4). _Built in D.2 and D.4._
 
 **An unchanged product costs nothing** (A21). A product records `enrichmentInputHash`, the hash of
 what it was enriched from — name, description and the version of the instructions — and one whose
-hash matches and whose status is `READY` is skipped without a request. The write is conditional on
-the row still holding the name and description that were sent, so an import that changed them
-meanwhile wins. _The conditional write is built in D.3, the skip in D.5._
+hash matches and whose status is `READY` is skipped without a request, and counted as
+`alreadyReady`. A `FAILED` one is asked again: a model answers differently from one request to the
+next, and naming the sku again is how its owner asks. The write is conditional on the row still
+holding the name and description that were sent, so an import that changed them meanwhile wins.
+The worker logs a line for each request to the model, under the job's id. _Built in D.3 and D.5._
 
 **Each job records its cost:** `tokensIn`, `tokensOut` and `estimatedCostUsd`, over all its
 requests, corrective ones included. _Built in D.6._
@@ -735,7 +738,7 @@ has now — never enriched, or changed since — then `{ "status": "READY", "cat
 
 ```jsonc
 // result
-{ "requested": 3, "enriched": 1, "failed": 1, "superseded": 0, "notFound": ["X-9"] }
+{ "requested": 4, "enriched": 1, "failed": 1, "superseded": 0, "alreadyReady": 1, "notFound": ["X-9"] }
 ```
 
 ### 6.4 Validation
@@ -1713,7 +1716,7 @@ cases.
 | **A18** | **Image batches do not self-stall.** Five batches of 20 of the heaviest image the limits allow, at the worker's concurrency of 5, timed by a probe inside the real worker | Zero `stalled` events and every product `READY`; event-loop delay and Redis round trip under 1 s, against the 15 s a renewal may be late. A single 40 s main-thread freeze fails it with 5 stalls (D10) | PC |
 | **A19** | **LLM output is untrusted input.** The fake model answers one batch with a category outside the list, and another with cut-off JSON, the corrective request included | Both jobs `SUCCEEDED` on attempt 1. Nothing is written for those products: `enrichmentStatus = 'FAILED'` with the reason, no category, no tags, and the reason shown in `GET /products`; the other product in the batch is `READY`. No `category` in the table is outside the list | PD |
 | **A20** | **Rate limits slow the queue, not the jobs.** 4 `ai.enrich` jobs of one attempt each, queued before a worker running one at a time; the fake model answers the first with a 429 and a `Retry-After` of 1 s | Every job `SUCCEEDED` at `attempts = 1`, every product `READY`. No job started within the second after the 429, and every one within 3 s of it: the queue waited as long as the provider asked, not a limiter window. The busy job ran again first | PD |
-| **A21** | **Re-enrichment of unchanged products is free.** Run enrichment twice | Provider call count on the second run **= 0**; `estimatedCostUsd` unchanged | PD |
+| **A21** | **Re-enrichment of unchanged products is free.** Enrich 3 products, enrich them again, then once more after one product's description changed | Every job `SUCCEEDED`. The worker's log holds one request to the model for the first job, **none** for the second, with `alreadyReady = 3`, and one about 1 product for the third. `estimatedCostUsd` unchanged: checked once D.6 records it | PD |
 | **A22** | **A failed child does not fail the pipeline.** Force one enrichment batch to fail | `Pipeline.status = 'completed_with_errors'`; sibling batches completed; the failed batch is re-drivable; no `Job` row carries `completed_with_errors` | PE |
 | **A23** | **The fan-out is idempotent.** Replay the fan-out for a pipeline | One `Job` row per `(stage, batch)`; the duplicate attempt is refused by `UNIQUE (userId, idempotencyKey)` | PE |
 | **A24** | **The parent cannot be lost.** Crash between the last child committing and the parent being enqueued | The relay publishes the parent's outbox row; the pipeline finalizes exactly once | PE |
@@ -2438,6 +2441,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-20 | §6.3d, §14 — an unchanged product is skipped, D.5. A product `READY` for the hash of its current text is not sent to the model, and the result counts it as `alreadyReady`; a `FAILED` one is asked again. What the first reply answered is recorded before the corrective request, so a 429 on that request costs only the rest on the next run. A line in the worker's log for every request to the model. A21 automated; its cost check waits for D.6. The assertion harness clears each queue's limiter window as a file starts: one left by an earlier file's AI jobs held A29's worker back for the rest of a minute. |
 | 2026-11-20 | §5.2, §6.3d, §12, §14 — a provider's 429, D.4. The handler turns it into `JobRateLimitedError`; the processor pauses the job's queue in Redis for the `Retry-After`, at least a second, and hands the attempt back uncounted, the job at the head of the queue — on the last attempt too. Only a queue with a limiter can be paused; elsewhere the error is an ordinary failure. `queue.rateLimit`, since `worker.rateLimit` is deprecated. Attempts gain the outcome `rate_limited`. A20 automated. |
 | 2026-11-19 | §4.5, §6.3d, §8.1, §8.4, §10.1, §11, §12, §14, §16 — `relay-ai`, D.2; D6a decided for `ai.enrich`. A job's queue is chosen by its type when its outbox row is written, and recorded there: the direct path, the relay, the sweep, cancel and the stall log all read the entry from that queue. The worker runs a processor per queue — the logic shared, the options apart — and `relay-ai`'s has a limiter, 20 jobs a minute across every worker, and 2 at once per worker. `relay_queue_depth` gains a `queue` label. The worker loads `.env` before its modules, so a processor option set there — `WORKER_CONCURRENCY` included, which `.env` could not set before — takes effect. A29 registered and automated. |
 | 2026-11-19 | §4.7, §6.2, §6.3d, §14 — `ai.enrich` built, D.3. `Product` gains `enrichmentStatus`, `enrichmentInputHash`, `enrichmentError`, `category` — a Postgres enum, so nothing outside the list can be stored — and `tags`, with `CHECK`s that only a `READY` product has an answer. One request per batch; each item of the reply is checked on its own, and the products without a usable answer get one corrective request, then `FAILED` with the reason. Recorded only while the product has the text the model was given. `GET /products` shows each product's `enrichment`. Built before D.2: the queue split needs the job to carry. A19 automated. |

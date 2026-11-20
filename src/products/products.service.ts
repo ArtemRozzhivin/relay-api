@@ -121,13 +121,21 @@ export class ProductsService {
   }
 
   /**
-   * The caller's products among `skus`, with the text ai.enrich sends. A sku
-   * the caller has no product for is simply absent.
+   * The caller's products among `skus`, with the text ai.enrich sends and what
+   * their last enrichment was made from. A sku the caller has no product for
+   * is simply absent.
    */
   forEnrichment(userId: string, skus: string[]) {
     return this.prisma.product.findMany({
       where: { userId, sku: { in: skus } },
-      select: { id: true, sku: true, name: true, description: true },
+      select: {
+        id: true,
+        sku: true,
+        name: true,
+        description: true,
+        enrichmentStatus: true,
+        enrichmentInputHash: true,
+      },
       orderBy: { sku: 'asc' },
     });
   }

@@ -11,7 +11,7 @@ import type {
   JobStatus,
   Prisma,
 } from '../../src/generated/prisma/client.js';
-import { JOBS_QUEUE, messageId } from '../../src/jobs/job-queue.js';
+import { JOBS_QUEUE, QUEUES, messageId } from '../../src/jobs/job-queue.js';
 import { postUploadForm } from '../support/upload-form.js';
 
 const QUEUE_PREFIX = 'bull:relay-jobs';
@@ -171,6 +171,11 @@ export class RelayHarness {
     const harness = new RelayHarness(await freePort());
 
     await harness.prisma.$connect();
+    // A limiter's window is kept in Redis for the whole queue and outlives the
+    // workers that opened it, so a file whose worker ran AI jobs would hand
+    // the next file a window already partly spent: A29's limit of one a second
+    // then waits out the rest of a minute. Each file starts with none.
+    await harness.redis.del(QUEUES.map((queue) => `bull:${queue}:limiter`));
 
     return harness;
   }
