@@ -248,9 +248,10 @@ export class JobTransitionService {
     );
   }
 
-  // The worker is shutting down, not failing: the attempt stopped at a safe
-  // point, so it is handed back rather than counted against the budget, and
-  // the next worker resumes the job from what it committed.
+  // The attempt stopped for a reason that is not the job's: the worker is
+  // shutting down, or a service the job calls is busy. It is handed back
+  // rather than counted against the budget, and the next attempt resumes the
+  // job from what it committed.
   release(jobId: string, lease: number) {
     return this.move(
       jobId,

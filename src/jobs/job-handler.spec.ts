@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { TerminalJobError } from '../common/errors/app-error.js';
-import { JobCancelledError } from './job-handler.js';
+import { JobCancelledError, JobRateLimitedError } from './job-handler.js';
 import { MockJobHandler } from './handlers/mock.handler.js';
 import { recordingContext } from './job-context.fixture.js';
 
@@ -99,5 +99,21 @@ describe('JobHandler', () => {
     await new MockJobHandler().run(context, { durationMs: 0 });
 
     expect(lines).toEqual(['sleeping 0ms over 1 step(s)']);
+  });
+});
+
+describe('JobRateLimitedError', () => {
+  // Redis refuses a pause of 0 or NaN, and anything shorter than a second
+  // would ask the busy service again at once.
+  it.each([
+    [2500, 2500],
+    [1200.4, 1201],
+    [200, 1000],
+    [0, 1000],
+    [-5, 1000],
+    [Number.NaN, 1000],
+    [Number.POSITIVE_INFINITY, 1000],
+  ])('waits %d ms as %d', (asked, waited) => {
+    expect(new JobRateLimitedError(asked).retryAfterMs).toBe(waited);
   });
 });

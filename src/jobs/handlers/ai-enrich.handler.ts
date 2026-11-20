@@ -1,12 +1,14 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { JobHandler } from '../job-handler.js';
+import { JobHandler, JobRateLimitedError } from '../job-handler.js';
 import type { JobContext } from '../job-context.js';
 import { aiEnrichPayloadSchema, type PayloadOf } from '../jobs.schema.js';
 import { ProductsService } from '../../products/products.service.js';
 import {
   LLM_PROVIDER,
+  LlmRateLimitError,
   type EnrichmentInput,
   type LlmProvider,
+  type LlmRequest,
 } from '../../enrichment/llm-provider.js';
 import {
   checkReply,
@@ -90,8 +92,8 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
    * Asks the model about `products`, then once more about those its reply
    * gave no usable answer for, saying what was wrong (§6.3d).
    *
-   * @throws LlmRateLimitError, or anything else the provider throws, which
-   * fails the attempt.
+   * @throws JobRateLimitedError when the provider is busy, or anything else
+   * the provider throws, which fails the attempt.
    */
   private async ask(products: EnrichmentInput[]): Promise<CheckedReply> {
     if (products.length === 0) {
@@ -99,7 +101,7 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
     }
 
     const first = checkReply(
-      (await this.llm.enrich({ products })).text,
+      (await this.request({ products })).text,
       products.map(({ sku }) => sku),
     );
 
@@ -110,7 +112,7 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
     const again = products.filter(({ sku }) => first.problems.has(sku));
     const second = checkReply(
       (
-        await this.llm.enrich({
+        await this.request({
           products: again,
           correction: correctionFor(first.problems),
         })
@@ -122,5 +124,16 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
       answers: new Map([...first.answers, ...second.answers]),
       problems: second.problems,
     };
+  }
+
+  // A busy model pauses the queue rather than failing the attempt (§6.3d).
+  private async request(request: LlmRequest) {
+    try {
+      return await this.llm.enrich(request);
+    } catch (error) {
+      throw error instanceof LlmRateLimitError
+        ? new JobRateLimitedError(error.retryAfterMs)
+        : error;
+    }
   }
 }

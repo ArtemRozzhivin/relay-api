@@ -1,12 +1,17 @@
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
-import { DelayedError, UnrecoverableError, type Job as QueueJob } from 'bullmq';
+import {
+  DelayedError,
+  RateLimitError,
+  UnrecoverableError,
+  type Job as QueueJob,
+} from 'bullmq';
 import { PinoLogger } from 'nestjs-pino';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
 import { JobContextFactory } from '../jobs/job-context.factory.js';
-import { JobCancelledError } from '../jobs/job-handler.js';
+import { JobCancelledError, JobRateLimitedError } from '../jobs/job-handler.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import { AI_QUEUE, JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
 import { JobQueues } from '../jobs/job-queues.js';
@@ -193,6 +198,40 @@ abstract class QueueProcessor extends WorkerHost implements OnModuleDestroy {
         // Returned, not thrown: stopping when asked is the job doing what it
         // was told, so the queue records the delivery as complete rather than
         // failed and schedules nothing.
+        return;
+      }
+
+      // Only a queue with a limiter can be paused: BullMQ reads the pause on
+      // no other, so there the job would be handed straight back and ask the
+      // busy service again at once. On such a queue it is an ordinary failure.
+      if (cause instanceof JobRateLimitedError && this.worker.opts.limiter) {
+        const { retryAfterMs } = cause;
+
+        // The whole queue, not this job alone: every job on it would ask the
+        // same busy service. Kept in Redis, so every worker waits.
+        await this.queues.named(this.worker.name).rateLimit(retryAfterMs);
+
+        const released = await this.transitions.release(jobId, lease);
+
+        if (released) {
+          outcome = 'rate_limited';
+          await this.events.jobUpdated(released);
+          this.logger.warn(
+            `Job ${jobId} found a service busy on attempt ${attempt}; its queue waits ${retryAfterMs} ms, and the attempt is not counted`,
+          );
+
+          // BullMQ puts the entry back at the head of the queue, without
+          // spending one of its attempts or waiting out a backoff.
+          throw new RateLimitError();
+        }
+
+        outcome = 'superseded';
+        this.logger.warn(
+          `Job ${jobId} found a service busy on attempt ${attempt}, which no longer owns it`,
+        );
+
+        // Returned, as for a cancellation: whoever owns the job now has its own
+        // delivery, and this one handed back would claim the job from them.
         return;
       }
 

@@ -821,7 +821,11 @@ of failing jobs.
   _A hallucinated category is indistinguishable from a valid one until something checks. This is
   the lesson of the phase._
   ```
-- [ ] **D.4 · Honour 429s** — `worker.rateLimit(ms)` + `RateLimitError`, using `Retry-After`.
+- [x] **D.4 · Honour 429s** — `queue.rateLimit(ms)` + `RateLimitError`, using `Retry-After`.
+  `worker.rateLimit` is deprecated in BullMQ 6. The handler throws `JobRateLimitedError`; the
+  processor pauses the queue and hands the attempt back uncounted. A20 proves the queue waits as
+  long as the provider asked, and no longer: handed back without its own pause, a job waits out
+  the rest of the limiter's window, up to 30 s.
   ```
   _Backpressure, not failure: the job has not failed, the provider is busy._
   ```
@@ -834,7 +838,7 @@ of failing jobs.
 ### Done when
 
 - [x] **A19 passes** — malformed or out-of-schema output never reaches the database
-- [ ] **A20 passes** — simulated 429s slow the queue; no job fails because of one
+- [x] **A20 passes** — simulated 429s slow the queue; no job fails because of one
 - [ ] **A21 passes** — re-running enrichment on unchanged products issues zero provider calls
 
 ---

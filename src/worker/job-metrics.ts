@@ -10,6 +10,8 @@ export type AttemptOutcome =
   | 'cancelled'
   // Stopped for a shutdown and handed to the next worker, uncounted.
   | 'handed_back'
+  // Refused by a busy service; the queue waits, and the attempt is uncounted.
+  | 'rate_limited'
   // Ended after another attempt had taken the job over; nothing written.
   | 'superseded'
   // Its outcome could not be written; the queue delivers the job again.

@@ -20,6 +20,7 @@ import {
 } from '../../src/enrichment/llm-provider.js';
 import { CATEGORIES } from '../../src/enrichment/taxonomy.js';
 import { AiEnrichJobHandler } from '../../src/jobs/handlers/ai-enrich.handler.js';
+import { JobRateLimitedError } from '../../src/jobs/job-handler.js';
 import { recordingContext } from '../../src/jobs/job-context.fixture.js';
 import {
   createTestModule,
@@ -229,6 +230,28 @@ describe('the ai.enrich handler', () => {
     });
 
     expect((await view(userId)).MUG).toEqual({ status: 'PENDING' });
+  });
+
+  // A20's handler half: the queue's pause comes from this error, and the run
+  // after it has to find nothing half written.
+  it("turns a busy model into the queue's pause, and writes nothing", async () => {
+    const userId = await store(['DESK', 'Desk [llm:busy]'], ['CHAIR', 'Chair']);
+
+    const refused = await run(userId, ['DESK', 'CHAIR']).catch(
+      (error: unknown) => error,
+    );
+
+    expect(refused).toBeInstanceOf(JobRateLimitedError);
+    expect(refused).toMatchObject({ retryAfterMs: 1000 });
+    expect(await stored(userId)).toEqual({
+      CHAIR: { status: null, category: null, tags: [], error: null },
+      DESK: { status: null, category: null, tags: [], error: null },
+    });
+
+    // The fake refuses a product once, as a provider's busy spell passes.
+    await expect(run(userId, ['DESK', 'CHAIR'])).resolves.toMatchObject({
+      enriched: 2,
+    });
   });
 
   it('clears an earlier category when a later run fails', async () => {
