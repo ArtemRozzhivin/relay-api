@@ -9,6 +9,7 @@ import {
   type JobProgress,
 } from './job-progress.js';
 import type { AttemptFailedError, DeadLetterError } from './job-error-codes.js';
+import type { ModelUsage } from './job-context.js';
 
 const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
 
@@ -31,6 +32,8 @@ const REDRIVE_RESET = {
   // reporting its checkpoint, and a restarted one would otherwise show 19 500
   // of 20 000 on a job that has done nothing yet.
   progress: Prisma.DbNull,
+  // Nor is the model usage: what earlier lives spent was spent.
+  //
   // An operator re-driving a job is asking for it to run again, so a
   // cancellation requested during its previous life must not stop it at the
   // first boundary.
@@ -248,9 +251,29 @@ export class JobTransitionService {
     );
   }
 
-  // The worker is shutting down, not failing: the attempt stopped at a safe
-  // point, so it is handed back rather than counted against the budget, and
-  // the next worker resumes the job from what it committed.
+  /**
+   * Adds one reply's usage to the job's totals. No lease and no status: what a
+   * stale attempt spent was spent, and an increment overwrites nobody's value.
+   * Postgres rounds the cost to the millionth of a dollar.
+   */
+  async addModelUsage(
+    jobId: string,
+    { tokensIn, tokensOut, estimatedCostUsd }: ModelUsage,
+  ) {
+    await this.prisma.job.updateMany({
+      where: { id: jobId },
+      data: {
+        tokensIn: { increment: tokensIn },
+        tokensOut: { increment: tokensOut },
+        estimatedCostUsd: { increment: estimatedCostUsd },
+      },
+    });
+  }
+
+  // The attempt stopped for a reason that is not the job's: the worker is
+  // shutting down, or a service the job calls is busy. It is handed back
+  // rather than counted against the budget, and the next attempt resumes the
+  // job from what it committed.
   release(jobId: string, lease: number) {
     return this.move(
       jobId,

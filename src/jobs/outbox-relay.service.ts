@@ -1,14 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
-import { InjectQueue } from '@nestjs/bullmq';
-import type { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service.js';
-import {
-  JOBS_QUEUE,
-  jobOptions,
-  type JobMessage,
-  type OutboxMessage,
-} from './job-queue.js';
+import { jobOptions, type OutboxMessage } from './job-queue.js';
+import { JobQueues } from './job-queues.js';
 import { describeError } from '../common/errors/describe-error.js';
 import { nonOverlapping } from '../common/scheduling/non-overlapping.js';
 
@@ -30,7 +24,7 @@ export class OutboxRelayService {
 
   constructor(
     private readonly prisma: PrismaService,
-    @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
+    private readonly queues: JobQueues,
   ) {}
 
   @Interval(1000)
@@ -59,11 +53,15 @@ export class OutboxRelayService {
       // every tick; the rows behind it go out in the meantime, which costs only
       // their order relative to it — and each row is a separate message.
       try {
-        await this.queue.add(
-          row.jobName,
-          { jobId: message.jobId, correlationId: message.correlationId },
-          jobOptions(message.jobId, row.id, message.maxAttempts),
-        );
+        // The queue the row names, which a queue unknown to this deploy fails
+        // like any other publish: the row waits for a deploy that knows it.
+        await this.queues
+          .named(row.queue)
+          .add(
+            row.jobName,
+            { jobId: message.jobId, correlationId: message.correlationId },
+            jobOptions(message.jobId, row.id, message.maxAttempts),
+          );
 
         await this.prisma.outbox.update({
           where: { id: row.id },

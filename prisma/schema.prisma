@@ -50,37 +50,43 @@ enum JobStatus {
 }
 
 model Job {
-  id              String    @id @default(uuid()) @db.Uuid
-  userId          String    @db.Uuid
-  type            String
-  payload         Json
-  status          JobStatus @default(QUEUED)
-  attempts        Int       @default(0)
+  id               String    @id @default(uuid()) @db.Uuid
+  userId           String    @db.Uuid
+  type             String
+  payload          Json
+  status           JobStatus @default(QUEUED)
+  attempts         Int       @default(0)
   /// The ownership token: every claim increments it and nothing resets it, unlike
   /// `attempts`, which a re-drive resets — so no two deliveries ever share one (D7).
-  lease           Int       @default(0)
-  maxAttempts     Int       @default(5)
-  idempotencyKey  String
+  lease            Int       @default(0)
+  maxAttempts      Int       @default(5)
+  idempotencyKey   String
   /// SHA-256 of the canonical submit body: a reused key with a different body is
   /// a 422, not a replay (D28). NULL on rows from before it was stored.
-  requestHash     String?
-  result          Json?
-  error           Json?
-  progress        Json?
+  requestHash      String?
+  result           Json?
+  error            Json?
+  progress         Json?
   /// What the last committed batch recorded, so a retry or a re-drive resumes
   /// after it (D26). Written in the batch's own transaction; never sent to a client.
-  checkpoint      Json?
-  cancelRequested Boolean   @default(false)
+  checkpoint       Json?
+  cancelRequested  Boolean   @default(false)
   /// Set in the transaction that commits the job's one irreversible effect; the
   /// job can then only be finished by its handler, never cancelled (§5.2). **DB** `CHECK`
-  effectCommitted Boolean   @default(false)
-  correlationId   String
+  effectCommitted  Boolean   @default(false)
+  correlationId    String
   /// Milliseconds, not microseconds: the list's cursor carries it through a JS Date (D14).
-  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
-  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
-  startedAt       DateTime? @db.Timestamptz(6)
+  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @db.Timestamptz(6)
+  startedAt        DateTime? @db.Timestamptz(6)
   /// Milliseconds, like `createdAt`: the dead-letter list's cursor carries it through a JS Date.
-  finishedAt      DateTime? @db.Timestamptz(3)
+  finishedAt       DateTime? @db.Timestamptz(3)
+  /// What the job's requests to a language model used, over every attempt and
+  /// life: added to as each reply arrives, never reset (§6.3d). **DB** `CHECK`
+  tokensIn         Int       @default(0)
+  tokensOut        Int       @default(0)
+  /// At the provider's price when the reply arrived.
+  estimatedCostUsd Decimal   @default(0) @db.Decimal(12, 6)
 
   user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   sideEffects SideEffect[]
@@ -133,29 +139,56 @@ model UploadSlip {
   @@index([userId, createdAt])
 }
 
+/// The categories ai.enrich may give a product (§6.3d).
+enum ProductCategory {
+  apparel
+  footwear
+  accessories
+  beauty
+  home
+  kitchen
+  electronics
+  toys
+  sports
+  books
+  food
+  /// A model made to choose from a list with no way out picks a wrong category, and nothing
+  /// could tell it from a right one.
+  other
+}
+
 /// A store's product, written by `import.csv`. A store knows it by its own `sku`, never by
 /// our `id`, so `(userId, sku)` is what an import matches on — and what makes a replayed batch
 /// harmless (D30).
 model Product {
-  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId         String   @db.Uuid
-  sku            String
-  name           String
-  description    String?
+  id                  String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId              String           @db.Uuid
+  sku                 String
+  name                String
+  description         String?
   /// Whole minor units, never a float: 0.1 + 0.2 is not 0.3.
-  priceCents     Int
+  priceCents          Int
   /// ISO 4217, three capital letters.
-  currency       String
+  currency            String
   /// As written in the file, so untrusted until phase C's guard has checked it.
-  imageUrl       String?
+  imageUrl            String?
   /// `READY` or `FAILED`: what image.process concluded about `imageSourceUrl`. Describes the
   /// product's image only while `imageSourceUrl` equals `imageUrl`.
-  imageStatus    String?
-  imageSourceUrl String?
+  imageStatus         String?
+  imageSourceUrl      String?
   /// Why the image at `imageSourceUrl` could not be used; set only when `FAILED`.
-  imageError     String?
-  createdAt      DateTime @default(now()) @db.Timestamptz(6)
-  updatedAt      DateTime @updatedAt @db.Timestamptz(6)
+  imageError          String?
+  /// `READY` or `FAILED`: what ai.enrich concluded from the input `enrichmentInputHash` names.
+  /// Describes the product only while that hash is still the hash of its input.
+  enrichmentStatus    String?
+  enrichmentInputHash String?
+  /// Why ai.enrich could not enrich the product; set only when `FAILED`.
+  enrichmentError     String?
+  /// Set only when `READY`, and never to anything outside the enum, whatever a model answers.
+  category            ProductCategory?
+  tags                String[]         @default([])
+  createdAt           DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime         @updatedAt @db.Timestamptz(6)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 

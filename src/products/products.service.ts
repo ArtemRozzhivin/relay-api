@@ -6,6 +6,8 @@ import { StorageService } from '../storage/storage.service.js';
 import { productImageKey } from '../storage/object-keys.js';
 import { IMAGE_SIZES, type ImageSize } from '../images/image-variants.js';
 import type { ListProductsQuery } from './products.schema.js';
+import { hashEnrichmentInput } from '../enrichment/enrichment-input.js';
+import type { Enrichment } from '../enrichment/enrichment-reply.js';
 
 /** One product as an import writes it, after its row has been validated. */
 // Signed per page, never stored: a stored link would have expired by the time
@@ -17,6 +19,19 @@ export type ProductImage =
   | { status: 'PENDING' }
   | ({ status: 'READY' } & Record<ImageSize, string>)
   | { status: 'FAILED'; error: string | null };
+
+/** A product's enrichment as a client sees it. */
+export type ProductEnrichment =
+  | { status: 'PENDING' }
+  | ({ status: 'READY' } & Enrichment)
+  | { status: 'FAILED'; error: string | null };
+
+/** The text a product was enriched from, which its record is conditional on. */
+interface EnrichedFrom {
+  id: string;
+  name: string;
+  description: string | null;
+}
 
 export interface ProductRow {
   sku: string;
@@ -105,6 +120,79 @@ export class ProductsService {
     return this.recordImage(userId, productId, sourceUrl, 'FAILED', error);
   }
 
+  /**
+   * The caller's products among `skus`, with the text ai.enrich sends and what
+   * their last enrichment was made from. A sku the caller has no product for
+   * is simply absent.
+   */
+  forEnrichment(userId: string, skus: string[]) {
+    return this.prisma.product.findMany({
+      where: { userId, sku: { in: skus } },
+      select: {
+        id: true,
+        sku: true,
+        name: true,
+        description: true,
+        enrichmentStatus: true,
+        enrichmentInputHash: true,
+      },
+      orderBy: { sku: 'asc' },
+    });
+  }
+
+  /**
+   * Records a product's category and tags — only while it still has the name
+   * and description they were made from. An import that changed either
+   * meanwhile wins: the answer is about text the product no longer has.
+   *
+   * @returns whether it was recorded.
+   */
+  recordEnrichmentReady(
+    userId: string,
+    product: EnrichedFrom,
+    { category, tags }: Enrichment,
+  ) {
+    return this.recordEnrichment(userId, product, {
+      enrichmentStatus: 'READY',
+      enrichmentError: null,
+      category,
+      tags,
+    });
+  }
+
+  /**
+   * Records that the model gave no usable answer for a product, and why, under
+   * the same condition as `recordEnrichmentReady`. `error` is shown to the
+   * product's owner. Clears any earlier category and tags, which were made from
+   * older text.
+   *
+   * @returns whether it was recorded.
+   */
+  recordEnrichmentFailed(userId: string, product: EnrichedFrom, error: string) {
+    return this.recordEnrichment(userId, product, {
+      enrichmentStatus: 'FAILED',
+      enrichmentError: error,
+      category: null,
+      tags: [],
+    });
+  }
+
+  private async recordEnrichment(
+    userId: string,
+    { id, name, description }: EnrichedFrom,
+    data: Prisma.ProductUpdateManyMutationInput,
+  ) {
+    const { count } = await this.prisma.product.updateMany({
+      where: { id, userId, name, description },
+      data: {
+        ...data,
+        enrichmentInputHash: hashEnrichmentInput({ name, description }),
+      },
+    });
+
+    return count === 1;
+  }
+
   private async recordImage(
     userId: string,
     productId: string,
@@ -130,6 +218,11 @@ export class ProductsService {
     imageStatus,
     imageSourceUrl,
     imageError,
+    enrichmentStatus,
+    enrichmentInputHash,
+    enrichmentError,
+    category,
+    tags,
     ...product
   }: Product) {
     let image: ProductImage | null = null;
@@ -158,7 +251,19 @@ export class ProductsService {
       };
     }
 
-    return { ...product, image };
+    let enrichment: ProductEnrichment;
+
+    // Never enriched, or enriched from text the product has since replaced:
+    // either way there is no answer for what it says now.
+    if (enrichmentInputHash !== hashEnrichmentInput(product)) {
+      enrichment = { status: 'PENDING' };
+    } else if (enrichmentStatus === 'FAILED') {
+      enrichment = { status: 'FAILED', error: enrichmentError };
+    } else {
+      enrichment = { status: 'READY', category: category!, tags };
+    }
+
+    return { ...product, image, enrichment };
   }
 
   /**

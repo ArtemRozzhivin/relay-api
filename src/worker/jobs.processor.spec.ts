@@ -1,6 +1,11 @@
 import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
-import { UnrecoverableError, type Job as QueueJob, type Queue } from 'bullmq';
+import {
+  RateLimitError,
+  UnrecoverableError,
+  type Job as QueueJob,
+  type Worker,
+} from 'bullmq';
 import { type Histogram, Registry } from '@prometheus-io/client';
 import type { PinoLogger, RunInContextOptions } from 'nestjs-pino';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,10 +17,11 @@ import type { Job, Prisma } from '../generated/prisma/client.js';
 import type { JobContextFactory } from '../jobs/job-context.factory.js';
 import type { JobEventsPublisher } from '../jobs/job-events.publisher.js';
 import type { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
-import type { JobMessage } from '../jobs/job-queue.js';
+import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
+import type { JobQueues } from '../jobs/job-queues.js';
 import type { JobTransitionService } from '../jobs/job-transition.service.js';
 import type { WorkerEnv } from '../config/env.schema.js';
-import { JobCancelledError } from '../jobs/job-handler.js';
+import { JobCancelledError, JobRateLimitedError } from '../jobs/job-handler.js';
 import { JobsProcessor } from './jobs.processor.js';
 import { JobMetrics, type AttemptOutcome } from './job-metrics.js';
 
@@ -45,18 +51,22 @@ const hidden =
 // A processor whose handler runs `run` on the attempt given, with every error
 // the processor asked a transition to write collected in `errors`, what it
 // built each handler's context from in `contexts`, the fields of each log
-// context it opened in `logContexts`, and its metrics in `registry`.
-// `transitions` replaces any of the transitions' answers.
+// context it opened in `logContexts`, every pause it put on its queue in
+// `pauses`, and its metrics in `registry`. `transitions` replaces any of the
+// transitions' answers; `limited` gives its queue a limiter.
 const processorFor = ({
   attempt = 1,
   run,
   transitions = {},
+  limited = false,
 }: {
   attempt?: number;
   run: () => Promise<unknown>;
   transitions?: Partial<Record<keyof JobTransitionService, unknown>>;
+  limited?: boolean;
 }) => {
   const errors: Prisma.InputJsonValue[] = [];
+  const pauses: number[] = [];
   const contexts: { lastAttempt?: boolean }[] = [];
   const logContexts: Record<string, unknown>[] = [];
   const registry = new Registry();
@@ -103,10 +113,27 @@ const processorFor = ({
       assign: (fields: Record<string, unknown>) =>
         Object.assign(logContexts.at(-1)!, fields),
     } as unknown as PinoLogger,
-    { getJob: async () => message } as unknown as Queue,
+    {
+      named: (name: string) =>
+        name === JOBS_QUEUE
+          ? {
+              getJob: async () => message,
+              rateLimit: async (ms: number) => {
+                pauses.push(ms);
+              },
+            }
+          : undefined,
+    } as unknown as JobQueues,
   );
 
-  return { processor, errors, contexts, logContexts, registry };
+  // The worker @nestjs/bullmq attaches at start-up, as much of it as the
+  // processor reads.
+  vi.spyOn(processor, 'worker', 'get').mockReturnValue({
+    name: JOBS_QUEUE,
+    opts: limited ? { limiter: { max: 20, duration: 60_000 } } : {},
+  } as Worker);
+
+  return { processor, errors, contexts, logContexts, pauses, registry };
 };
 
 // A processor whose handler throws `failure` on the attempt given.
@@ -315,6 +342,62 @@ describe('JobsProcessor', () => {
     });
   });
 
+  describe('a service the job calls is busy', () => {
+    const busy = async () => {
+      throw new JobRateLimitedError(1500);
+    };
+
+    // On the last attempt too: a busy service is no reason to give up.
+    it.each([1, claimed.maxAttempts])(
+      'pauses the queue for as long as the service asked, and hands attempt %i back uncounted',
+      async (attempt) => {
+        const release = vi.fn(async () => claimed);
+        const { processor, errors, pauses } = processorFor({
+          attempt,
+          run: busy,
+          limited: true,
+          transitions: { release },
+        });
+
+        await expect(processor.process(message)).rejects.toBeInstanceOf(
+          RateLimitError,
+        );
+        expect(pauses).toEqual([1500]);
+        expect(release).toHaveBeenCalledWith('a-job', claimed.lease);
+        expect(errors).toEqual([]);
+      },
+    );
+
+    // Handed back, it would be delivered again and claim the job from the
+    // attempt that holds it now.
+    it('pauses the queue, and leaves a job another attempt has taken over', async () => {
+      const { processor, pauses } = processorFor({
+        run: busy,
+        limited: true,
+        transitions: { release: async () => null },
+      });
+
+      await expect(processor.process(message)).resolves.toBeUndefined();
+      expect(pauses).toEqual([1500]);
+    });
+
+    // BullMQ would hand the job straight back to ask the busy service again.
+    it('fails the attempt on a queue with no limiter to pause', async () => {
+      const { processor, errors, pauses } = processorFor({
+        run: busy,
+        transitions: { release: async () => claimed },
+      });
+
+      await expect(processor.process(message)).rejects.toBeInstanceOf(
+        JobRateLimitedError,
+      );
+      expect(pauses).toEqual([]);
+      expect(errors).toEqual([
+        expect.objectContaining({ code: 'ATTEMPT_FAILED' }),
+      ]);
+    });
+  });
+
   // The histogram's count per outcome is what the failure rate is computed
   // from, so each branch has to land under its own name, once.
   describe('times each attempt under how it ended', () => {
@@ -353,6 +436,16 @@ describe('JobsProcessor', () => {
             throw new JobCancelledError();
           },
           transitions: { cancel: async () => claimed },
+        },
+      ],
+      [
+        'rate_limited',
+        {
+          run: async () => {
+            throw new JobRateLimitedError(1000);
+          },
+          limited: true,
+          transitions: { release: async () => claimed },
         },
       ],
     ])('%s', async (outcome, setup) => {

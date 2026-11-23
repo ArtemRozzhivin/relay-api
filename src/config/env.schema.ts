@@ -66,6 +66,9 @@ export const apiEnvSchema = sharedEnvSchema.extend({
 
 export const workerEnvSchema = sharedEnvSchema.extend({
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(5),
+  AI_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(2),
+  AI_QUEUE_LIMIT_MAX: z.coerce.number().int().min(1).default(20),
+  AI_QUEUE_LIMIT_DURATION_MS: z.coerce.number().int().min(100).default(60_000),
   RELAY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1000).default(60_000),
   RELAY_FAULT_SKIP_ABANDON: z.stringbool().default(false),
 });

@@ -22,6 +22,33 @@ export class JobCancelledError extends Error {
   }
 }
 
+// Under a second would ask the busy service again at once, and Redis refuses a
+// pause of 0 ms or of NaN.
+const MIN_RATE_LIMIT_MS = 1000;
+
+/**
+ * Thrown by a handler whose outside service refused it for now and said for
+ * how long: a 429 with `Retry-After`. Not the job's failure. The processor
+ * pauses the job's queue for {@link retryAfterMs}, so nothing else on it asks
+ * the busy service meanwhile, and hands the attempt back uncounted (§6.3d).
+ * Only a queue with a limiter can be paused; on any other it is an ordinary
+ * failure.
+ */
+export class JobRateLimitedError extends Error {
+  /** At least a second, whatever the service said. */
+  readonly retryAfterMs: number;
+
+  constructor(retryAfterMs: number) {
+    const wait = Number.isFinite(retryAfterMs)
+      ? Math.max(Math.ceil(retryAfterMs), MIN_RATE_LIMIT_MS)
+      : MIN_RATE_LIMIT_MS;
+
+    super(`A service the job calls is busy; retry after ${wait} ms`);
+    this.name = 'JobRateLimitedError';
+    this.retryAfterMs = wait;
+  }
+}
+
 /**
  * The shape the registry holds: handlers of unrelated payload types in one map.
  * Extend {@link JobHandler} instead of implementing this — a direct
@@ -45,7 +72,9 @@ export interface RunnableJobHandler {
  *   so it must be JSON-serialisable and must hold nothing the owner may not see.
  * - Throwing `Error` means retry. Throwing `TerminalJobError` means dead-letter
  *   now, without spending the remaining attempts. Throwing `JobCancelledError`
- *   means "I was asked to stop, and stopped somewhere safe".
+ *   means "I was asked to stop, and stopped somewhere safe". Throwing
+ *   `JobRateLimitedError` means "a service I call is busy for this long", and
+ *   the whole run happens again after it, from the start.
  * - A handler that does its work in batches should call `context.shouldStop()`
  *   between them — never in the middle of one, so a stopped job leaves no
  *   batch half applied. A handler with a single atomic effect need not call it

@@ -1,11 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bullmq';
 import { Gauge, Registry } from '@prometheus-io/client';
-import type { Queue } from 'bullmq';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { describeError } from '../common/errors/describe-error.js';
-import { JOBS_QUEUE, type JobMessage } from './job-queue.js';
+import { JobQueues } from './job-queues.js';
 import { JOB_TYPES } from './jobs.schema.js';
 
 // Where an unfinished job can wait in the queue. Completed and failed entries
@@ -38,18 +36,18 @@ export const DEAD_LETTERS_BY_TYPE = Prisma.sql`
 @Injectable()
 export class QueueMetrics {
   private readonly logger = new Logger(QueueMetrics.name);
-  private readonly depth: Gauge<'state'>;
+  private readonly depth: Gauge<'queue' | 'state'>;
   private readonly deadLetters: Gauge<'type'>;
 
   constructor(
     registry: Registry,
     private readonly prisma: PrismaService,
-    @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
+    private readonly queues: JobQueues,
   ) {
     this.depth = new Gauge({
       name: 'relay_queue_depth',
-      help: 'Unfinished jobs by where they wait: the outbox (committed, not yet queued) or a queue state',
-      labelNames: ['state'],
+      help: 'Unfinished jobs by queue and where they wait: the outbox (committed, not yet queued) or a queue state',
+      labelNames: ['queue', 'state'],
       registers: [registry],
       collect: () => this.readDepth(),
     });
@@ -64,29 +62,47 @@ export class QueueMetrics {
   }
 
   private async readDepth() {
-    const [outbox, queue] = await Promise.allSettled([
-      this.prisma.outbox.count({ where: { publishedAt: null } }),
-      this.queue.getJobCounts(...QUEUE_STATES),
+    const queues = this.queues.all();
+    const [outbox, ...counts] = await Promise.allSettled([
+      this.prisma.outbox.groupBy({
+        by: ['queue'],
+        where: { publishedAt: null },
+        _count: { _all: true },
+      }),
+      ...queues.map(([, queue]) => queue.getJobCounts(...QUEUE_STATES)),
     ]);
 
     if (outbox.status === 'fulfilled') {
-      this.depth.set({ state: 'outbox' }, outbox.value);
+      const unpublished = new Map(
+        outbox.value.map((row) => [row.queue, row._count._all]),
+      );
+
+      for (const [queue] of queues) {
+        this.depth.set({ queue, state: 'outbox' }, unpublished.get(queue) ?? 0);
+      }
     } else {
-      this.depth.remove({ state: 'outbox' });
+      for (const [queue] of queues) {
+        this.depth.remove({ queue, state: 'outbox' });
+      }
+
       this.skipped('the outbox', outbox.reason);
     }
 
-    for (const state of QUEUE_STATES) {
-      if (queue.status === 'fulfilled') {
-        this.depth.set({ state }, queue.value[state] ?? 0);
-      } else {
-        this.depth.remove({ state });
-      }
-    }
+    queues.forEach(([queue], index) => {
+      const count = counts[index];
 
-    if (queue.status === 'rejected') {
-      this.skipped('the queue', queue.reason);
-    }
+      for (const state of QUEUE_STATES) {
+        if (count.status === 'fulfilled') {
+          this.depth.set({ queue, state }, count.value[state] ?? 0);
+        } else {
+          this.depth.remove({ queue, state });
+        }
+      }
+
+      if (count.status === 'rejected') {
+        this.skipped(queue, count.reason);
+      }
+    });
   }
 
   private async readDeadLetters() {

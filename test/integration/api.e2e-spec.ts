@@ -372,6 +372,40 @@ describe('the job API contract', () => {
     });
   });
 
+  it("shows what a job's requests to a model used, the cost as a number", async () => {
+    const token = await register('model-usage');
+    const { body: created } = await submit(token);
+    const jobId = created.data.id as string;
+    const read = async () =>
+      (
+        await request(server)
+          .get(`/jobs/${jobId}`)
+          .set('Authorization', `Bearer ${token}`)
+          .expect(200)
+      ).body.data;
+
+    expect((await read()).modelUsage).toEqual({
+      tokensIn: 0,
+      tokensOut: 0,
+      estimatedCostUsd: 0,
+    });
+
+    await app.get(PrismaService).job.update({
+      where: { id: jobId },
+      data: { tokensIn: 1200, tokensOut: 300, estimatedCostUsd: 0.0027 },
+    });
+
+    const job = await read();
+
+    expect(job.modelUsage).toEqual({
+      tokensIn: 1200,
+      tokensOut: 300,
+      estimatedCostUsd: 0.0027,
+    });
+    expect(job).not.toHaveProperty('tokensIn');
+    expect(job).not.toHaveProperty('estimatedCostUsd');
+  });
+
   it('rejects a malformed job id', async () => {
     const token = await register('badid');
 

@@ -166,7 +166,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 |---|---|---|
 | `id` | `uuid` | PK. This is the id returned to the client and the only thing put on the queue (§8.3) |
 | `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE` |
-| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` \| `import.csv` \| `image.process` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
+| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` \| `import.csv` \| `image.process` \| `ai.enrich` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
 | `payload` | `jsonb` | Validated per-type at the edge (§6.4) |
 | `status` | `JobStatus` enum | See §5 |
 | `attempts` | `int` | Default `0`. Incremented by the worker when it *claims* the job. The retry budget, reset by a re-drive — so **not** the ownership token |
@@ -185,6 +185,8 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `updatedAt` | `timestamptz(6)` | |
 | `startedAt` | `timestamptz(6)?` | The latest claim. Cleared by a re-drive |
 | `finishedAt` | `timestamptz(3)?` | Terminal transition. Milliseconds, like `createdAt`: the dead-letter list's cursor carries it through a JS `Date` too (D14) |
+| `tokensIn`, `tokensOut` | `int` | Default `0`. What the job's requests to a language model used, over every attempt and life (§6.3d). Added to as each reply arrives, never reset — not by a re-drive either |
+| `estimatedCostUsd` | `numeric(12,6)` | Default `0`. What those replies cost at the provider's price when each arrived. A number in a response, under `modelUsage` with the two counts |
 
 **Indexes**
 
@@ -205,7 +207,8 @@ every line of application code is wrong; constraints listed as **APP** are polic
   is written in SQL with the status in it, for the reason above: as a Prisma query it read every
   job.
 
-**DB** `CHECK (attempts >= 0)`.
+**DB** `CHECK (attempts >= 0)`. **DB** `CHECK` that `tokensIn`, `tokensOut` and `estimatedCostUsd`
+are never negative.
 
 **DB** `CHECK ((status IN ('QUEUED','RUNNING')) = (finishedAt IS NULL))` — a job has a
 `finishedAt` exactly when it is finished. Every transition into `SUCCEEDED`, `DEAD_LETTERED` or
@@ -248,7 +251,7 @@ Closes the commit-then-enqueue gap (D5). Written in the same transaction as the 
 |---|---|---|
 | `id` | `bigserial` | PK. Serial, not uuid — the relay publishes in insertion order, skipping a row it cannot publish rather than stopping at it, so one bad row never holds back the rest |
 | `jobId` | `uuid` | **DB** FK → `Job` |
-| `queue` / `jobName` | `text` | Destination |
+| `queue` / `jobName` | `text` | Destination: the queue the job's type is delivered through when the row is written (§8.1), and its type. Every delivery of the row — direct, relay, sweep, cancel — goes to that queue |
 | `payload` | `jsonb` | The queue message (§8.3) |
 | `createdAt` | `timestamptz(6)` | |
 | `publishedAt` | `timestamptz(6)?` | `NULL` = pending |
@@ -283,6 +286,11 @@ code it gives each item it sells), never by our `id`, so the SKU is the key an i
 | `imageStatus` | `text?` | `READY` or `FAILED`: what `image.process` concluded about `imageSourceUrl` (§6.3c). **DB** `CHECK` |
 | `imageSourceUrl` | `text?` | The `imageUrl` that conclusion is about. Set exactly when `imageStatus` is (**DB** `CHECK`). Once an import replaces `imageUrl`, the two differ and the image reads as not processed yet — nothing has to clear the old conclusion |
 | `imageError` | `text?` | Why the image at `imageSourceUrl` could not be used. **DB** `CHECK`: only when `FAILED` |
+| `enrichmentStatus` | `text?` | `READY` or `FAILED`: what `ai.enrich` concluded from the input `enrichmentInputHash` names (§6.3d). **DB** `CHECK` |
+| `enrichmentInputHash` | `text?` | SHA-256 of the name, description and instructions' version the conclusion was made from. Set exactly when `enrichmentStatus` is (**DB** `CHECK`). Once an import changes the text, the hash no longer matches and the product reads as not enriched yet — nothing has to clear the old conclusion |
+| `enrichmentError` | `text?` | Why the model's answer could not be used. **DB** `CHECK`: only when `FAILED` |
+| `category` | `ProductCategory?` | A Postgres enum of the 12 categories, so no value outside them can be stored. **DB** `CHECK`: set exactly when `READY` |
+| `tags` | `text[]` | Up to 5, empty unless `READY` (**DB** `CHECK`s); each at most 30 characters, which the handler checks |
 | `createdAt` / `updatedAt` | `timestamptz(6)` | |
 
 **DB** `UNIQUE (userId, sku)` — per store, because two stores' `A-1` are unrelated. This is what
@@ -358,7 +366,7 @@ to guard. Revisit if the status stream turns out to be unreadable without it (§
 | `QUEUED`, `RUNNING` | `RUNNING` | Worker (`claim`) | `WHERE id = ? AND status IN ('QUEUED','RUNNING')`, sets `attempts = attempts + 1`, `lease = lease + 1`, `startedAt`. From `RUNNING` it is a redelivery after a stall or a crash: the new lease outranks the attempt that lost the job (D7) |
 | `RUNNING` | `SUCCEEDED` | Worker | `WHERE id = ? AND status = 'RUNNING' AND lease = ?` |
 | `RUNNING` | `QUEUED` | Worker, attempt failed | `WHERE id = ? AND status = 'RUNNING' AND lease = ?`. Whether to retry — `attempt < maxAttempts` and not terminal — is the processor's decision; no SQL checks the budget |
-| `RUNNING` | `QUEUED` | Worker, shutting down (`release`) | `WHERE id = ? AND status = 'RUNNING' AND lease = ?`, sets `attempts = attempts - 1` — the handler stopped at a safe point because the worker is going away (§7.6a) |
+| `RUNNING` | `QUEUED` | Worker, handing the attempt back (`release`) | `WHERE id = ? AND status = 'RUNNING' AND lease = ?`, sets `attempts = attempts - 1` — the handler stopped at a safe point because the worker is going away (§7.6a), or a service it calls is busy (§6.3d) |
 | `RUNNING` | `DEAD_LETTERED` | Worker | `WHERE id = ? AND status = 'RUNNING' AND lease = ?` — a terminal error or the budget spent |
 | `QUEUED`, `RUNNING` | `DEAD_LETTERED` | Worker, the queue gave up (`abandon`) | `WHERE id = ? AND status IN ('QUEUED','RUNNING') AND attempts > 0` — no lease: the queue failed the job outside any attempt (§7.6). `attempts > 0` keeps it off a job re-driven since |
 | `QUEUED`, `RUNNING` | `DEAD_LETTERED` | Worker, the sweep (`abandonStranded`) | `WHERE id = ? AND status = ? AND lease = ? AND NOT EXISTS (a newer outbox row)` — the status, lease and delivery the sweep read, so a job claimed or re-driven since is left alone (§7.6) |
@@ -369,7 +377,9 @@ to guard. Revisit if the status stream turns out to be unreadable without it (§
 
 **Every write a worker makes on a claimed job carries `lease = <the lease it claimed>`** — each
 transition above, a progress report, a checkpoint and an effect alike — so an attempt that lost the
-job, to a redelivery or to a re-drive, writes nothing over whoever holds it now.
+job, to a redelivery or to a re-drive, writes nothing over whoever holds it now. One write is
+exempt: the model usage (§6.3d) is a total that only grows, so an increment overwrites nobody's
+value, and what an attempt that lost the job spent was spent all the same.
 
 **A job whose effect has committed is finished only by its handler.** The two cancels that run no
 handler cannot see whether a charge went through, so they refuse a job marked `effectCommitted`;
@@ -435,7 +445,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
 | `GET` | `/jobs/dead-letters` | access | `200` | The caller's dead letters, oldest-dead first, matching `POST /jobs/retry`'s filter — `?type=`, `?errorCode=`, `?deadLetteredFrom=`, `?deadLetteredTo=`, none required — in the order a re-drive with the same filter takes them. The re-drive skips a type at its cap, and later dead letters take its places (D32). Paged like `/jobs`: `?limit=` (1–100), `?cursor=` → `{ items, nextCursor }`. Send an offset's `+` as `%2B`: a query string reads `+` as a space, and the instant is refused. A scroll is not a snapshot; to page through a fixed set, set `deadLetteredTo` a few seconds in the past. See D11 |
-| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) |
+| `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) and `enrichment` (§6.3d) |
 | `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. Read a batch before sending it with `GET /jobs/dead-letters`. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
@@ -662,6 +672,86 @@ fixed the file behind the same URL, and naming the sku again is how they ask.
 `GET /products`, each product's `image` is `null` without an `imageUrl`, `{ "status": "PENDING" }`
 until its current URL is processed, `{ "status": "READY", "thumb", "medium", "large" }` with links
 signed for an hour on each read, or `{ "status": "FAILED", "error" }`.
+
+### 6.3d `ai.enrich` — a category and tags for a batch of products (PD)
+
+The payload names up to 20 of the caller's skus. For each, a language model is asked for a
+`category` from a fixed list and up to 5 `tags`, from the product's `name` and `description`. One
+request carries the whole batch, so the instructions are paid for once, not once per product.
+
+`apparel` · `footwear` · `accessories` · `beauty` · `home` · `kitchen` · `electronics` · `toys` ·
+`sports` · `books` · `food` · `other`
+
+`other` is in the list so a product that fits none has an honest answer: a model made to choose
+from a list without one picks a wrong category, and nothing could tell it from a right one.
+
+**The reply is untrusted input** (A19). It is text meant to be JSON —
+`{ "items": [{ "sku", "category", "tags" }] }` — and each item is checked against a schema on its
+own: a category outside the list, more than 5 tags, a tag over 30 characters, or an sku the request
+did not name is refused. A reply that is not JSON, and items that were refused or left out, get one
+corrective request that says what was wrong. Whatever is still wrong after it is recorded on its
+product as `enrichmentStatus = 'FAILED'` with the reason, and nothing else is written for it; as
+with images, a product's failure is not the job's (D31). _Built in D.3._
+
+**A provider's 429 is not a failure** (A20). Its `Retry-After` pauses the AI queue for that long,
+and the job waits without spending an attempt. The handler throws `JobRateLimitedError`, and the
+processor sets the pause on the queue in Redis — every worker waits, as every job there would ask
+the same busy provider — hands the attempt back, and puts the entry back at the head of the queue.
+A wait under a second is taken as a second. The pause lives in the limiter's own key, so it also
+ends the window that was running: after it, the count starts again. Only a queue with a limiter can
+be paused, so on `relay-jobs` the same error is an ordinary failure. A 429 on the corrective
+request runs the job again, which asks only about what the first reply left without an answer:
+what it did answer was recorded before the corrective request. These jobs run on a queue of their
+own, `relay-ai`, with a limiter and a low concurrency: a BullMQ limiter applies to a whole queue, so on `relay-jobs`
+it would slow imports and images too (D6a). By default 20 jobs may start a minute, across every
+worker — at most two requests each, under a provider's usual 50 a minute — and 2 run at once in
+each worker (§8.4). _Built in D.2 and D.4._
+
+**An unchanged product costs nothing** (A21). A product records `enrichmentInputHash`, the hash of
+what it was enriched from — name, description and the version of the instructions — and one whose
+hash matches and whose status is `READY` is skipped without a request, and counted as
+`alreadyReady`. A `FAILED` one is asked again: a model answers differently from one request to the
+next, and naming the sku again is how its owner asks. The write is conditional on the row still
+holding the name and description that were sent, so an import that changed them meanwhile wins.
+The worker logs a line for each request to the model, under the job's id. _Built in D.3 and D.5._
+
+**Each job records its cost:** `tokensIn`, `tokensOut` and `estimatedCostUsd`, over all its
+requests, corrective ones included. They are columns of the job, added to as each reply arrives and
+before it is checked: a provider charges for a reply whether or not it is any use, and whether or
+not the attempt that asked goes on to succeed. Kept in the result instead, a retry, a 429 or a
+crash would take what it had spent with it. A refused request costs nothing and records nothing.
+The cost is the provider's `price` — dollars per million tokens, in and out — at the time; the fake
+charges nothing, but declares 1 and 5 so the estimate has something to show. `GET /jobs/:id` shows
+them for every job as `modelUsage: { tokensIn, tokensOut, estimatedCostUsd }`, zeros for a job that
+asked no model. _Built in D.6._
+
+**The provider is an interface,** `LlmProvider`, and PD builds one implementation:
+`FakeLlmProvider`, deterministic, with no key and no cost. A real model fails rarely and costs
+money each time, so the fake is the only way to test those failures, and it produces each on
+demand, when a product's name holds a directive:
+
+| In the name | The fake |
+|---|---|
+| `[llm:malformed]` | answers every request holding it with prose and cut-off JSON |
+| `[llm:malformed-once]` | answers like that until the corrective request, which it answers correctly |
+| `[llm:off-taxonomy]` | gives that product `gadgets`, a category outside the list |
+| `[llm:busy]` | refuses the first request holding it with a 429 and a `Retry-After` of 1 s; per process |
+
+Otherwise it picks a category by a hash of the sku, and up to 3 tags from the words of the name.
+Its token counts are the characters sent and received, over four. A real provider would plug in
+behind the same interface; which one, and whether one is built, PD leaves open.
+
+The corrective request names only the products that need it, each with its reason, and only the
+text the model needs — sku, name and description, never an id or the owner. A failure clears any
+category and tags the product had: they were made from older text. In `GET /products`, each
+product's `enrichment` is `{ "status": "PENDING" }` until there is a conclusion for the text it
+has now — never enriched, or changed since — then `{ "status": "READY", "category", "tags" }` or
+`{ "status": "FAILED", "error" }`.
+
+```jsonc
+// result
+{ "requested": 4, "enriched": 1, "failed": 1, "superseded": 0, "alreadyReady": 1, "notFound": ["X-9"] }
+```
 
 ### 6.4 Validation
 
@@ -1011,7 +1101,11 @@ seller list which internal names exist, one URL at a time.
 
 ### 8.1 Queues
 
-One queue, `relay-jobs`, with the BullMQ **job name** set to the `Job.type`.
+Two queues, with the BullMQ **job name** set to the `Job.type`: `relay-ai` for `ai.enrich`, and
+`relay-jobs` for every other type. `queueFor(type)` decides, when the job's outbox row is written,
+and the row records it, so a delivery goes where its row says whatever a later deploy routes the
+type to. A row naming a queue the running deploy does not know stays unpublished, holding nothing
+else back.
 
 > **Corrected 2026-10-16:** originally specified as `relay:jobs`. BullMQ v6 rejects a queue name
 > containing `:`, which it reserves as its Redis key separator (`Error: Queue name cannot
@@ -1019,8 +1113,9 @@ One queue, `relay-jobs`, with the BullMQ **job name** set to the `Job.type`.
 
 > **DECISION — D6a · One queue or one per type?**
 >
-> **Status: DEFERRED — phase 10.** Trigger: the load test shows one job type starving another.
-> Undecidable before that measurement. One queue for v1.
+> **Status: RESOLVED for `ai.enrich` (PD, 2026-11-19); open for the rest — phase 10.** A provider's
+> rate limit forced the split before any starvation was measured: a BullMQ limiter is per queue.
+> Every other type stays on `relay-jobs` until the load test shows one starving another.
 >
 > - **(a) One queue, job name = type.** Simplest. One slow type starves the others — worker
 >   concurrency is shared across all types.
@@ -1032,7 +1127,8 @@ One queue, `relay-jobs`, with the BullMQ **job name** set to the `Job.type`.
 > **Recommendation:** (a) for v1. With two mock job types there is nothing to isolate, and the
 > trigger for splitting is measurable (§16). Do not pre-build isolation you cannot observe.
 >
-> **Resolution:** open — see Status above.
+> **Resolution:** (b) for `ai.enrich` alone, `relay-ai` with a limiter of its own (A29); (a) for
+> the rest until phase 10's measurement.
 
 ### 8.2 Job options
 
@@ -1068,18 +1164,28 @@ rides along so the worker's logs join the submitting request's logs (§12.1).
 
 | Setting | v1 value |
 |---|---|
-| Concurrency | `5` per worker process (`WORKER_CONCURRENCY`) |
+| Concurrency | `relay-jobs`: `5` per worker process (`WORKER_CONCURRENCY`); `relay-ai`: `2` (`AI_WORKER_CONCURRENCY`) |
+| Rate limit | `relay-ai` only: `AI_QUEUE_LIMIT_MAX` jobs start per `AI_QUEUE_LIMIT_DURATION_MS`, 20 a minute by default. Kept in Redis for the whole queue, so more workers do not raise it |
 | Instances | 1 in dev; ≥2 in the load test, to prove no double-processing |
-| Registration | `BullModule.registerQueue({ name: 'relay-jobs' })` **+** a `WorkerHost` class — in the worker root only |
+| Registration | `BullModule.registerQueue` for both queues **+** a `WorkerHost` class per queue — in the worker root only |
 
 Processor shape is BullMQ v6 / `@nestjs/bullmq` v12:
 
 ```ts
-@Processor('relay-jobs')
-export class JobsProcessor extends WorkerHost {
-  async process(job: Job<JobMessage>): Promise<unknown> { /* … */ }
+abstract class QueueProcessor extends WorkerHost {
+  async process(job: Job<JobMessage>): Promise<unknown> { /* … the same for every queue */ }
 }
+
+@Processor(JOBS_QUEUE, { concurrency })
+export class JobsProcessor extends QueueProcessor {}
+
+@Processor(AI_QUEUE, { concurrency, limiter: { max, duration } })
+export class AiJobsProcessor extends QueueProcessor {}
 ```
+
+A processor's options are read as its module loads, before `ConfigModule` has read `.env`, so the
+worker's entry point loads `.env` first (`load-env.ts`); a variable already in the environment
+wins. Each is parsed by the env schema, so it has the default and bounds the schema gives it.
 
 Not the `@Process()`-decorated-method style — that is the legacy `@nestjs/bull` API and does
 not apply here.
@@ -1289,7 +1395,7 @@ AppModule  (bootstrap: NestFactory.create)
 ├── JobsModule              → JobsController, JobsService, OutboxRelayService
 │    ├── imports JobCoreModule, StorageModule
 │    ├── imports ScheduleModule.forRoot()                            // the relay's tick
-│    └── imports BullModule.registerQueue({ name: 'relay-jobs' })   // PRODUCER ONLY
+│    └── imports BullModule.registerQueue relay-jobs, relay-ai       // PRODUCER ONLY
 ├── EventsModule            → EventsGateway (+ the bridge subscriber, D8)
 ├── HealthModule            → Terminus: Postgres + Redis
 ├── UploadsModule           → UploadsController, UploadsService (signs upload slips)
@@ -1298,8 +1404,10 @@ AppModule  (bootstrap: NestFactory.create)
 WorkerModule  (bootstrap: NestFactory.createApplicationContext)
 ├── ConfigModule / LoggerModule / PrismaModule   (same modules, worker env schema)
 ├── JobCoreModule
-├── BullModule.registerQueue({ name: 'relay-jobs' })                 // CONSUMER
-├── JobsProcessor           (WorkerHost)
+├── BullModule.registerQueue relay-jobs, relay-ai                    // CONSUMER
+├── JobsProcessor           (WorkerHost, relay-jobs)
+├── AiJobsProcessor         (WorkerHost, relay-ai: a limiter and low concurrency, §8.4)
+├── JobQueues               (both queues by name, for whatever reads an entry: §8.1)
 ├── StrandedJobSweeper      (finishes jobs the queue stopped delivering, §7.6)
 └── ImageFolderSweeper      (deletes image folders no product uses, §6.3c)
 
@@ -1382,6 +1490,9 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `ACCESS_TOKEN_TTL` | duration | ✓ | — | Default `15m` |
 | `REFRESH_TOKEN_TTL` | duration | ✓ | — | Default `30d` |
 | `WORKER_CONCURRENCY` | int | — | ✓ | Default 5 |
+| `AI_WORKER_CONCURRENCY` | int 1–20 | — | ✓ | Default 2. `relay-ai` jobs at once per worker (§8.4) |
+| `AI_QUEUE_LIMIT_MAX` | int ≥1 | — | ✓ | Default 20. `relay-ai` jobs that may start per window, across every worker |
+| `AI_QUEUE_LIMIT_DURATION_MS` | int ≥100 | — | ✓ | Default 60000. The window |
 | `RELAY_SWEEP_INTERVAL_MS` | int ≥1000 | — | ✓ | Default 60000. The stranded-job sweep (§7.6) |
 | `RELAY_FAULT_AFTER_COMMIT` | bool | ✓ | — | Tests only (A6). Default `false` |
 | `RELAY_FAULT_SKIP_ABANDON` | bool | — | ✓ | Tests only (A5d). Default `false` |
@@ -1440,8 +1551,8 @@ never the API's — and serves nothing when it is unset. Every series carries `r
 
 | Metric | From | What it is |
 |---|---|---|
-| `relay_job_attempt_duration_seconds{type, outcome}` | worker | A histogram of every claimed attempt, from its claim to its outcome. `outcome` is `succeeded`, `retrying`, `dead_lettered`, `cancelled`, `handed_back` (stopped for a shutdown, uncounted), `superseded` (another attempt had taken the job over) or `unrecorded` (the outcome could not be written; the queue delivers the job again) |
-| `relay_queue_depth{state}` | API | Unfinished jobs by where they wait: `outbox` (committed, not yet queued), `waiting`, `prioritized`, `delayed`, `active`. Read when scraped |
+| `relay_job_attempt_duration_seconds{type, outcome}` | worker | A histogram of every claimed attempt, from its claim to its outcome. `outcome` is `succeeded`, `retrying`, `dead_lettered`, `cancelled`, `handed_back` (stopped for a shutdown, uncounted), `rate_limited` (refused by a busy service; the queue waits, uncounted), `superseded` (another attempt had taken the job over) or `unrecorded` (the outcome could not be written; the queue delivers the job again) |
+| `relay_queue_depth{queue,state}` | API | Unfinished jobs by queue and where they wait: `outbox` (committed, not yet queued), `waiting`, `prioritized`, `delayed`, `active`. Read when scraped |
 | `relay_dead_letters{type}` | API | Dead-lettered jobs nobody has re-driven, every type listed. Read when scraped |
 | `relay_http_request_duration_seconds{method, route, status}` | API | A histogram of every response, from the first middleware. `route` is the matched pattern (`/jobs/:id`), or `unmatched` for a `404` or a body the parser refused |
 
@@ -1615,9 +1726,9 @@ cases.
 | **A16** | **A hostile image URL reaches nothing private.** `http://localhost`, `http://169.254.169.254`, and a public DNS name resolving to a private address | All three rejected **after resolution, before connect**; the product fails, the batch does not | PC |
 | **A17** | **A permanent error does not burn the budget.** One batch: an image, a 404, a page, undecodable bytes, the metadata address | `attempts = 1` at `SUCCEEDED`; the four products `FAILED`, each with its reason; no backoff was waited (D31) | PC |
 | **A18** | **Image batches do not self-stall.** Five batches of 20 of the heaviest image the limits allow, at the worker's concurrency of 5, timed by a probe inside the real worker | Zero `stalled` events and every product `READY`; event-loop delay and Redis round trip under 1 s, against the 15 s a renewal may be late. A single 40 s main-thread freeze fails it with 5 stalls (D10) | PC |
-| **A19** | **LLM output is untrusted input.** Fake provider returns malformed JSON and an out-of-enum category | Nothing is written for those items; `enrichmentStatus = 'failed'` with a reason; the DB holds no value outside the taxonomy | PD |
-| **A20** | **Rate limits slow the queue, not the jobs.** Fake provider returns 429 with `Retry-After` | No job reaches `DEAD_LETTERED` because of a 429; the queue's throughput drops and recovers | PD |
-| **A21** | **Re-enrichment of unchanged products is free.** Run enrichment twice | Provider call count on the second run **= 0**; `estimatedCostUsd` unchanged | PD |
+| **A19** | **LLM output is untrusted input.** The fake model answers one batch with a category outside the list, and another with cut-off JSON, the corrective request included | Both jobs `SUCCEEDED` on attempt 1. Nothing is written for those products: `enrichmentStatus = 'FAILED'` with the reason, no category, no tags, and the reason shown in `GET /products`; the other product in the batch is `READY`. No `category` in the table is outside the list | PD |
+| **A20** | **Rate limits slow the queue, not the jobs.** 4 `ai.enrich` jobs of one attempt each, queued before a worker running one at a time; the fake model answers the first with a 429 and a `Retry-After` of 1 s | Every job `SUCCEEDED` at `attempts = 1`, every product `READY`. No job started within the second after the 429, and every one within 3 s of it: the queue waited as long as the provider asked, not a limiter window. The busy job ran again first | PD |
+| **A21** | **Re-enrichment of unchanged products is free.** Enrich 3 products, enrich them again, then once more after one product's description changed | Every job `SUCCEEDED`. The worker's log holds one request to the model for the first job, **none** for the second, with `alreadyReady = 3`, and one about 1 product for the third. `modelUsage` shows the first job's cost, the second's as zero, and the third's below the first's | PD |
 | **A22** | **A failed child does not fail the pipeline.** Force one enrichment batch to fail | `Pipeline.status = 'completed_with_errors'`; sibling batches completed; the failed batch is re-drivable; no `Job` row carries `completed_with_errors` | PE |
 | **A23** | **The fan-out is idempotent.** Replay the fan-out for a pipeline | One `Job` row per `(stage, batch)`; the duplicate attempt is refused by `UNIQUE (userId, idempotencyKey)` | PE |
 | **A24** | **The parent cannot be lost.** Crash between the last child committing and the parent being enqueued | The relay publishes the parent's outbox row; the pipeline finalizes exactly once | PE |
@@ -1625,6 +1736,7 @@ cases.
 | **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
 | **A27** | **The backlog can be watched.** Submit 20 jobs with no worker running, then start one | Scraped from the API's own metrics port, `relay_queue_depth` rises by 20 and falls back to where it began; the worker's `relay_job_attempt_duration_seconds_count{outcome="succeeded"}` reaches 20. A job dead-lettered after it raises `relay_dead_letters` and counts as `dead_lettered` on the worker | 8 |
 | **A28** | **A job's story is found by one id.** Under a chosen `X-Request-Id`, submit a job that fails twice, then re-drive it under another; and one that succeeds. Both processes log JSON, as in production | Under the submit's id: the API's lines for the submit, and every worker line of both attempts, the handler's included, each naming the job, its type and its attempt, ending in the dead letter. No line about the job is without it. The re-drive's runs are under the re-drive's id, none under the submit's. A succeeded job's lines end in one saying so | 8 |
+| **A29** | **A provider's rate limit slows only its own jobs.** The AI queue limited to 1 job a second; 4 `ai.enrich` jobs, then 3 `MOCK` jobs, queued before the worker starts | Every job `SUCCEEDED`, and every `ai.enrich` outbox row names `relay-ai`. The `ai.enrich` jobs started at least a window apart; every `MOCK` job finished before the second `ai.enrich` job started | PD |
 
 **A6 is written to fail against the phase-5 design.** The commit-then-enqueue gap is a knowingly
 accepted risk; A6 quantifies it rather than leaving it undocumented.
@@ -1977,7 +2089,7 @@ to settle it.
 | D7 | ~~Claim guard; crash reconciliation; authoritative attempt counter~~ | — | **DECIDED (phase 6)** — claim `QUEUED`/`RUNNING`; BullMQ redelivery reconciles; `Job.attempts` is authoritative. §7.6 |
 | D6b | ~~What a dead letter physically is~~ | — | **DECIDED (phase 6)** — `DEAD_LETTERED` + `error` on the `Job` row. §4.6 |
 | D8 | ~~Who emits the WS event; how it crosses the process boundary~~ | — | **DECIDED 2026-10-26** — the worker `PUBLISH`es a domain event to `relay:job-updated`; the API subscribes on a duplicated connection and fans out to `user:<userId>`. §9.3 |
-| D6a | One queue, or one per job type | The load test shows one job type starving another | 10 |
+| D6a | One queue, or one per job type | The load test shows one job type starving another | 10 — **decided for `ai.enrich`** (PD): `relay-ai`, forced by the provider's rate limit. §8.1 |
 | D3b | Add an explicit `RETRYING` state? | The status stream proves unreadable without distinguishing "never run" from "waiting after failure #2" | 7 |
 | D10 | ~~Worker concurrency tuning; sandboxed processors~~ | Measured event-loop blocking in the worker | **DECIDED 2026-11-09** — concurrency 5, renders in-process; image work leaves the event loop alone, measured below. Re-measured on the target host in phase 10 |
 | D11 | ~~A dead-letter re-drive API beyond `POST /jobs/:id/retry`~~ | The first real dead letter that needs bulk handling | **DECIDED** — filtered, bounded per call, published through the outbox. Inspection **built 2026-11-18**: `GET /jobs/dead-letters` |
@@ -2341,6 +2453,12 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-20 | §4.3, §5.2, §6.3d, §14 — each job's model usage, D.6, which closes PD. `Job` gains `tokensIn`, `tokensOut` and `estimatedCostUsd`, added to as each reply arrives, by any attempt — the one write exempt from the lease — and never reset. `LlmProvider` declares its `price`. `GET /jobs/:id` shows them as `modelUsage`, the cost a number. A21 checks the cost. §4.3 listed four job types; it lists five. |
+| 2026-11-20 | §6.3d, §14 — an unchanged product is skipped, D.5. A product `READY` for the hash of its current text is not sent to the model, and the result counts it as `alreadyReady`; a `FAILED` one is asked again. What the first reply answered is recorded before the corrective request, so a 429 on that request costs only the rest on the next run. A line in the worker's log for every request to the model. A21 automated; its cost check waits for D.6. The assertion harness clears each queue's limiter window as a file starts: one left by an earlier file's AI jobs held A29's worker back for the rest of a minute. |
+| 2026-11-20 | §5.2, §6.3d, §12, §14 — a provider's 429, D.4. The handler turns it into `JobRateLimitedError`; the processor pauses the job's queue in Redis for the `Retry-After`, at least a second, and hands the attempt back uncounted, the job at the head of the queue — on the last attempt too. Only a queue with a limiter can be paused; elsewhere the error is an ordinary failure. `queue.rateLimit`, since `worker.rateLimit` is deprecated. Attempts gain the outcome `rate_limited`. A20 automated. |
+| 2026-11-19 | §4.5, §6.3d, §8.1, §8.4, §10.1, §11, §12, §14, §16 — `relay-ai`, D.2; D6a decided for `ai.enrich`. A job's queue is chosen by its type when its outbox row is written, and recorded there: the direct path, the relay, the sweep, cancel and the stall log all read the entry from that queue. The worker runs a processor per queue — the logic shared, the options apart — and `relay-ai`'s has a limiter, 20 jobs a minute across every worker, and 2 at once per worker. `relay_queue_depth` gains a `queue` label. The worker loads `.env` before its modules, so a processor option set there — `WORKER_CONCURRENCY` included, which `.env` could not set before — takes effect. A29 registered and automated. |
+| 2026-11-19 | §4.7, §6.2, §6.3d, §14 — `ai.enrich` built, D.3. `Product` gains `enrichmentStatus`, `enrichmentInputHash`, `enrichmentError`, `category` — a Postgres enum, so nothing outside the list can be stored — and `tags`, with `CHECK`s that only a `READY` product has an answer. One request per batch; each item of the reply is checked on its own, and the products without a usable answer get one corrective request, then `FAILED` with the reason. Recorded only while the product has the text the model was given. `GET /products` shows each product's `enrichment`. Built before D.2: the queue split needs the job to carry. A19 automated. |
+| 2026-11-19 | §6.3d — `ai.enrich` specified, and D.1 built. A batch of up to 20 skus gets a category from a fixed list of 12 and up to 5 tags in one request; the reply is checked item by item, with one corrective request, and what is still wrong fails its product, not the job. A 429 pauses a queue of the job's own; an unchanged product is skipped by the hash of its input; each job records its tokens and cost. `LlmProvider` is the interface, and `FakeLlmProvider` the one implementation: deterministic, and failing on demand when a product's name holds a directive. A real provider is left open. |
 | 2026-11-19 | §13.4, D32 — the AWS budget alarm is set: email alerts at $5 a month, on the account that holds the bucket. The last of 8.3, and of phase 8. |
 | 2026-11-18 | §6.3c, §10.1, §13.4, §15.2 — replaced image folders, 8.8. `ImageFolderSweeper` lists `products/` every 6 hours in each worker and deletes a folder only when it is neither the product's current URL's nor the one its image was made from, and nothing in it has been written for a day; a product that no longer exists keeps none. Rows are read after the listing, a folder split across listing pages is judged whole, and a bulk delete's per-key refusals are thrown. The window left open — a URL switched back and re-rendered within one S3 request — is named. |
 | 2026-11-18 | §7.7, §12.1, §14, §15.2 — logs joined by `correlationId`, 8.7. Every line about a job carries it as a field in both processes: the API binds the request id under that name to each line it writes while handling the request, and the worker runs each job, its stall, its abandonment and the sweep's finishing of it in a log context naming the `correlationId` and `jobId`, adding `jobType` and `attempt` once claimed — whichever class writes the line. A re-drive's runs are logged under the re-drive's id. A succeeded attempt now logs that it succeeded. `status` dropped from §12.1's fields. A28 registered and automated. |

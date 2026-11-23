@@ -34,6 +34,7 @@ describe('submitJobSchema', () => {
       'CHARGE',
       'import.csv',
       'image.process',
+      'ai.enrich',
     ]);
   });
 });
@@ -53,6 +54,25 @@ describe('the image.process payload', () => {
     ['more than 50', Array.from({ length: 51 }, (_, i) => `S-${i}`)],
     ['a blank sku', ['  ']],
     ['a sku longer than a product can have', ['x'.repeat(101)]],
+  ])('refuses %s', (_label, skus) => {
+    expect(submit(skus)).toBe(false);
+  });
+});
+
+describe('the ai.enrich payload', () => {
+  const submit = (skus: unknown) =>
+    submitJobSchema.safeParse({ type: 'ai.enrich', payload: { skus } }).success;
+
+  it('takes a batch of up to 20 skus', () => {
+    expect(submit(['A-1'])).toBe(true);
+    expect(submit(Array.from({ length: 20 }, (_, i) => `S-${i}`))).toBe(true);
+  });
+
+  it.each([
+    ['no skus', []],
+    ['more than 20', Array.from({ length: 21 }, (_, i) => `S-${i}`)],
+    ['a blank sku', ['  ']],
+    ['a sku with a NUL', ['A\u00001']],
   ])('refuses %s', (_label, skus) => {
     expect(submit(skus)).toBe(false);
   });

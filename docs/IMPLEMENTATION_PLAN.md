@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD → PE → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE → PF → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -798,39 +798,52 @@ of failing jobs.
 
 ### Tasks
 
-- [ ] **D.1 ·** `LlmProvider` **interface** + `FakeLlmProvider` — deterministic, no API key, and
-  able to simulate 429s and malformed JSON on demand.
+- [x] **D.1 ·** `LlmProvider` **interface** + `FakeLlmProvider` — deterministic, no API key, and
+  able to simulate 429s and malformed JSON on demand. A directive in a product's name asks for
+  each failure (§6.3d), so a test that runs real processes can ask for one through an import.
   ```
   _The fake is not a stand-in for the real one; it is the only way to test the failure paths the
   real one produces rarely and expensively._
   ```
-- [ ] **D.2 · A separate** `relay-ai` **queue with a** `limiter` **(resolves D6a)** and low
-  concurrency.
+- [x] **D.2 · A separate** `relay-ai` **queue with a** `limiter` **(resolves D6a)** and low
+  concurrency. The outbox row records each job's queue, and everything that reads an entry reads
+  it there; one processor class per queue, sharing the logic. A29 proves the limit slows only
+  `ai.enrich`.
   ```
   _A BullMQ limiter is per-queue, so the rate limit itself forces the split — not a starvation
   measurement, which is what D6a was waiting for._
   ```
-- [ ] **D.3 · Zod-validate every item** — one corrective retry, then
-  `enrichmentStatus = 'failed'`; a category outside the enum is rejected.
+- [x] **D.3 · Zod-validate every item** — one corrective retry, then
+  `enrichmentStatus = 'failed'`; a category outside the enum is rejected. Built before D.2, which
+  needs a job to carry. `category` is a Postgres enum, and the write is conditional on the text
+  the model was given — D.5's second half.
   ```
   _A hallucinated category is indistinguishable from a valid one until something checks. This is
   the lesson of the phase._
   ```
-- [ ] **D.4 · Honour 429s** — `worker.rateLimit(ms)` + `RateLimitError`, using `Retry-After`.
+- [x] **D.4 · Honour 429s** — `queue.rateLimit(ms)` + `RateLimitError`, using `Retry-After`.
+  `worker.rateLimit` is deprecated in BullMQ 6. The handler throws `JobRateLimitedError`; the
+  processor pauses the queue and hands the attempt back uncounted. A20 proves the queue waits as
+  long as the provider asked, and no longer: handed back without its own pause, a job waits out
+  the rest of the limiter's window, up to 30 s.
   ```
   _Backpressure, not failure: the job has not failed, the provider is busy._
   ```
-- [ ] **D.5 ·** `enrichmentInputHash` **skip** + conditional update on write.
+- [x] **D.5 ·** `enrichmentInputHash` **skip** + conditional update on write. A `FAILED` product
+  is asked again. The first reply's answers are recorded before the corrective request, so a 429
+  on it costs only the rest. A21 counts the model requests in the worker's log.
   ```
   _Re-running must cost nothing for unchanged products, and must never overwrite newer data._
   ```
-- [ ] **D.6 · Track** `tokensIn`, `tokensOut`, `estimatedCostUsd` per job.
+- [x] **D.6 · Track** `tokensIn`, `tokensOut`, `estimatedCostUsd` per job, and add A21's cost
+  check. Columns of the job, added to as each reply arrives by whichever attempt made it, and
+  shown as `modelUsage`; the provider declares its price.
 
 ### Done when
 
-- [ ] **A19 passes** — malformed or out-of-schema output never reaches the database
-- [ ] **A20 passes** — simulated 429s slow the queue; no job fails because of one
-- [ ] **A21 passes** — re-running enrichment on unchanged products issues zero provider calls
+- [x] **A19 passes** — malformed or out-of-schema output never reaches the database
+- [x] **A20 passes** — simulated 429s slow the queue; no job fails because of one
+- [x] **A21 passes** — re-running enrichment on unchanged products issues zero provider calls
 
 ---
 

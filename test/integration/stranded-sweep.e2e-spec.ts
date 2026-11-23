@@ -11,7 +11,8 @@ import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { RedisModule } from '../../src/redis/redis.module.js';
 import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
 import { JobEventsPublisher } from '../../src/jobs/job-events.publisher.js';
-import { JOBS_QUEUE, messageId } from '../../src/jobs/job-queue.js';
+import { AI_QUEUE, JOBS_QUEUE, messageId } from '../../src/jobs/job-queue.js';
+import { JobQueues } from '../../src/jobs/job-queues.js';
 import {
   StrandedJobSweeper,
   type SweepCandidate,
@@ -36,7 +37,7 @@ describe('the stranded-job sweep', () => {
   let prisma: PrismaService;
   let sweeper: StrandedJobSweeper;
   let transitions: JobTransitionService;
-  let queue: Queue;
+  let queues: Record<string, Queue>;
   let worker: Worker;
   let userId: string;
 
@@ -45,6 +46,7 @@ describe('the stranded-job sweep', () => {
   // published, because the queue has had it.
   const unfinished = async (
     status: 'RUNNING' | 'QUEUED',
+    queue: string = JOBS_QUEUE,
   ): Promise<SweepCandidate> => {
     const claimed = status === 'RUNNING';
     const job = await seedJob(prisma, {
@@ -56,7 +58,7 @@ describe('the stranded-job sweep', () => {
     const outbox = await prisma.outbox.create({
       data: {
         jobId: job.id,
-        queue: JOBS_QUEUE,
+        queue,
         jobName: 'MOCK',
         payload: {},
         publishedAt: claimed ? null : new Date(),
@@ -68,13 +70,14 @@ describe('the stranded-job sweep', () => {
       status: job.status,
       lease: job.lease,
       outboxId: outbox.id,
+      queue,
     };
   };
 
   const running = () => unfinished('RUNNING');
 
   const enqueue = (job: SweepCandidate, options: { delay?: number } = {}) =>
-    queue.add(
+    queues[job.queue].add(
       'MOCK',
       { jobId: job.id, correlationId: 'sweep' },
       { jobId: messageId(job.id, job.outboxId), attempts: 1, ...options },
@@ -106,16 +109,26 @@ describe('the stranded-job sweep', () => {
         PrismaModule,
         RedisModule,
         BullModule.forRoot({ connection, prefix }),
-        BullModule.registerQueue({ name: JOBS_QUEUE }),
+        BullModule.registerQueue({ name: JOBS_QUEUE }, { name: AI_QUEUE }),
         LoggerModule.forRoot({ pinoHttp: { level: 'silent' } }),
       ],
-      providers: [JobTransitionService, JobEventsPublisher, StrandedJobSweeper],
+      providers: [
+        JobTransitionService,
+        JobEventsPublisher,
+        JobQueues,
+        StrandedJobSweeper,
+      ],
     });
 
     prisma = moduleRef.get(PrismaService);
     sweeper = moduleRef.get(StrandedJobSweeper);
     transitions = moduleRef.get(JobTransitionService);
-    queue = moduleRef.get(getQueueToken(JOBS_QUEUE));
+    queues = Object.fromEntries(
+      [JOBS_QUEUE, AI_QUEUE].map((name) => [
+        name,
+        moduleRef.get<Queue>(getQueueToken(name)),
+      ]),
+    );
     worker = new Worker(JOBS_QUEUE, null, { connection, prefix });
 
     userId = await createThrowawayUser(prisma, 'sweep');
@@ -123,7 +136,9 @@ describe('the stranded-job sweep', () => {
 
   afterAll(async () => {
     await worker.close();
-    await queue.obliterate({ force: true });
+    for (const queue of Object.values(queues)) {
+      await queue.obliterate({ force: true });
+    }
     await deleteUsers(prisma, [userId]);
     await moduleRef.close();
   });
@@ -161,6 +176,23 @@ describe('the stranded-job sweep', () => {
       });
     },
   );
+
+  // Were it asked of relay-jobs, the entry would read as missing and a job
+  // still waiting its turn behind the AI queue's limiter would be finished.
+  it("looks for the entry in the queue the job's outbox row names", async () => {
+    const job = await running();
+    const aiJob = await unfinished('RUNNING', AI_QUEUE);
+
+    await enqueue(aiJob);
+
+    expect(await sweeper.finishIfStranded(aiJob, later())).toBeNull();
+    expect((await row(aiJob.id)).status).toBe('RUNNING');
+
+    // The same id under relay-jobs: nothing there, so that one is finished.
+    expect(await sweeper.finishIfStranded(job, later())).toMatchObject({
+      status: 'DEAD_LETTERED',
+    });
+  });
 
   it('leaves a just-failed entry for the failed event to finish', async () => {
     const job = await running();
@@ -277,10 +309,15 @@ describe('the stranded-job sweep', () => {
         correlationId: 'sweep',
       })),
     });
+    // Every third on the AI queue, so the candidate is seen to carry the queue
+    // its own row names.
+    const queueOf = (jobId: string) =>
+      ids.indexOf(jobId) % 3 === 0 ? AI_QUEUE : JOBS_QUEUE;
+
     await prisma.outbox.createMany({
       data: ids.map((jobId) => ({
         jobId,
-        queue: JOBS_QUEUE,
+        queue: queueOf(jobId),
         jobName: 'MOCK',
         payload: { jobId, correlationId: `sweep-${jobId}`, maxAttempts: 1 },
         publishedAt: jobId === unpublished ? null : new Date(),
@@ -289,7 +326,7 @@ describe('the stranded-job sweep', () => {
 
     const ours = new Set(ids);
     const decide = sweeper.finishIfStranded.bind(sweeper);
-    const asked: string[] = [];
+    const asked: [jobId: string, queue: string][] = [];
     const spy = vi
       .spyOn(sweeper, 'finishIfStranded')
       .mockImplementation(async (job, now) => {
@@ -297,7 +334,7 @@ describe('the stranded-job sweep', () => {
           return null;
         }
 
-        asked.push(job.id);
+        asked.push([job.id, job.queue]);
 
         // Their entries are missing under this file's prefix, so each one is
         // dead-lettered and leaves the filter as soon as it is asked about.
@@ -332,7 +369,7 @@ describe('the stranded-job sweep', () => {
 
     const candidates = ids.filter((jobId) => jobId !== unpublished);
 
-    expect(asked).toEqual(candidates);
+    expect(asked).toEqual(candidates.map((jobId) => [jobId, queueOf(jobId)]));
     expect(contexts).toEqual(
       candidates.map((jobId) => ({ correlationId: `sweep-${jobId}`, jobId })),
     );

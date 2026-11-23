@@ -36,6 +36,10 @@ nothing.
 | An import killed mid-file resumes rather than restarts    | `SIGKILL` while a batch is held on a row lock (A14)               |
 | The same file submitted twice imports once                | Two submits, one key, one catalog (A15)                           |
 | One request id finds everything it caused, in both logs   | A job fails, is re-driven; both processes' logs read back (A28)   |
+| A model's answer is checked before anything is written    | Cut-off JSON and a category outside the list (A19)                |
+| A provider's rate limit slows only the jobs that call it  | AI jobs limited to 1 a second; other jobs run at once (A29)       |
+| A busy AI provider slows the queue and fails no job       | A 429 on a one-attempt job: the queue waits, the job runs (A20)   |
+| Enriching an unchanged product again costs nothing        | A second run on the same text asks the model nothing (A21)        |
 
 The full list, with the SQL each test checks, is §14 of the
 [technical specification](docs/TECH_SPEC.md#14-verification-plan).

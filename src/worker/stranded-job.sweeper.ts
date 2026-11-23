@@ -5,18 +5,12 @@ import {
   type OnModuleDestroy,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { InjectQueue } from '@nestjs/bullmq';
-import type { Queue } from 'bullmq';
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { JobTransitionService } from '../jobs/job-transition.service.js';
 import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
-import {
-  JOBS_QUEUE,
-  messageId,
-  type JobMessage,
-  type OutboxMessage,
-} from '../jobs/job-queue.js';
+import { messageId, type OutboxMessage } from '../jobs/job-queue.js';
+import { JobQueues } from '../jobs/job-queues.js';
 import type { JobStatus } from '../generated/prisma/enums.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';
@@ -39,6 +33,8 @@ export interface SweepCandidate {
   status: JobStatus;
   lease: number;
   outboxId: bigint;
+  /** The queue that outbox row was published to, where its entry is. */
+  queue: string;
 }
 
 /**
@@ -71,7 +67,7 @@ export class StrandedJobSweeper
     private readonly transitions: JobTransitionService,
     private readonly events: JobEventsPublisher,
     private readonly config: ConfigService<WorkerEnv, true>,
-    @InjectQueue(JOBS_QUEUE) private readonly queue: Queue<JobMessage>,
+    private readonly queues: JobQueues,
     private readonly logContext: PinoLogger,
   ) {}
 
@@ -113,7 +109,12 @@ export class StrandedJobSweeper
           outbox: {
             orderBy: { id: 'desc' },
             take: 1,
-            select: { id: true, publishedAt: true, payload: true },
+            select: {
+              id: true,
+              queue: true,
+              publishedAt: true,
+              payload: true,
+            },
           },
         },
       });
@@ -136,7 +137,7 @@ export class StrandedJobSweeper
           await this.logContext.runInContext(
             () =>
               this.finishIfStranded(
-                { id, status, lease, outboxId: latest.id },
+                { id, status, lease, outboxId: latest.id, queue: latest.queue },
                 now,
               ),
             { bindings: { correlationId, jobId: id } },
@@ -162,7 +163,9 @@ export class StrandedJobSweeper
    * something else finished it first.
    */
   async finishIfStranded(job: SweepCandidate, now = Date.now()) {
-    const entry = await this.queue.getJob(messageId(job.id, job.outboxId));
+    const entry = await this.queues
+      .named(job.queue)
+      .getJob(messageId(job.id, job.outboxId));
 
     let found: string;
 
