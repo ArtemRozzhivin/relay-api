@@ -805,8 +805,11 @@ import's lease and by the import still holding its place in the pipeline, so nei
 that lost the import nor a re-drive of the import after the pipeline finished fans out. The
 batches carry the pipeline's correlation id and reach their queues through the relay (§4.5).
 They count against no cap: the import that makes them does, and its file is at most 50 MB. A
-client's own `Idempotency-Key` may not begin with `pipeline:` (`400`): sharing the server's
-prefix, it could take a batch's key before the fan-out writes it.
+client's own `Idempotency-Key` may not begin with `pipeline:` (`400 IDEMPOTENCY_KEY_RESERVED`):
+sharing the server's prefix, it could take a batch's key before the fan-out writes it. The
+import's result gains `batches: { enrich, images }`, how many of each the file called for, so it
+reads the same on the attempt that wrote them and on any that found them written. _Built in
+E.2._
 
 **The counter (D24).** `pendingChildren` starts at 1, for the import, and the fan-out raises it
 while the import still holds that 1, so it cannot reach zero before every batch exists. Each job
@@ -941,9 +944,10 @@ written by two different processes.
 
 ### 7.2 What `Idempotency-Key` is required on
 
-Required on `POST /jobs`. A submit without the header is a `400` — not a silently-accepted
-unguarded job. Making it optional means the guarantee is opt-in, and the one client that forgets
-is the one that double-charges.
+Required on `POST /jobs` and `POST /pipelines`. A submit without the header is a `400` — not a
+silently-accepted unguarded job. Making it optional means the guarantee is opt-in, and the one
+client that forgets is the one that double-charges. A key beginning with `pipeline:` is a
+`400 IDEMPOTENCY_KEY_RESERVED`: that prefix is the server's, for a pipeline's own jobs (§6.3e).
 
 ### 7.3 The insert is the check
 
@@ -1490,7 +1494,8 @@ AppModule  (bootstrap: NestFactory.create)
 ├── RedisModule             (global; exports the ioredis client)
 ├── AuthModule              → AuthController, AuthService, TokenService, PasswordService,
 │                             APP_GUARD: JwtAuthGuard
-├── JobsModule              → JobsController, JobsService, OutboxRelayService
+├── JobsModule              → JobsController, JobsService, OutboxRelayService,
+│                             PipelinesController, PipelinesService (§6.3e)
 │    ├── imports JobCoreModule, StorageModule
 │    ├── imports ScheduleModule.forRoot()                            // the relay's tick
 │    └── imports BullModule.registerQueue relay-jobs, relay-ai       // PRODUCER ONLY
@@ -1627,6 +1632,7 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `RELAY_SWEEP_INTERVAL_MS` | int ≥1000 | — | ✓ | Default 60000. The stranded-job sweep (§7.6) |
 | `RELAY_FAULT_AFTER_COMMIT` | bool | ✓ | — | Tests only (A6). Default `false` |
 | `RELAY_FAULT_SKIP_ABANDON` | bool | — | ✓ | Tests only (A5d). Default `false` |
+| `RELAY_FAULT_AFTER_FAN_OUT` | bool | — | ✓ | Tests only (A23): fails an import's first attempt right after its fan-out commits. Default `false` |
 | `JOB_MAX_ATTEMPTS` | int | ✓ | ✓ | Default ceiling |
 | `LOG_LEVEL` | enum | ✓ | ✓ | |
 | `CORS_ORIGINS` | csv | ✓ | — | The origins a browser may call from, over HTTP and the socket alike. Empty: none (§15.2) |
@@ -1861,7 +1867,7 @@ cases.
 | **A20** | **Rate limits slow the queue, not the jobs.** 4 `ai.enrich` jobs of one attempt each, queued before a worker running one at a time; the fake model answers the first with a 429 and a `Retry-After` of 1 s | Every job `SUCCEEDED` at `attempts = 1`, every product `READY`. No job started within the second after the 429, and every one within 3 s of it: the queue waited as long as the provider asked, not a limiter window. The busy job ran again first | PD |
 | **A21** | **Re-enrichment of unchanged products is free.** Enrich 3 products, enrich them again, then once more after one product's description changed | Every job `SUCCEEDED`. The worker's log holds one request to the model for the first job, **none** for the second, with `alreadyReady = 3`, and one about 1 product for the third. `modelUsage` shows the first job's cost, the second's as zero, and the third's below the first's | PD |
 | **A22** | **A failed child does not fail the pipeline.** Force one enrichment batch to fail | `Pipeline.status = 'completed_with_errors'`; sibling batches completed; the failed batch is re-drivable; no `Job` row carries `completed_with_errors` | PE |
-| **A23** | **The fan-out is idempotent.** Replay the fan-out for a pipeline | One `Job` row per `(stage, batch)`; the duplicate attempt is refused by `UNIQUE (userId, idempotencyKey)` | PE |
+| **A23** | **The fan-out is idempotent.** A pipeline's import fails its first attempt right after its fan-out commits (`RELAY_FAULT_AFTER_FAN_OUT`), so its retry fans out again | The import `SUCCEEDED` on attempt 2; one `Job` row per `(stage, batch)`, each with one outbox row; the retry wrote none, every batch refused by `UNIQUE (userId, idempotencyKey)`; `pendingChildren` raised once | PE |
 | **A24** | **The parent cannot be lost.** Crash between the last child committing and the parent being enqueued | The relay publishes the parent's outbox row; the pipeline finalizes exactly once | PE |
 | **A25** | **Revocation is immediate.** Revoke a key, then use it | `401`, with no process restart | PF |
 | **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
@@ -2584,6 +2590,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-23 | §6.3e, §7.2, §10.1, §11, §14 — a pipeline starts and fans out, E.2. `POST /pipelines` and `GET /pipelines/:id` built; a pipeline's import ends by reading its file again and writing the batches its products need, through `context.fanOut`, under the import's lease and only while it holds its place. A client key beginning with `pipeline:` is refused. A23 registered, with `RELAY_FAULT_AFTER_FAN_OUT`. Nothing takes one off the counter yet, so a pipeline stays `RUNNING` until E.3. |
 | 2026-11-23 | §4.3, §4.9, §6.2, §6.3e — pipelines specified, E.1. `POST /pipelines` writes a `Pipeline` and its import; the import ends by fanning out into `ai.enrich` and `image.process` batches with server-minted keys, in one transaction; each job takes one off `pendingChildren` in the transaction of its first terminal transition, and the one that reaches zero writes `pipeline.finalize`, which sets the status once. `Job` gains `pipelineId` and `pendingInPipeline`. **New migration** `20261123100000_pipeline`. |
 | 2026-11-23 | §10.4 — `src/jobs` split into folders by the question each answers: `api/`, `engine/`, `delivery/`, `events/`, and one folder per job type under `handlers/`. Files moved and imports rewritten, nothing else. Imports point one way, and why there is no repository layer, recorded there. |
 | 2026-11-20 | §4.3, §5.2, §6.3d, §14 — each job's model usage, D.6, which closes PD. `Job` gains `tokensIn`, `tokensOut` and `estimatedCostUsd`, added to as each reply arrives, by any attempt — the one write exempt from the lease — and never reset. `LlmProvider` declares its `price`. `GET /jobs/:id` shows them as `modelUsage`, the cost a number. A21 checks the cost. §4.3 listed four job types; it lists five. |

@@ -134,6 +134,10 @@ abstract class QueueProcessor extends WorkerHost implements OnModuleDestroy {
       progress: claimed.progress,
       checkpoint: claimed.checkpoint,
       stopping: () => this.stopping,
+      pipelineId: claimed.pipelineId,
+      failAfterFanOut: this.config.get('RELAY_FAULT_AFTER_FAN_OUT', {
+        infer: true,
+      }),
     });
 
     try {

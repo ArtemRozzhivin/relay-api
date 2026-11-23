@@ -9,7 +9,9 @@ import {
   type JobProgress,
 } from './job-progress.js';
 import type { AttemptFailedError, DeadLetterError } from './job-error-codes.js';
-import type { ModelUsage } from './job-context.js';
+import type { ModelUsage, PipelineBatch } from './job-context.js';
+import { outboxEntry } from '../delivery/job-queue.js';
+import { pipelineKey } from './pipeline-keys.js';
 
 const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
 
@@ -41,6 +43,22 @@ const REDRIVE_RESET = {
   startedAt: null,
   finishedAt: null,
 } satisfies Prisma.JobUpdateManyMutationInput;
+
+// Postgres binds at most 65 535 parameters a statement, and a job row binds
+// about ten.
+const INSERT_CHUNK = 1000;
+
+// A 50 MB file can fan out into tens of thousands of batches, written in one
+// transaction so a retry finds all of them or none: far past Prisma's default
+// of 5 s.
+const FAN_OUT_TIMEOUT_MS = 60_000;
+
+interface FanningOut {
+  userId: string;
+  correlationId: string;
+  pipelineId: string | null;
+  pendingInPipeline: boolean;
+}
 
 interface MoveOptions {
   client?: Prisma.TransactionClient;
@@ -394,6 +412,88 @@ export class JobTransitionService {
 
       throw error;
     }
+  }
+
+  /**
+   * Writes a pipeline's batches as jobs, their outbox rows, and the raise of
+   * the pipeline's counter, in one transaction (§6.3e). Guarded by the lease
+   * like every other write a worker makes.
+   *
+   * The job is read under a share lock: its terminal transition — the one
+   * write that gives its place in the pipeline up — waits for this commit, or
+   * this read waits for it. Either way the counter is never raised for a
+   * pipeline whose last place has just been given up.
+   *
+   * @returns how many batches were written, and whether the job held its place
+   * at all; `null` when this attempt no longer owns the job.
+   */
+  fanOut(jobId: string, lease: number, batches: PipelineBatch[]) {
+    return this.prisma.$transaction(
+      async (tx) => {
+        const [job] = await tx.$queryRaw<FanningOut[]>`
+          SELECT "userId", "correlationId", "pipelineId", "pendingInPipeline"
+          FROM "Job"
+          WHERE "id" = ${jobId}::uuid AND "status" = 'RUNNING' AND "lease" = ${lease}
+          FOR SHARE`;
+
+        if (!job) {
+          return null;
+        }
+
+        const { userId, correlationId, pipelineId, pendingInPipeline } = job;
+
+        if (!pendingInPipeline || pipelineId === null) {
+          return { holding: false, written: 0 };
+        }
+
+        const numbered = new Map<string, number>();
+        const rows = batches.map(({ stage, type, payload }) => {
+          const n = numbered.get(stage) ?? 0;
+
+          numbered.set(stage, n + 1);
+
+          return {
+            userId,
+            correlationId,
+            pipelineId,
+            pendingInPipeline: true,
+            idempotencyKey: pipelineKey(pipelineId, stage, n),
+            type,
+            payload,
+          };
+        });
+
+        let written = 0;
+
+        for (let start = 0; start < rows.length; start += INSERT_CHUNK) {
+          // A batch an earlier attempt wrote is skipped, not returned, so only
+          // the new ones get an outbox row and a place in the counter.
+          const created = await tx.job.createManyAndReturn({
+            data: rows.slice(start, start + INSERT_CHUNK),
+            skipDuplicates: true,
+            select: { id: true, type: true, maxAttempts: true },
+          });
+
+          if (created.length > 0) {
+            await tx.outbox.createMany({
+              data: created.map((child) => outboxEntry(child, correlationId)),
+            });
+          }
+
+          written += created.length;
+        }
+
+        if (written > 0) {
+          await tx.pipeline.update({
+            where: { id: pipelineId },
+            data: { pendingChildren: { increment: written } },
+          });
+        }
+
+        return { holding: true, written };
+      },
+      { timeout: FAN_OUT_TIMEOUT_MS },
+    );
   }
 
   /**

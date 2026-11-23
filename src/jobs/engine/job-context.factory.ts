@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import type { Prisma } from '../../generated/prisma/client.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from '../events/job-events.publisher.js';
-import type { JobContext, ModelUsage } from './job-context.js';
+import type { JobContext, ModelUsage, PipelineBatch } from './job-context.js';
 import { JobCancelledError } from './job-handler.js';
 import { readProgress, type JobProgress } from './job-progress.js';
 import { describeError } from '../../common/errors/describe-error.js';
@@ -36,6 +36,16 @@ interface RunningJob {
 
   /** Whether the worker running it is shutting down; never, by default. */
   stopping?: () => boolean;
+
+  /** The pipeline the job belongs to; none, by default. */
+  pipelineId?: string | null;
+
+  /**
+   * Fails a first attempt right after its fan-out commits, as a worker that
+   * died there would leave it, so A23 can watch the retry write it again.
+   * Never set in production.
+   */
+  failAfterFanOut?: boolean;
 }
 
 /**
@@ -54,8 +64,10 @@ class RunningJobContext implements ManagedJobContext {
   readonly attempt: number;
   readonly lastAttempt: boolean;
   readonly checkpoint: Prisma.JsonValue | null;
+  readonly pipelineId: string | null;
   private readonly lease: number;
   private readonly stopping: () => boolean;
+  private readonly failAfterFanOut: boolean;
 
   // The highest count accepted so far, and the last `total`/`message` seen —
   // both seeded from the claimed row. The seed spares the database the writes
@@ -102,8 +114,10 @@ class RunningJobContext implements ManagedJobContext {
     this.attempt = job.attempt;
     this.lastAttempt = job.lastAttempt;
     this.checkpoint = job.checkpoint;
+    this.pipelineId = job.pipelineId;
     this.lease = job.lease;
     this.stopping = job.stopping;
+    this.failAfterFanOut = job.failAfterFanOut;
 
     const stored = readProgress(job.progress);
 
@@ -173,6 +187,40 @@ class RunningJobContext implements ManagedJobContext {
 
   recordModelUsage(usage: ModelUsage) {
     return this.transitions.addModelUsage(this.jobId, usage);
+  }
+
+  async fanOut(batches: PipelineBatch[]) {
+    if (this.pipelineId === null) {
+      throw new Error(`Job ${this.jobId} belongs to no pipeline`);
+    }
+
+    const outcome = await this.transitions.fanOut(
+      this.jobId,
+      this.lease,
+      batches,
+    );
+
+    if (!outcome) {
+      throw new JobCancelledError();
+    }
+
+    if (!outcome.holding) {
+      this.log(
+        'holds no place in its pipeline any more, so writes none of its batches',
+      );
+
+      return 0;
+    }
+
+    this.log(
+      `fanned out ${outcome.written} new of ${batches.length} batch(es)`,
+    );
+
+    if (this.failAfterFanOut && this.attempt === 1) {
+      throw new Error('Injected fault: fanned out, then failed the attempt');
+    }
+
+    return outcome.written;
   }
 
   log(message: string) {
@@ -297,10 +345,12 @@ export class JobContextFactory {
   create({
     lastAttempt = false,
     stopping = () => false,
+    pipelineId = null,
+    failAfterFanOut = false,
     ...job
   }: RunningJob): ManagedJobContext {
     return new RunningJobContext(
-      { ...job, lastAttempt, stopping },
+      { ...job, lastAttempt, stopping, pipelineId, failAfterFanOut },
       this.transitions,
       this.events,
       this.logger,

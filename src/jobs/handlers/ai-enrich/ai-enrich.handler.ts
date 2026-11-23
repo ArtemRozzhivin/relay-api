@@ -16,7 +16,7 @@ import {
   type CheckedReply,
   type Enrichment,
 } from '../../../enrichment/enrichment-reply.js';
-import { hashEnrichmentInput } from '../../../enrichment/enrichment-input.js';
+import { isEnrichedForCurrentText } from '../../../products/product-state.js';
 
 type Target = Awaited<ReturnType<ProductsService['forEnrichment']>>[number];
 
@@ -48,13 +48,7 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
     // free (A21). A FAILED one is asked again: a model answers differently
     // from one request to the next, and naming the sku again is how its owner
     // asks.
-    const todo = found.filter(
-      (product) =>
-        !(
-          product.enrichmentStatus === 'READY' &&
-          product.enrichmentInputHash === hashEnrichmentInput(product)
-        ),
-    );
+    const todo = found.filter((product) => !isEnrichedForCurrentText(product));
 
     let enriched = 0;
     let failed = 0;

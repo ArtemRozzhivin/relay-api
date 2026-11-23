@@ -859,8 +859,11 @@ partial failure as a first-class outcome.
   Specified first (§4.9, §6.3e): how a pipeline starts, what its import fans out into, and
   when it finishes. `Job` gains `pipelineId` and `pendingInPipeline`, the flag that lets each
   job take one off the counter once.
-- [ ] **E.2 · Children are our own rows** (D24), each with a **server-minted deterministic**
+- [x] **E.2 · Children are our own rows** (D24), each with a **server-minted deterministic**
   idempotency key `pipeline:<id>:<stage>:<batch>` (D23), enqueued through the outbox.
+  `POST /pipelines` writes the pipeline and its import; the import ends by fanning out the
+  products its file names into the batches they need, in one transaction. A23 fails the import
+  after its fan-out and proves the retry writes nothing twice.
   ```
   _`FlowProducer` would make Redis a second source of truth for pipeline structure and its
   children would bypass the outbox. Minting the key server-side also means

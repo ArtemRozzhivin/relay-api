@@ -71,6 +71,7 @@ export const workerEnvSchema = sharedEnvSchema.extend({
   AI_QUEUE_LIMIT_DURATION_MS: z.coerce.number().int().min(100).default(60_000),
   RELAY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1000).default(60_000),
   RELAY_FAULT_SKIP_ABANDON: z.stringbool().default(false),
+  RELAY_FAULT_AFTER_FAN_OUT: z.stringbool().default(false),
 });
 
 export type SharedEnv = z.infer<typeof sharedEnvSchema>;

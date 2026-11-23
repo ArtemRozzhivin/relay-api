@@ -63,6 +63,17 @@ export class IdempotencyKeyRequiredError extends AppError {
   }
 }
 
+export class IdempotencyKeyReservedError extends AppError {
+  readonly kind = 'VALIDATION' as const;
+  readonly code = 'IDEMPOTENCY_KEY_RESERVED';
+
+  constructor(prefix: string) {
+    super(
+      `An Idempotency-Key may not begin with "${prefix}", which the keys of a pipeline's own jobs use`,
+    );
+  }
+}
+
 // 422, not 409: the request is well-formed and nothing is in the way of it —
 // it is unprocessable as what it claims to be, a retry, because the body
 // differs from the one the key was first used with (D28).
@@ -91,6 +102,15 @@ export class ErrorReportNotFoundError extends AppError {
 // 422 like a reused key: the body is well-formed, but what it names is not
 // there. One answer for "not yours" and "not uploaded", so a probe for another
 // tenant's key learns nothing from the difference.
+export class PipelineNotFoundError extends AppError {
+  readonly kind = 'NOT_FOUND' as const;
+  readonly code = 'PIPELINE_NOT_FOUND';
+
+  constructor() {
+    super('Pipeline not found');
+  }
+}
+
 export class UploadNotFoundError extends AppError {
   readonly kind = 'UNPROCESSABLE' as const;
   readonly code = 'UPLOAD_NOT_FOUND';

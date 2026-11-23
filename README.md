@@ -40,6 +40,7 @@ nothing.
 | A provider's rate limit slows only the jobs that call it  | AI jobs limited to 1 a second; other jobs run at once (A29)       |
 | A busy AI provider slows the queue and fails no job       | A 429 on a one-attempt job: the queue waits, the job runs (A20)   |
 | Enriching an unchanged product again costs nothing        | A second run on the same text asks the model nothing (A21)        |
+| A pipeline writes each of its batches once                | The import fails after writing them; the retry writes none (A23)  |
 
 The full list, with the SQL each test checks, is §14 of the
 [technical specification](docs/TECH_SPEC.md#14-verification-plan).

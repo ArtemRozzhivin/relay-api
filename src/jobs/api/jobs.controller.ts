@@ -31,13 +31,15 @@ import {
 } from '../jobs.schema.js';
 
 // The fingerprint is how the API recognises a retry (D28), the lease is how
-// workers recognise each other (D7), and the checkpoint is where a handler
-// resumes (D26); none is part of the job a client sees, and a field in a
-// response is a field clients come to rely on.
+// workers recognise each other (D7), the checkpoint is where a handler resumes
+// (D26), and the pipeline flag is how its counter counts each job once (D24);
+// none is part of the job a client sees, and a field in a response is a field
+// clients come to rely on.
 const toJobView = ({
   requestHash: _requestHash,
   lease: _lease,
   checkpoint: _checkpoint,
+  pendingInPipeline: _pendingInPipeline,
   tokensIn,
   tokensOut,
   estimatedCostUsd,

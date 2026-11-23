@@ -26,6 +26,7 @@ import type { Prisma } from '../../src/generated/prisma/client.js';
 import { recordingContext } from '../../src/jobs/engine/job-context.fixture.js';
 import { TerminalJobError } from '../../src/common/errors/app-error.js';
 import { postUploadForm } from '../support/upload-form.js';
+import { hashEnrichmentInput } from '../../src/enrichment/enrichment-input.js';
 import {
   createTestModule,
   createThrowawayUser,
@@ -65,7 +66,11 @@ describe('the import.csv handler', () => {
   const run = (
     userId: string,
     key: string,
-    options: { stopAfterChecks?: number; checkpoint?: Prisma.JsonValue } = {},
+    options: {
+      stopAfterChecks?: number;
+      checkpoint?: Prisma.JsonValue;
+      pipelineId?: string;
+    } = {},
   ) => {
     const recorded = recordingContext({ userId, client: prisma, ...options });
 
@@ -521,6 +526,105 @@ describe('the import.csv handler', () => {
       expect(again.lines).toContain(
         'checkpoint unreadable; importing from the top',
       );
+    });
+  });
+
+  // §6.3e: an import that belongs to a pipeline ends by handing its products
+  // on, as batches of the stages each still needs.
+  describe('in a pipeline', () => {
+    const PIPELINE = 'a-pipeline';
+
+    it('fans out the products of its valid rows, in file order, each once, to the stages they need', async () => {
+      const userId = await store();
+
+      // Enriched already for the text the file gives it again.
+      await prisma.product.create({
+        data: {
+          userId,
+          sku: 'C-3',
+          name: 'Desk',
+          priceCents: 100,
+          currency: 'EUR',
+          enrichmentStatus: 'READY',
+          category: 'home',
+          enrichmentInputHash: hashEnrichmentInput({
+            name: 'Desk',
+            description: null,
+          }),
+        },
+      });
+
+      const key = await upload(
+        userId,
+        [
+          'sku,name,price,currency,imageUrl',
+          'B-1,Lamp,1,EUR,https://shop.example/b.jpg',
+          'A-2,Chair,1,EUR,',
+          'BAD,,x,EUR,',
+          'C-3,Desk,1,EUR,',
+          'B-1,Lamp,1,EUR,https://shop.example/b.jpg',
+        ].join('\n'),
+      );
+
+      const { result, fannedOut } = run(userId, key, { pipelineId: PIPELINE });
+
+      expect(await result).toMatchObject({
+        imported: 3,
+        invalid: 1,
+        batches: { enrich: 1, images: 1 },
+      });
+      expect(fannedOut).toEqual([
+        [
+          {
+            stage: 'enrich',
+            type: 'ai.enrich',
+            payload: { skus: ['B-1', 'A-2'] },
+          },
+          {
+            stage: 'images',
+            type: 'image.process',
+            payload: { skus: ['B-1'] },
+          },
+        ],
+      ]);
+    });
+
+    it('fans out the rows before its checkpoint too, when it resumes', async () => {
+      const userId = await store();
+      const key = await upload(userId, rowsOf(1200));
+      const first = run(userId, key, {
+        pipelineId: PIPELINE,
+        stopAfterChecks: 1,
+      });
+
+      await expect(first.result).rejects.toBeInstanceOf(JobCancelledError);
+      expect(first.fannedOut).toEqual([]);
+
+      const again = run(userId, key, {
+        pipelineId: PIPELINE,
+        checkpoint: first.checkpoints.at(-1) as Prisma.JsonValue,
+      });
+
+      expect(await again.result).toMatchObject({
+        batches: { enrich: 60, images: 0 },
+      });
+
+      const skus = again.fannedOut
+        .flat()
+        .flatMap(({ payload }) => ('skus' in payload ? payload.skus : []));
+
+      expect(skus).toHaveLength(1200);
+      expect(skus.slice(0, 2)).toEqual(['SKU-0', 'SKU-1']);
+      expect(skus.at(-1)).toBe('SKU-1199');
+    });
+
+    it('fans out nothing when it belongs to no pipeline', async () => {
+      const userId = await store();
+      const key = await upload(userId, rowsOf(3));
+      const { result, fannedOut } = run(userId, key);
+
+      expect(await result).not.toHaveProperty('batches');
+      expect(fannedOut).toEqual([]);
     });
   });
 });
