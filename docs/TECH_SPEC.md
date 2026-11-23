@@ -166,7 +166,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 |---|---|---|
 | `id` | `uuid` | PK. This is the id returned to the client and the only thing put on the queue (§8.3) |
 | `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE` |
-| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` \| `import.csv` \| `image.process` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
+| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` \| `import.csv` \| `image.process` \| `ai.enrich` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
 | `payload` | `jsonb` | Validated per-type at the edge (§6.4) |
 | `status` | `JobStatus` enum | See §5 |
 | `attempts` | `int` | Default `0`. Incremented by the worker when it *claims* the job. The retry budget, reset by a re-drive — so **not** the ownership token |
@@ -185,6 +185,8 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `updatedAt` | `timestamptz(6)` | |
 | `startedAt` | `timestamptz(6)?` | The latest claim. Cleared by a re-drive |
 | `finishedAt` | `timestamptz(3)?` | Terminal transition. Milliseconds, like `createdAt`: the dead-letter list's cursor carries it through a JS `Date` too (D14) |
+| `tokensIn`, `tokensOut` | `int` | Default `0`. What the job's requests to a language model used, over every attempt and life (§6.3d). Added to as each reply arrives, never reset — not by a re-drive either |
+| `estimatedCostUsd` | `numeric(12,6)` | Default `0`. What those replies cost at the provider's price when each arrived. A number in a response, under `modelUsage` with the two counts |
 
 **Indexes**
 
@@ -205,7 +207,8 @@ every line of application code is wrong; constraints listed as **APP** are polic
   is written in SQL with the status in it, for the reason above: as a Prisma query it read every
   job.
 
-**DB** `CHECK (attempts >= 0)`.
+**DB** `CHECK (attempts >= 0)`. **DB** `CHECK` that `tokensIn`, `tokensOut` and `estimatedCostUsd`
+are never negative.
 
 **DB** `CHECK ((status IN ('QUEUED','RUNNING')) = (finishedAt IS NULL))` — a job has a
 `finishedAt` exactly when it is finished. Every transition into `SUCCEEDED`, `DEAD_LETTERED` or
@@ -374,7 +377,9 @@ to guard. Revisit if the status stream turns out to be unreadable without it (§
 
 **Every write a worker makes on a claimed job carries `lease = <the lease it claimed>`** — each
 transition above, a progress report, a checkpoint and an effect alike — so an attempt that lost the
-job, to a redelivery or to a re-drive, writes nothing over whoever holds it now.
+job, to a redelivery or to a re-drive, writes nothing over whoever holds it now. One write is
+exempt: the model usage (§6.3d) is a total that only grows, so an increment overwrites nobody's
+value, and what an attempt that lost the job spent was spent all the same.
 
 **A job whose effect has committed is finished only by its handler.** The two cancels that run no
 handler cannot see whether a charge went through, so they refuse a job marked `effectCommitted`;
@@ -711,7 +716,14 @@ holding the name and description that were sent, so an import that changed them 
 The worker logs a line for each request to the model, under the job's id. _Built in D.3 and D.5._
 
 **Each job records its cost:** `tokensIn`, `tokensOut` and `estimatedCostUsd`, over all its
-requests, corrective ones included. _Built in D.6._
+requests, corrective ones included. They are columns of the job, added to as each reply arrives and
+before it is checked: a provider charges for a reply whether or not it is any use, and whether or
+not the attempt that asked goes on to succeed. Kept in the result instead, a retry, a 429 or a
+crash would take what it had spent with it. A refused request costs nothing and records nothing.
+The cost is the provider's `price` — dollars per million tokens, in and out — at the time; the fake
+charges nothing, but declares 1 and 5 so the estimate has something to show. `GET /jobs/:id` shows
+them for every job as `modelUsage: { tokensIn, tokensOut, estimatedCostUsd }`, zeros for a job that
+asked no model. _Built in D.6._
 
 **The provider is an interface,** `LlmProvider`, and PD builds one implementation:
 `FakeLlmProvider`, deterministic, with no key and no cost. A real model fails rarely and costs
@@ -1716,7 +1728,7 @@ cases.
 | **A18** | **Image batches do not self-stall.** Five batches of 20 of the heaviest image the limits allow, at the worker's concurrency of 5, timed by a probe inside the real worker | Zero `stalled` events and every product `READY`; event-loop delay and Redis round trip under 1 s, against the 15 s a renewal may be late. A single 40 s main-thread freeze fails it with 5 stalls (D10) | PC |
 | **A19** | **LLM output is untrusted input.** The fake model answers one batch with a category outside the list, and another with cut-off JSON, the corrective request included | Both jobs `SUCCEEDED` on attempt 1. Nothing is written for those products: `enrichmentStatus = 'FAILED'` with the reason, no category, no tags, and the reason shown in `GET /products`; the other product in the batch is `READY`. No `category` in the table is outside the list | PD |
 | **A20** | **Rate limits slow the queue, not the jobs.** 4 `ai.enrich` jobs of one attempt each, queued before a worker running one at a time; the fake model answers the first with a 429 and a `Retry-After` of 1 s | Every job `SUCCEEDED` at `attempts = 1`, every product `READY`. No job started within the second after the 429, and every one within 3 s of it: the queue waited as long as the provider asked, not a limiter window. The busy job ran again first | PD |
-| **A21** | **Re-enrichment of unchanged products is free.** Enrich 3 products, enrich them again, then once more after one product's description changed | Every job `SUCCEEDED`. The worker's log holds one request to the model for the first job, **none** for the second, with `alreadyReady = 3`, and one about 1 product for the third. `estimatedCostUsd` unchanged: checked once D.6 records it | PD |
+| **A21** | **Re-enrichment of unchanged products is free.** Enrich 3 products, enrich them again, then once more after one product's description changed | Every job `SUCCEEDED`. The worker's log holds one request to the model for the first job, **none** for the second, with `alreadyReady = 3`, and one about 1 product for the third. `modelUsage` shows the first job's cost, the second's as zero, and the third's below the first's | PD |
 | **A22** | **A failed child does not fail the pipeline.** Force one enrichment batch to fail | `Pipeline.status = 'completed_with_errors'`; sibling batches completed; the failed batch is re-drivable; no `Job` row carries `completed_with_errors` | PE |
 | **A23** | **The fan-out is idempotent.** Replay the fan-out for a pipeline | One `Job` row per `(stage, batch)`; the duplicate attempt is refused by `UNIQUE (userId, idempotencyKey)` | PE |
 | **A24** | **The parent cannot be lost.** Crash between the last child committing and the parent being enqueued | The relay publishes the parent's outbox row; the pipeline finalizes exactly once | PE |
@@ -2441,6 +2453,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-20 | §4.3, §5.2, §6.3d, §14 — each job's model usage, D.6, which closes PD. `Job` gains `tokensIn`, `tokensOut` and `estimatedCostUsd`, added to as each reply arrives, by any attempt — the one write exempt from the lease — and never reset. `LlmProvider` declares its `price`. `GET /jobs/:id` shows them as `modelUsage`, the cost a number. A21 checks the cost. §4.3 listed four job types; it lists five. |
 | 2026-11-20 | §6.3d, §14 — an unchanged product is skipped, D.5. A product `READY` for the hash of its current text is not sent to the model, and the result counts it as `alreadyReady`; a `FAILED` one is asked again. What the first reply answered is recorded before the corrective request, so a 429 on that request costs only the rest on the next run. A line in the worker's log for every request to the model. A21 automated; its cost check waits for D.6. The assertion harness clears each queue's limiter window as a file starts: one left by an earlier file's AI jobs held A29's worker back for the rest of a minute. |
 | 2026-11-20 | §5.2, §6.3d, §12, §14 — a provider's 429, D.4. The handler turns it into `JobRateLimitedError`; the processor pauses the job's queue in Redis for the `Retry-After`, at least a second, and hands the attempt back uncounted, the job at the head of the queue — on the last attempt too. Only a queue with a limiter can be paused; elsewhere the error is an ordinary failure. `queue.rateLimit`, since `worker.rateLimit` is deprecated. Attempts gain the outcome `rate_limited`. A20 automated. |
 | 2026-11-19 | §4.5, §6.3d, §8.1, §8.4, §10.1, §11, §12, §14, §16 — `relay-ai`, D.2; D6a decided for `ai.enrich`. A job's queue is chosen by its type when its outbox row is written, and recorded there: the direct path, the relay, the sweep, cancel and the stall log all read the entry from that queue. The worker runs a processor per queue — the logic shared, the options apart — and `relay-ai`'s has a limiter, 20 jobs a minute across every worker, and 2 at once per worker. `relay_queue_depth` gains a `queue` label. The worker loads `.env` before its modules, so a processor option set there — `WORKER_CONCURRENCY` included, which `.env` could not set before — takes effect. A29 registered and automated. |

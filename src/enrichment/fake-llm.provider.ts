@@ -50,6 +50,13 @@ const tokens = (text: string) => Math.ceil(text.length / CHARACTERS_PER_TOKEN);
 export class FakeLlmProvider implements LlmProvider {
   readonly model = 'fake';
 
+  // The fake charges nothing. A price in the range small hosted models charge
+  // gives the cost a job records something to show.
+  readonly price = {
+    inputUsdPerMillionTokens: 1,
+    outputUsdPerMillionTokens: 5,
+  };
+
   private readonly refusedAsBusy = new Set<string>();
 
   async enrich(request: LlmRequest) {

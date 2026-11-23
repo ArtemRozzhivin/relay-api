@@ -117,6 +117,22 @@ export interface JobContext {
     work: (tx: Prisma.TransactionClient) => Promise<T>,
   ): Promise<T>;
 
+  /**
+   * Adds what one request to a language model used to the job's totals, read
+   * by a client from `GET /jobs/:id`. Call it as each reply arrives, before
+   * anything is made of it: the provider charged for it either way.
+   *
+   * Recorded whichever attempt holds the job, unlike every other write: what
+   * an attempt that lost the job spent was spent all the same.
+   */
+  recordModelUsage(usage: ModelUsage): Promise<void>;
+
   /** Writes one line tagged with the job, the attempt and the request that submitted it. */
   log(message: string): void;
+}
+
+export interface ModelUsage {
+  tokensIn: number;
+  tokensOut: number;
+  estimatedCostUsd: number;
 }

@@ -38,8 +38,20 @@ const toJobView = ({
   requestHash: _requestHash,
   lease: _lease,
   checkpoint: _checkpoint,
+  tokensIn,
+  tokensOut,
+  estimatedCostUsd,
   ...job
-}: Job) => job;
+}: Job) => ({
+  ...job,
+  // A number, not the Decimal's string: a millionth of a dollar is well
+  // within what a double holds exactly enough.
+  modelUsage: {
+    tokensIn,
+    tokensOut,
+    estimatedCostUsd: estimatedCostUsd.toNumber(),
+  },
+});
 
 @Controller('jobs')
 export class JobsController {

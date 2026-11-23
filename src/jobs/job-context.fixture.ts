@@ -1,6 +1,6 @@
 import type { Prisma } from '../generated/prisma/client.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
-import type { JobContext } from './job-context.js';
+import type { JobContext, ModelUsage } from './job-context.js';
 import type { JobProgress } from './job-progress.js';
 
 /**
@@ -34,6 +34,7 @@ export const recordingContext = ({
   const reports: JobProgress[] = [];
   const lines: string[] = [];
   const checkpoints: Prisma.InputJsonValue[] = [];
+  const usages: ModelUsage[] = [];
   let checks = 0;
 
   const context: JobContext = {
@@ -68,10 +69,20 @@ export const recordingContext = ({
 
       return client.$transaction((tx) => work(tx));
     },
+    recordModelUsage: async (usage) => {
+      usages.push(usage);
+    },
     log: (message) => {
       lines.push(message);
     },
   };
 
-  return { context, reports, lines, checkpoints, checks: () => checks };
+  return {
+    context,
+    reports,
+    lines,
+    checkpoints,
+    usages,
+    checks: () => checks,
+  };
 };

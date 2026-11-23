@@ -15,7 +15,8 @@ const SKUS = ['SKU-0', 'SKU-1', 'SKU-2'];
 // A21 — enriching products again costs nothing for those whose text has not
 // changed since their answer (§6.3d). The worker's log has a line for every
 // request to the model, written by the one method that makes them, so the
-// requests a job made are the lines under its id.
+// requests a job made are the lines under its id; what they cost is on the job,
+// as a client reads it.
 describe('A21 · re-enriching unchanged products asks the model nothing', () => {
   let harness: RelayHarness;
   let account: Account;
@@ -52,6 +53,19 @@ describe('A21 · re-enriching unchanged products asks the model nothing', () => 
       // Past the prefix the context gives every line of a job.
       .map((line) => line.msg.replace(/^Job \S+ attempt \d+ /, ''));
 
+  // What the job's requests used, from GET /jobs/:id.
+  const usageOf = async (jobId: string) => {
+    const { status, body } = await harness.fetchJob(account, jobId);
+
+    expect(status).toBe(200);
+
+    return body.data.modelUsage as {
+      tokensIn: number;
+      tokensOut: number;
+      estimatedCostUsd: number;
+    };
+  };
+
   beforeAll(async () => {
     harness = await RelayHarness.create();
     await harness.startApi();
@@ -83,6 +97,12 @@ describe('A21 · re-enriching unchanged products asks the model nothing', () => 
       'asking the model about 3 product(s)',
     ]);
 
+    const firstUsage = await usageOf(first.id);
+
+    expect(firstUsage.tokensIn).toBeGreaterThan(0);
+    expect(firstUsage.tokensOut).toBeGreaterThan(0);
+    expect(firstUsage.estimatedCostUsd).toBeGreaterThan(0);
+
     const again = await enrich();
 
     expect(again).toMatchObject({
@@ -90,6 +110,11 @@ describe('A21 · re-enriching unchanged products asks the model nothing', () => 
       result: { enriched: 0, alreadyReady: 3 },
     });
     expect(requestsOf(again.id)).toEqual([]);
+    expect(await usageOf(again.id)).toEqual({
+      tokensIn: 0,
+      tokensOut: 0,
+      estimatedCostUsd: 0,
+    });
 
     // What an import does to a product whose row in the file changed.
     await harness.prisma.product.updateMany({
@@ -106,5 +131,13 @@ describe('A21 · re-enriching unchanged products asks the model nothing', () => 
     expect(requestsOf(changed.id)).toEqual([
       'asking the model about 1 product(s)',
     ]);
+
+    // Paid for one product's text, not three.
+    const changedUsage = await usageOf(changed.id);
+
+    expect(changedUsage.estimatedCostUsd).toBeGreaterThan(0);
+    expect(changedUsage.estimatedCostUsd).toBeLessThan(
+      firstUsage.estimatedCostUsd,
+    );
   });
 });

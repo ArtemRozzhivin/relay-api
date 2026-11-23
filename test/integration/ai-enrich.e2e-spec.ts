@@ -17,7 +17,9 @@ import { EnrichmentModule } from '../../src/enrichment/enrichment.module.js';
 import {
   LLM_PROVIDER,
   LlmRateLimitError,
+  estimateCostUsd,
   type LlmProvider,
+  type LlmReply,
   type LlmRequest,
 } from '../../src/enrichment/llm-provider.js';
 import { CATEGORIES } from '../../src/enrichment/taxonomy.js';
@@ -339,6 +341,45 @@ describe('the ai.enrich handler', () => {
       alreadyReady: 1,
     });
     expect(asked(enrich)).toEqual([['GADGET'], ['GADGET']]);
+  });
+
+  // D.6: what A21's cost check adds up, reply by reply.
+  it('records what every reply used, the corrective one included', async () => {
+    const userId = await store(['MUG', 'Mug [llm:malformed-once]']);
+    const enrich = vi.spyOn(llm, 'enrich');
+    const { context, usages } = recordingContext({ userId });
+
+    await handler.run(context, { skus: ['MUG'] });
+
+    const replies: LlmReply[] = await Promise.all(
+      enrich.mock.results.map(({ value }) => value),
+    );
+
+    expect(replies).toHaveLength(2);
+    expect(usages).toEqual(
+      replies.map(({ tokensIn, tokensOut }) => ({
+        tokensIn,
+        tokensOut,
+        estimatedCostUsd: estimateCostUsd(llm.price, { tokensIn, tokensOut }),
+      })),
+    );
+    expect(
+      usages.every(
+        ({ tokensIn, tokensOut, estimatedCostUsd }) =>
+          tokensIn > 0 && tokensOut > 0 && estimatedCostUsd > 0,
+      ),
+    ).toBe(true);
+  });
+
+  it('records nothing for a request the model refused as busy', async () => {
+    // Its own product: the fake refuses each busy product once a process.
+    const userId = await store(['STOOL', 'Stool [llm:busy]']);
+    const { context, usages } = recordingContext({ userId });
+
+    await expect(handler.run(context, { skus: ['STOOL'] })).rejects.toThrow(
+      JobRateLimitedError,
+    );
+    expect(usages).toEqual([]);
   });
 
   it('clears an earlier category when a later run fails', async () => {

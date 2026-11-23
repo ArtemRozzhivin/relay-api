@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD → PE → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE → PF → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -835,8 +835,9 @@ of failing jobs.
   ```
   _Re-running must cost nothing for unchanged products, and must never overwrite newer data._
   ```
-- [ ] **D.6 · Track** `tokensIn`, `tokensOut`, `estimatedCostUsd` per job, and add A21's cost
-  check.
+- [x] **D.6 · Track** `tokensIn`, `tokensOut`, `estimatedCostUsd` per job, and add A21's cost
+  check. Columns of the job, added to as each reply arrives by whichever attempt made it, and
+  shown as `modelUsage`; the provider declares its price.
 
 ### Done when
 

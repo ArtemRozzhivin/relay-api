@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import type { Prisma } from '../generated/prisma/client.js';
 import { JobTransitionService } from './job-transition.service.js';
 import { JobEventsPublisher } from './job-events.publisher.js';
-import type { JobContext } from './job-context.js';
+import type { JobContext, ModelUsage } from './job-context.js';
 import { JobCancelledError } from './job-handler.js';
 import { readProgress, type JobProgress } from './job-progress.js';
 import { describeError } from '../common/errors/describe-error.js';
@@ -169,6 +169,10 @@ class RunningJobContext implements ManagedJobContext {
       this.stopping() ||
       !(await this.transitions.isWanted(this.jobId, this.lease))
     );
+  }
+
+  recordModelUsage(usage: ModelUsage) {
+    return this.transitions.addModelUsage(this.jobId, usage);
   }
 
   log(message: string) {

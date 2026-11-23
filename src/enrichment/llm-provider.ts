@@ -23,6 +23,23 @@ export interface LlmReply {
   tokensOut: number;
 }
 
+/** What a model charges, in US dollars per million tokens each way. */
+export interface ModelPrice {
+  inputUsdPerMillionTokens: number;
+  outputUsdPerMillionTokens: number;
+}
+
+const TOKENS_PER_PRICE_UNIT = 1_000_000;
+
+/** What a reply cost at `price`, in US dollars. */
+export const estimateCostUsd = (
+  price: ModelPrice,
+  { tokensIn, tokensOut }: Pick<LlmReply, 'tokensIn' | 'tokensOut'>,
+) =>
+  (tokensIn * price.inputUsdPerMillionTokens +
+    tokensOut * price.outputUsdPerMillionTokens) /
+  TOKENS_PER_PRICE_UNIT;
+
 /**
  * A language model asked for each product's category and tags (§6.3d). It
  * returns the model's text as it came: checking it is the caller's job, so
@@ -31,8 +48,11 @@ export interface LlmReply {
  * @throws LlmRateLimitError when the provider is busy and says for how long.
  */
 export interface LlmProvider {
-  /** The model a request is priced by. */
   readonly model: string;
+
+  /** What {@link model} charges, which each job's estimated cost uses. */
+  readonly price: ModelPrice;
+
   enrich(request: LlmRequest): Promise<LlmReply>;
 }
 

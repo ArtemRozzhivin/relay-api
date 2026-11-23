@@ -6,8 +6,10 @@ import { ProductsService } from '../../products/products.service.js';
 import {
   LLM_PROVIDER,
   LlmRateLimitError,
+  estimateCostUsd,
   type EnrichmentInput,
   type LlmProvider,
+  type LlmReply,
 } from '../../enrichment/llm-provider.js';
 import {
   checkReply,
@@ -160,21 +162,31 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
       ({ sku, name, description }) => ({ sku, name, description }),
     );
 
+    let reply: LlmReply;
+
     try {
-      const { text } = await this.llm.enrich({
+      reply = await this.llm.enrich({
         products: sent,
         ...(correction === undefined ? {} : { correction }),
       });
-
-      return checkReply(
-        text,
-        products.map(({ sku }) => sku),
-      );
     } catch (error) {
       // A busy model pauses the queue rather than failing the attempt.
       throw error instanceof LlmRateLimitError
         ? new JobRateLimitedError(error.retryAfterMs)
         : error;
     }
+
+    // Before the reply is checked: a reply that fails every check was paid
+    // for like any other.
+    await context.recordModelUsage({
+      tokensIn: reply.tokensIn,
+      tokensOut: reply.tokensOut,
+      estimatedCostUsd: estimateCostUsd(this.llm.price, reply),
+    });
+
+    return checkReply(
+      reply.text,
+      products.map(({ sku }) => sku),
+    );
   }
 }
