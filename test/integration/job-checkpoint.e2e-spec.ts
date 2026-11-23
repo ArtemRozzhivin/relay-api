@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import type { Prisma } from '../../src/generated/prisma/client.js';
-import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
+import { JobTransitionService } from '../../src/jobs/engine/job-transition.service.js';
 import {
   createTestModule,
   createThrowawayUser,

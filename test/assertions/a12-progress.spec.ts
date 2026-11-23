@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
-import { readProgress } from '../../src/jobs/job-progress.js';
+import { readProgress } from '../../src/jobs/engine/job-progress.js';
 
 const JOBS = 3;
 const STEPS = 20;

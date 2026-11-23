@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
-import { AI_QUEUE } from '../../src/jobs/job-queue.js';
+import { AI_QUEUE } from '../../src/jobs/delivery/job-queue.js';
 
 const AI_JOBS = 4;
 const LIMIT_WINDOW_MS = 1000;

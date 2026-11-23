@@ -14,14 +14,17 @@ import {
   TerminalJobError,
 } from '../common/errors/app-error.js';
 import type { Job, Prisma } from '../generated/prisma/client.js';
-import type { JobContextFactory } from '../jobs/job-context.factory.js';
-import type { JobEventsPublisher } from '../jobs/job-events.publisher.js';
-import type { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
-import { JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
-import type { JobQueues } from '../jobs/job-queues.js';
-import type { JobTransitionService } from '../jobs/job-transition.service.js';
+import type { JobContextFactory } from '../jobs/engine/job-context.factory.js';
+import type { JobEventsPublisher } from '../jobs/events/job-events.publisher.js';
+import type { JobHandlerRegistry } from '../jobs/engine/job-handler.registry.js';
+import { JOBS_QUEUE, type JobMessage } from '../jobs/delivery/job-queue.js';
+import type { JobQueues } from '../jobs/delivery/job-queues.js';
+import type { JobTransitionService } from '../jobs/engine/job-transition.service.js';
 import type { WorkerEnv } from '../config/env.schema.js';
-import { JobCancelledError, JobRateLimitedError } from '../jobs/job-handler.js';
+import {
+  JobCancelledError,
+  JobRateLimitedError,
+} from '../jobs/engine/job-handler.js';
 import { JobsProcessor } from './jobs.processor.js';
 import { JobMetrics, type AttemptOutcome } from './job-metrics.js';
 

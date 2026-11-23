@@ -1,14 +1,14 @@
 import { Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
 import { ScheduleModule } from '@nestjs/schedule';
-import { JobsController } from './jobs.controller.js';
-import { JobsService } from './jobs.service.js';
+import { JobsController } from './api/jobs.controller.js';
+import { JobsService } from './api/jobs.service.js';
 import { JobCoreModule } from './job-core.module.js';
-import { AI_QUEUE, JOBS_QUEUE } from './job-queue.js';
-import { JobQueues } from './job-queues.js';
-import { OutboxRelayService } from './outbox-relay.service.js';
+import { AI_QUEUE, JOBS_QUEUE } from './delivery/job-queue.js';
+import { JobQueues } from './delivery/job-queues.js';
+import { OutboxRelayService } from './delivery/outbox-relay.service.js';
 import { StorageModule } from '../storage/storage.module.js';
-import { QueueMetrics } from './queue-metrics.js';
+import { QueueMetrics } from './delivery/queue-metrics.js';
 
 @Module({
   imports: [

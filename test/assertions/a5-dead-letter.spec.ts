@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
-import { JOBS_QUEUE } from '../../src/jobs/job-queue.js';
+import { JOBS_QUEUE } from '../../src/jobs/delivery/job-queue.js';
 
 // A5 — retries are bounded, an error no retry can fix skips them, the terminal
 // state records why, and re-drive is guarded by the transition rather than by

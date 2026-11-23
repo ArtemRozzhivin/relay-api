@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { JobStatus } from '../generated/prisma/enums.js';
-import { DEAD_LETTER_CODES } from './job-error-codes.js';
+import { DEAD_LETTER_CODES } from './engine/job-error-codes.js';
 import { UPLOAD_KEY_PATTERN } from '../storage/object-keys.js';
 import { cursorParam, limitParam } from '../common/pagination/cursor.js';
 import { storableText } from '../common/validation/storable-text.js';

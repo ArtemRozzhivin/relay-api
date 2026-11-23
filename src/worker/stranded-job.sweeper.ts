@@ -7,10 +7,10 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service.js';
-import { JobTransitionService } from '../jobs/job-transition.service.js';
-import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
-import { messageId, type OutboxMessage } from '../jobs/job-queue.js';
-import { JobQueues } from '../jobs/job-queues.js';
+import { JobTransitionService } from '../jobs/engine/job-transition.service.js';
+import { JobEventsPublisher } from '../jobs/events/job-events.publisher.js';
+import { messageId, type OutboxMessage } from '../jobs/delivery/job-queue.js';
+import { JobQueues } from '../jobs/delivery/job-queues.js';
 import type { JobStatus } from '../generated/prisma/enums.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';

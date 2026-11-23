@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
-import type { DeadLetterCode } from '../../src/jobs/job-error-codes.js';
+import type { DeadLetterCode } from '../../src/jobs/engine/job-error-codes.js';
 import { seedJob } from '../support/db.js';
 
 // A5c — the dead-letter family's third case: a filtered bulk re-drive revives

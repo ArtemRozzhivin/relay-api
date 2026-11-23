@@ -23,9 +23,9 @@ import {
   type LlmRequest,
 } from '../../src/enrichment/llm-provider.js';
 import { CATEGORIES } from '../../src/enrichment/taxonomy.js';
-import { AiEnrichJobHandler } from '../../src/jobs/handlers/ai-enrich.handler.js';
-import { JobRateLimitedError } from '../../src/jobs/job-handler.js';
-import { recordingContext } from '../../src/jobs/job-context.fixture.js';
+import { AiEnrichJobHandler } from '../../src/jobs/handlers/ai-enrich/ai-enrich.handler.js';
+import { JobRateLimitedError } from '../../src/jobs/engine/job-handler.js';
+import { recordingContext } from '../../src/jobs/engine/job-context.fixture.js';
 import {
   createTestModule,
   createThrowawayUser,

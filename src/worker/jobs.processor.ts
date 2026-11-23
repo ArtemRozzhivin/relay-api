@@ -8,13 +8,20 @@ import {
   type Job as QueueJob,
 } from 'bullmq';
 import { PinoLogger } from 'nestjs-pino';
-import { JobTransitionService } from '../jobs/job-transition.service.js';
-import { JobHandlerRegistry } from '../jobs/job-handler.registry.js';
-import { JobContextFactory } from '../jobs/job-context.factory.js';
-import { JobCancelledError, JobRateLimitedError } from '../jobs/job-handler.js';
-import { JobEventsPublisher } from '../jobs/job-events.publisher.js';
-import { AI_QUEUE, JOBS_QUEUE, type JobMessage } from '../jobs/job-queue.js';
-import { JobQueues } from '../jobs/job-queues.js';
+import { JobTransitionService } from '../jobs/engine/job-transition.service.js';
+import { JobHandlerRegistry } from '../jobs/engine/job-handler.registry.js';
+import { JobContextFactory } from '../jobs/engine/job-context.factory.js';
+import {
+  JobCancelledError,
+  JobRateLimitedError,
+} from '../jobs/engine/job-handler.js';
+import { JobEventsPublisher } from '../jobs/events/job-events.publisher.js';
+import {
+  AI_QUEUE,
+  JOBS_QUEUE,
+  type JobMessage,
+} from '../jobs/delivery/job-queue.js';
+import { JobQueues } from '../jobs/delivery/job-queues.js';
 import { AppError, TerminalJobError } from '../common/errors/app-error.js';
 import { workerEnvSchema, type WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';

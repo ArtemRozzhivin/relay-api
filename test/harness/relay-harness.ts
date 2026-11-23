@@ -11,7 +11,11 @@ import type {
   JobStatus,
   Prisma,
 } from '../../src/generated/prisma/client.js';
-import { JOBS_QUEUE, QUEUES, messageId } from '../../src/jobs/job-queue.js';
+import {
+  JOBS_QUEUE,
+  QUEUES,
+  messageId,
+} from '../../src/jobs/delivery/job-queue.js';
 import { postUploadForm } from '../support/upload-form.js';
 
 const QUEUE_PREFIX = 'bull:relay-jobs';

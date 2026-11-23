@@ -17,10 +17,10 @@ import { ProductsModule } from '../../src/products/products.module.js';
 import { ProductsService } from '../../src/products/products.service.js';
 import { OutboundModule } from '../../src/outbound/outbound.module.js';
 import { GuardedDownloader } from '../../src/outbound/guarded-download.js';
-import { ImageProcessJobHandler } from '../../src/jobs/handlers/image-process.handler.js';
-import { JobCancelledError } from '../../src/jobs/job-handler.js';
+import { ImageProcessJobHandler } from '../../src/jobs/handlers/image-process/image-process.handler.js';
+import { JobCancelledError } from '../../src/jobs/engine/job-handler.js';
 import { RetryableJobError } from '../../src/common/errors/app-error.js';
-import { recordingContext } from '../../src/jobs/job-context.fixture.js';
+import { recordingContext } from '../../src/jobs/engine/job-context.fixture.js';
 import { deleteProductImages } from '../support/product-images.js';
 import {
   createTestModule,

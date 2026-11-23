@@ -7,8 +7,8 @@ import { PrismaService } from '../../src/prisma/prisma.service.js';
 import {
   DEAD_LETTERS_BY_TYPE,
   QueueMetrics,
-} from '../../src/jobs/queue-metrics.js';
-import type { JobQueues } from '../../src/jobs/job-queues.js';
+} from '../../src/jobs/delivery/queue-metrics.js';
+import type { JobQueues } from '../../src/jobs/delivery/job-queues.js';
 import {
   createTestModule,
   createThrowawayUser,
