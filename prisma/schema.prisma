@@ -23,6 +23,7 @@ model User {
 
   refreshTokens RefreshToken[]
   jobs          Job[]
+  pipelines     Pipeline[]
   products      Product[]
   uploadSlips   UploadSlip[]
 }
@@ -50,49 +51,56 @@ enum JobStatus {
 }
 
 model Job {
-  id               String    @id @default(uuid()) @db.Uuid
-  userId           String    @db.Uuid
-  type             String
-  payload          Json
-  status           JobStatus @default(QUEUED)
-  attempts         Int       @default(0)
+  id                String    @id @default(uuid()) @db.Uuid
+  userId            String    @db.Uuid
+  type              String
+  payload           Json
+  status            JobStatus @default(QUEUED)
+  attempts          Int       @default(0)
   /// The ownership token: every claim increments it and nothing resets it, unlike
   /// `attempts`, which a re-drive resets — so no two deliveries ever share one (D7).
-  lease            Int       @default(0)
-  maxAttempts      Int       @default(5)
-  idempotencyKey   String
+  lease             Int       @default(0)
+  maxAttempts       Int       @default(5)
+  idempotencyKey    String
   /// SHA-256 of the canonical submit body: a reused key with a different body is
   /// a 422, not a replay (D28). NULL on rows from before it was stored.
-  requestHash      String?
-  result           Json?
-  error            Json?
-  progress         Json?
+  requestHash       String?
+  result            Json?
+  error             Json?
+  progress          Json?
   /// What the last committed batch recorded, so a retry or a re-drive resumes
   /// after it (D26). Written in the batch's own transaction; never sent to a client.
-  checkpoint       Json?
-  cancelRequested  Boolean   @default(false)
+  checkpoint        Json?
+  cancelRequested   Boolean   @default(false)
   /// Set in the transaction that commits the job's one irreversible effect; the
   /// job can then only be finished by its handler, never cancelled (§5.2). **DB** `CHECK`
-  effectCommitted  Boolean   @default(false)
-  correlationId    String
+  effectCommitted   Boolean   @default(false)
+  correlationId     String
   /// Milliseconds, not microseconds: the list's cursor carries it through a JS Date (D14).
-  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
-  updatedAt        DateTime  @updatedAt @db.Timestamptz(6)
-  startedAt        DateTime? @db.Timestamptz(6)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(6)
+  startedAt         DateTime? @db.Timestamptz(6)
   /// Milliseconds, like `createdAt`: the dead-letter list's cursor carries it through a JS Date.
-  finishedAt       DateTime? @db.Timestamptz(3)
+  finishedAt        DateTime? @db.Timestamptz(3)
   /// What the job's requests to a language model used, over every attempt and
   /// life: added to as each reply arrives, never reset (§6.3d). **DB** `CHECK`
-  tokensIn         Int       @default(0)
-  tokensOut        Int       @default(0)
+  tokensIn          Int       @default(0)
+  tokensOut         Int       @default(0)
   /// At the provider's price when the reply arrived.
-  estimatedCostUsd Decimal   @default(0) @db.Decimal(12, 6)
+  estimatedCostUsd  Decimal   @default(0) @db.Decimal(12, 6)
+  /// The pipeline the job belongs to: its import, a batch, or its finalize (§6.3e).
+  pipelineId        String?   @db.Uuid
+  /// Whether the job still holds one of its pipeline's `pendingChildren`: cleared in
+  /// the transaction of its first terminal transition, never set again (D24). **DB** `CHECK`
+  pendingInPipeline Boolean   @default(false)
 
   user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pipeline    Pipeline?    @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
   sideEffects SideEffect[]
   outbox      Outbox[]
 
   @@unique([userId, idempotencyKey])
+  @@index([pipelineId, type, status])
   @@index([userId, status, createdAt(sort: Desc), id(sort: Desc)])
   @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
   @@index([userId, status, finishedAt, id])
@@ -109,6 +117,37 @@ model SideEffect {
   job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
   @@index([jobId])
+}
+
+enum PipelineStatus {
+  RUNNING
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+}
+
+/// An import, the batches it fans out into, and the summary they converge on (§6.3e).
+model Pipeline {
+  id              String         @id @default(uuid()) @db.Uuid
+  userId          String         @db.Uuid
+  idempotencyKey  String
+  requestHash     String
+  correlationId   String
+  status          PipelineStatus @default(RUNNING)
+  /// Its jobs not yet finished for the first time, the import included; the
+  /// transaction that takes it to 0 enqueues `pipeline.finalize` (D24). **DB** `CHECK`
+  pendingChildren Int            @default(1)
+  /// Its jobs that did not succeed the first time they finished. **DB** `CHECK`
+  failedChildren  Int            @default(0)
+  summary         Json?
+  createdAt       DateTime       @default(now()) @db.Timestamptz(3)
+  /// Set exactly when the status is final. **DB** `CHECK`
+  finishedAt      DateTime?      @db.Timestamptz(3)
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobs Job[]
+
+  @@unique([userId, idempotencyKey])
 }
 
 model Outbox {

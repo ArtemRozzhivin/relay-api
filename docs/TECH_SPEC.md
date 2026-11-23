@@ -187,6 +187,8 @@ every line of application code is wrong; constraints listed as **APP** are polic
 | `finishedAt` | `timestamptz(3)?` | Terminal transition. Milliseconds, like `createdAt`: the dead-letter list's cursor carries it through a JS `Date` too (D14) |
 | `tokensIn`, `tokensOut` | `int` | Default `0`. What the job's requests to a language model used, over every attempt and life (§6.3d). Added to as each reply arrives, never reset — not by a re-drive either |
 | `estimatedCostUsd` | `numeric(12,6)` | Default `0`. What those replies cost at the provider's price when each arrived. A number in a response, under `modelUsage` with the two counts |
+| `pipelineId` | `uuid?` | **DB** FK → `Pipeline`, `ON DELETE CASCADE`. The pipeline the job belongs to: its import, its batches and its `pipeline.finalize` (§6.3e). `NULL` for a job submitted on its own |
+| `pendingInPipeline` | `boolean` | Default `false`. True while the job holds one of its pipeline's `pendingChildren`: set when the import or a batch is written, cleared in the transaction of the job's first terminal transition, which takes one off the counter (D24). Never set again, a re-drive included, so no job takes one off twice. Internal — never in a response. **DB** `CHECK (NOT pendingInPipeline OR pipelineId IS NOT NULL)` |
 
 **Indexes**
 
@@ -201,6 +203,8 @@ every line of application code is wrong; constraints listed as **APP** are polic
   10.1 ms, a re-drive batch of 1000 0.23 ms against 5.6 ms. Not partial: Prisma sends the status
   as `CAST($1::text AS "JobStatus")`, which the planner cannot match to an index's `WHERE`, so a
   partial index on dead letters was never chosen.
+- `(pipelineId, type, status)` — a pipeline's jobs, which `pipeline.finalize` reads and
+  `GET /pipelines/:id` counts (§6.3e).
 - `(status)` partial `WHERE status IN ('QUEUED','RUNNING')` — operational "what is in flight".
 - `(type)` partial `WHERE status = 'DEAD_LETTERED'` — the dead-letter count every metrics scrape
   takes across all accounts (§12.3), which no index leading with `userId` can serve. That count
@@ -340,6 +344,26 @@ records one: the file it allows goes straight to S3, past the API.
 **DB** index `(userId, createdAt)`. Signing a slip deletes the caller's rows older than a day, so
 the table holds a day's worth per account at most.
 
+### 4.9 `Pipeline` — phase E
+
+One row per `POST /pipelines`: an import, the batches it fans out into, and the summary they
+converge on (§6.3e). Its jobs are ordinary `Job` rows pointing at it (D24); the row holds only
+what is about all of them.
+
+| Column | Type | Constraints / notes |
+|---|---|---|
+| `id` | `uuid` | PK |
+| `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE` |
+| `idempotencyKey` | `text` | The client's, as on `Job` (D1). **DB** `UNIQUE (userId, idempotencyKey)` |
+| `requestHash` | `text` | SHA-256 of the request body, so a reused key with a different body is refused (D28). Internal — never in a response |
+| `correlationId` | `text` | The creating request's. Every job of the pipeline carries it, so one id finds the whole run in the logs of both processes (§12.1) |
+| `status` | `PipelineStatus` enum | `RUNNING`, then once `COMPLETED`, `COMPLETED_WITH_ERRORS` or `FAILED`, written by `pipeline.finalize` |
+| `pendingChildren` | `int` | Default `1`, for the import. How many of its jobs have not yet finished for the first time; the transaction that takes it to `0` enqueues `pipeline.finalize` (D24). Internal. **DB** `CHECK (pendingChildren >= 0)` |
+| `failedChildren` | `int` | Default `0`. How many of its jobs did not succeed the first time they finished. Internal. **DB** `CHECK (failedChildren >= 0)` |
+| `summary` | `jsonb?` | Written with the final status |
+| `createdAt` | `timestamptz(3)` | |
+| `finishedAt` | `timestamptz(3)?` | **DB** `CHECK ((status = 'RUNNING') = (finishedAt IS NULL))`, as on `Job` |
+
 ---
 
 ## 5. Job state machine
@@ -449,6 +473,8 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. Read a batch before sending it with `GET /jobs/dead-letters`. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
+| `POST` | `/pipelines` | access | **`202`** / `422` / `429` | An import that goes on to enrich and image the products it imported, then sums them up. `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`. The same `422`s and `429` as `POST /jobs` for an `import.csv`, a replay included. See §6.3e |
+| `GET` | `/pipelines/:id` | access | `200` | Its status, how many of its jobs of each type are in each status, and the summary once finished. 404 for a pipeline you don't own. See §6.3e |
 | `POST` | `/uploads` | access | `200` / `429` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. `429 TOO_MANY_UPLOADS` past 20 in 24 hours (D32). See §6.3a |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
@@ -752,6 +778,78 @@ has now — never enriched, or changed since — then `{ "status": "READY", "cat
 // result
 { "requested": 4, "enriched": 1, "failed": 1, "superseded": 0, "alreadyReady": 1, "notFound": ["X-9"] }
 ```
+
+### 6.3e Pipelines — an import that enriches and images what it imported (PE)
+
+`POST /pipelines` takes `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`.
+One transaction writes the `Pipeline` and its import: an ordinary `import.csv` job keyed
+`pipeline:<pipelineId>:import`, counted against the import cap like any other (D32). A replay, a
+reused key, a missing upload and a full cap are answered as `POST /jobs` answers them. `202` with
+the pipeline.
+
+**The fan-out.** An import in a pipeline ends, after its last batch and its error report, by
+reading the file once more for the skus of its valid rows, in file order, each once. Of their
+products, each not `READY` for its current name and description goes into an `ai.enrich` batch of
+20, and each with an `imageUrl` not `READY` for it into an `image.process` batch of 50 — the same
+skip the two handlers make, so no batch is made that would do nothing, and a re-import of an
+unchanged catalog makes none. A `FAILED` product goes in again: importing it again is naming it
+again, which is how a seller asks (§6.3c, §6.3d).
+
+Every batch is written in one transaction: the `Job` rows, their outbox rows, and
+`pendingChildren` raised by the number written. Each batch's idempotency key is minted by the
+server and deterministic — `pipeline:<id>:enrich:<n>`, `pipeline:<id>:images:<n>` (D23) — so an
+import that runs again after its fan-out committed, because its worker died before its success
+was recorded, writes nothing twice: `UNIQUE (userId, idempotencyKey)` refuses each batch it
+already made (A23). One transaction, so a replay finds every batch or none. It is guarded by the
+import's lease and by the import still holding its place in the pipeline, so neither a worker
+that lost the import nor a re-drive of the import after the pipeline finished fans out. The
+batches carry the pipeline's correlation id and reach their queues through the relay (§4.5).
+They count against no cap: the import that makes them does, and its file is at most 50 MB. A
+client's own `Idempotency-Key` may not begin with `pipeline:` (`400`): sharing the server's
+prefix, it could take a batch's key before the fan-out writes it.
+
+**The counter (D24).** `pendingChildren` starts at 1, for the import, and the fan-out raises it
+while the import still holds that 1, so it cannot reach zero before every batch exists. Each job
+of the pipeline takes one off in the transaction of its first terminal transition — `SUCCEEDED`,
+`DEAD_LETTERED` or `CANCELLED`, whoever writes it: the worker, a cancel, the sweep — and adds one
+to `failedChildren` unless it succeeded. That transaction clears the job's `pendingInPipeline`,
+so a job takes one off once: a re-drive afterwards does not count again. The transaction that
+takes the counter to zero also writes the `pipeline.finalize` job and its outbox row, keyed
+`pipeline:<id>:finalize`. There is no moment at which the last job has finished and nothing
+records that the parent is due: a crash after that commit leaves an outbox row the relay
+publishes (A24).
+
+**`pipeline.finalize`** is a job type no client submits. It reads the pipeline's jobs, then
+writes the pipeline's `status`, `summary` and `finishedAt` in one update conditional on the
+status still being `RUNNING`, so a second delivery changes nothing.
+
+| Status | When |
+|---|---|
+| `COMPLETED` | Every job of the pipeline succeeded the first time it finished |
+| `COMPLETED_WITH_ERRORS` | The import succeeded, and some job did not (A22) |
+| `FAILED` | The import has not succeeded when the pipeline finalizes, so not everything was fanned out |
+
+A product that failed inside a batch that succeeded is not an error of the pipeline: it is data
+in the summary, as an import's invalid rows are data in its result (D22).
+
+```jsonc
+// summary — products counted from the batches that succeeded
+{ "import": { "rows": 120, "imported": 118, "invalid": 2 },
+  "enrich": { "batches": 6, "failedBatches": 1, "enriched": 95, "failed": 3 },
+  "images": { "batches": 3, "failedBatches": 0, "processed": 110, "failed": 2 } }
+```
+
+**A failed batch** leaves its products as they were and is re-drivable like any dead letter (A22).
+A re-drive does not reopen its pipeline: the status says how the run went, and the products show
+what the re-drive did. A cancelled job of the pipeline counts as one that did not succeed; there
+is no cancel for a whole pipeline.
+
+`GET /pipelines/:id` answers with the status, the import's job id, how many of the pipeline's
+jobs of each type are in each status — which is how a client follows a run, and finds a failed
+batch — and the summary once finished.
+
+AI batches run at the AI queue's 20 a minute (§8.4): a 20 000-product import's 1 000 enrichment
+batches take 50 minutes, and the pipeline finishes when the last of them does.
 
 ### 6.4 Validation
 
@@ -2486,6 +2584,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-23 | §4.3, §4.9, §6.2, §6.3e — pipelines specified, E.1. `POST /pipelines` writes a `Pipeline` and its import; the import ends by fanning out into `ai.enrich` and `image.process` batches with server-minted keys, in one transaction; each job takes one off `pendingChildren` in the transaction of its first terminal transition, and the one that reaches zero writes `pipeline.finalize`, which sets the status once. `Job` gains `pipelineId` and `pendingInPipeline`. **New migration** `20261123100000_pipeline`. |
 | 2026-11-23 | §10.4 — `src/jobs` split into folders by the question each answers: `api/`, `engine/`, `delivery/`, `events/`, and one folder per job type under `handlers/`. Files moved and imports rewritten, nothing else. Imports point one way, and why there is no repository layer, recorded there. |
 | 2026-11-20 | §4.3, §5.2, §6.3d, §14 — each job's model usage, D.6, which closes PD. `Job` gains `tokensIn`, `tokensOut` and `estimatedCostUsd`, added to as each reply arrives, by any attempt — the one write exempt from the lease — and never reset. `LlmProvider` declares its `price`. `GET /jobs/:id` shows them as `modelUsage`, the cost a number. A21 checks the cost. §4.3 listed four job types; it lists five. |
 | 2026-11-20 | §6.3d, §14 — an unchanged product is skipped, D.5. A product `READY` for the hash of its current text is not sent to the model, and the result counts it as `alreadyReady`; a `FAILED` one is asked again. What the first reply answered is recorded before the corrective request, so a 429 on that request costs only the rest on the next run. A line in the worker's log for every request to the model. A21 automated; its cost check waits for D.6. The assertion harness clears each queue's limiter window as a file starts: one left by an earlier file's AI jobs held A29's worker back for the rest of a minute. |

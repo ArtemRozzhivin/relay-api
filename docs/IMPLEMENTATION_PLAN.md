@@ -855,7 +855,10 @@ partial failure as a first-class outcome.
 
 ### Tasks
 
-- [ ] **E.1 ·** `Pipeline` **model** with a `pendingChildren` counter and aggregate counts.
+- [x] **E.1 ·** `Pipeline` **model** with a `pendingChildren` counter and aggregate counts.
+  Specified first (§4.9, §6.3e): how a pipeline starts, what its import fans out into, and
+  when it finishes. `Job` gains `pipelineId` and `pendingInPipeline`, the flag that lets each
+  job take one off the counter once.
 - [ ] **E.2 · Children are our own rows** (D24), each with a **server-minted deterministic**
   idempotency key `pipeline:<id>:<stage>:<batch>` (D23), enqueued through the outbox.
   ```
