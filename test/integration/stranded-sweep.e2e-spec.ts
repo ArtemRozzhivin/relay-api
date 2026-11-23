@@ -9,10 +9,14 @@ import { LoggerModule, PinoLogger } from 'nestjs-pino';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { RedisModule } from '../../src/redis/redis.module.js';
-import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
-import { JobEventsPublisher } from '../../src/jobs/job-events.publisher.js';
-import { AI_QUEUE, JOBS_QUEUE, messageId } from '../../src/jobs/job-queue.js';
-import { JobQueues } from '../../src/jobs/job-queues.js';
+import { JobTransitionService } from '../../src/jobs/engine/job-transition.service.js';
+import { JobEventsPublisher } from '../../src/jobs/events/job-events.publisher.js';
+import {
+  AI_QUEUE,
+  JOBS_QUEUE,
+  messageId,
+} from '../../src/jobs/delivery/job-queue.js';
+import { JobQueues } from '../../src/jobs/delivery/job-queues.js';
 import {
   StrandedJobSweeper,
   type SweepCandidate,

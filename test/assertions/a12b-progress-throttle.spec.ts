@@ -4,8 +4,8 @@ import {
   type Account,
   type JobEvent,
 } from '../harness/relay-harness.js';
-import { readProgress } from '../../src/jobs/job-progress.js';
-import { REPORT_WINDOW_MS } from '../../src/jobs/job-context.factory.js';
+import { readProgress } from '../../src/jobs/engine/job-progress.js';
+import { REPORT_WINDOW_MS } from '../../src/jobs/engine/job-context.factory.js';
 
 // A12b — the throttle's two halves, end to end rather than against fake
 // timers: a handler reporting far faster than the window must not flood the

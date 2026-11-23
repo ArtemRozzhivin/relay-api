@@ -20,10 +20,10 @@ import {
   mintUploadKey,
 } from '../../src/storage/object-keys.js';
 import { ProductsModule } from '../../src/products/products.module.js';
-import { ImportCsvJobHandler } from '../../src/jobs/handlers/import-csv.handler.js';
-import { JobCancelledError } from '../../src/jobs/job-handler.js';
+import { ImportCsvJobHandler } from '../../src/jobs/handlers/import-csv/import-csv.handler.js';
+import { JobCancelledError } from '../../src/jobs/engine/job-handler.js';
 import type { Prisma } from '../../src/generated/prisma/client.js';
-import { recordingContext } from '../../src/jobs/job-context.fixture.js';
+import { recordingContext } from '../../src/jobs/engine/job-context.fixture.js';
 import { TerminalJobError } from '../../src/common/errors/app-error.js';
 import { postUploadForm } from '../support/upload-form.js';
 import {

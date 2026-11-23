@@ -1471,6 +1471,39 @@ middleware → guards → interceptors (pre) → pipes → handler → intercept
 - Nest 12 changed lifecycle-hook ordering to be by component hierarchy level. Nothing here should
   depend on `onModuleInit` order; if something starts to, make it explicit rather than implicit.
 
+### 10.4 Where the files are — written 2026-11-23
+
+A feature is a folder at the top of `src/` holding its module, as Nest lays them out. `src/jobs`
+is the one large enough to need folders of its own, one for each question a reader comes with:
+
+```
+src/jobs/
+├── jobs.module.ts        the API's side: the routes, the outbox relay, the queues' metrics
+├── job-core.module.ts    what both processes run: the engine and every handler (§10.1)
+├── jobs.schema.ts        the contract: the job types, their payloads, the request shapes
+├── api/                  a request becomes a job: controller, service, idempotency, caps
+├── engine/               how any job runs: handler base, registry, context, transitions
+├── delivery/             how a job reaches a worker: the queues, the outbox relay, metrics
+├── events/               what a job's change publishes for the socket (D8)
+└── handlers/<type>/      one folder per job type: its handler and the helpers only it uses
+```
+
+**Imports point one way.** `api/` may use `engine/`, `delivery/` and `events/`. Of `src/jobs`, a
+handler uses only `engine/` and `jobs.schema.ts`: never `api/`, never another handler. Only
+`jobs.module.ts` imports `api/`, and the worker never loads that module. A new job type is an option
+in `jobs.schema.ts`, a folder under `handlers/` and an entry in `job-core.module.ts`'s `HANDLERS`.
+
+**No repository layer.** Services call Prisma themselves. Prisma's client is already the typed data
+access a repository would wrap, and what this system guarantees lives in the queries: the lease in
+each `WHERE` (§5.3, §7.3), the conditional `updateMany`, the outbox row written in the job's
+transaction (§4.5). A repository would pass each call through unchanged or hide those conditions
+behind a name, and threading a transaction through it is a parameter on every method. Where the
+discipline a repository brings pays, it is already there: every write to a job's status goes through
+`JobTransitionService`, and every write to a product through `ProductsService`. The tests that prove
+the guarantees run on a real Postgres (§15.1), so nothing needs the database swapped out. An
+interface stands where something really is swapped: `LLM_PROVIDER`, a fake model now and a real one
+later (§6.3d). Revisit when a second store holds jobs.
+
 ---
 
 ## 11. Configuration
@@ -2453,6 +2486,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-23 | §10.4 — `src/jobs` split into folders by the question each answers: `api/`, `engine/`, `delivery/`, `events/`, and one folder per job type under `handlers/`. Files moved and imports rewritten, nothing else. Imports point one way, and why there is no repository layer, recorded there. |
 | 2026-11-20 | §4.3, §5.2, §6.3d, §14 — each job's model usage, D.6, which closes PD. `Job` gains `tokensIn`, `tokensOut` and `estimatedCostUsd`, added to as each reply arrives, by any attempt — the one write exempt from the lease — and never reset. `LlmProvider` declares its `price`. `GET /jobs/:id` shows them as `modelUsage`, the cost a number. A21 checks the cost. §4.3 listed four job types; it lists five. |
 | 2026-11-20 | §6.3d, §14 — an unchanged product is skipped, D.5. A product `READY` for the hash of its current text is not sent to the model, and the result counts it as `alreadyReady`; a `FAILED` one is asked again. What the first reply answered is recorded before the corrective request, so a 429 on that request costs only the rest on the next run. A line in the worker's log for every request to the model. A21 automated; its cost check waits for D.6. The assertion harness clears each queue's limiter window as a file starts: one left by an earlier file's AI jobs held A29's worker back for the rest of a minute. |
 | 2026-11-20 | §5.2, §6.3d, §12, §14 — a provider's 429, D.4. The handler turns it into `JobRateLimitedError`; the processor pauses the job's queue in Redis for the `Retry-After`, at least a second, and hands the attempt back uncounted, the job at the head of the queue — on the last attempt too. Only a queue with a limiter can be paused; elsewhere the error is an ordinary failure. `queue.rateLimit`, since `worker.rateLimit` is deprecated. Attempts gain the outcome `rate_limited`. A20 automated. |

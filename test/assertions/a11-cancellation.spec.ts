@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RelayHarness, type Account } from '../harness/relay-harness.js';
-import { readProgress } from '../../src/jobs/job-progress.js';
+import { readProgress } from '../../src/jobs/engine/job-progress.js';
 
 // A11 — a cancelled job stops at a safe point, and a cancel never strands a
 // job. Process-level, because the interesting cases are races between an HTTP

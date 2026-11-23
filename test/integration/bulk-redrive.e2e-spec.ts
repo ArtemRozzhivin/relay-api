@@ -4,9 +4,9 @@ import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
-import { JobTransitionService } from '../../src/jobs/job-transition.service.js';
+import { JobTransitionService } from '../../src/jobs/engine/job-transition.service.js';
 import type { JobStatus } from '../../src/generated/prisma/enums.js';
-import type { DeadLetterCode } from '../../src/jobs/job-error-codes.js';
+import type { DeadLetterCode } from '../../src/jobs/engine/job-error-codes.js';
 import { registerAndLogin, startApp } from '../support/http.js';
 import { deleteUsers, seedJob } from '../support/db.js';
 

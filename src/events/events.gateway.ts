@@ -17,7 +17,7 @@ import { REDIS_CLIENT } from '../redis/redis.module.js';
 import {
   JOB_EVENTS_CHANNEL,
   type JobUpdatedEvent,
-} from '../jobs/job-events.js';
+} from '../jobs/events/job-events.js';
 import type { AccessTokenPayload } from '../auth/auth.types.js';
 import { describeError } from '../common/errors/describe-error.js';
 

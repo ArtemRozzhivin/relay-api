@@ -1,0 +1,61 @@
+import { Injectable } from '@nestjs/common';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { Prisma } from '../../../generated/prisma/client.js';
+import { JobHandler } from '../../engine/job-handler.js';
+import type { JobContext } from '../../engine/job-context.js';
+import { chargePayloadSchema, type PayloadOf } from '../../jobs.schema.js';
+
+@Injectable()
+export class ChargeJobHandler extends JobHandler<PayloadOf<'CHARGE'>> {
+  readonly type = 'CHARGE' as const;
+
+  protected readonly payloadSchema = chargePayloadSchema;
+
+  protected async execute(context: JobContext, payload: PayloadOf<'CHARGE'>) {
+    // Keyed on the job id, not on the client's idempotency key: a redelivery
+    // of this job has to find the same row, while two different jobs must
+    // never collide — and `effectKey` is unique across all tenants, so a
+    // tenant-scoped key here would let one tenant suppress another's charge.
+    const effectKey = `${context.jobId}:charge`;
+
+    try {
+      // Through commitEffect, not a bare insert: the row is written only while
+      // this attempt still owns the job, and the job is marked in the same
+      // transaction, so no cancel can finish it once the money has moved.
+      await context.commitEffect((tx) =>
+        tx.sideEffect.create({
+          data: {
+            effectKey,
+            jobId: context.jobId,
+            kind: 'charge',
+            detail: {
+              amountCents: payload.amountCents,
+              reference: payload.reference,
+            },
+          },
+        }),
+      );
+    } catch (error) {
+      // The unique index is the guard, not a SELECT before the insert: a
+      // concurrent redelivery would pass that read and charge twice. Losing
+      // the insert proves the charge already happened, so report success
+      // without performing it again.
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        return {
+          charged: payload.amountCents,
+          reference: payload.reference,
+          deduplicated: true,
+        };
+      }
+
+      throw error;
+    }
+
+    await sleep(payload.delayMs);
+
+    return { charged: payload.amountCents, reference: payload.reference };
+  }
+}

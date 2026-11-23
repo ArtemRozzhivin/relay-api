@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import request from 'supertest';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import type { JobStatus } from '../../src/generated/prisma/enums.js';
-import type { DeadLetterCode } from '../../src/jobs/job-error-codes.js';
+import type { DeadLetterCode } from '../../src/jobs/engine/job-error-codes.js';
 import { registerAndLogin, startApp } from '../support/http.js';
 import { deleteUsers, seedJob } from '../support/db.js';
 
