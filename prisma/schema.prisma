@@ -24,6 +24,7 @@ model User {
   refreshTokens RefreshToken[]
   jobs          Job[]
   pipelines     Pipeline[]
+  apiKeys       ApiKey[]
   products      Product[]
   uploadSlips   UploadSlip[]
 }
@@ -148,6 +149,33 @@ model Pipeline {
   jobs Job[]
 
   @@unique([userId, idempotencyKey])
+}
+
+enum ApiKeyScope {
+  read
+  write
+}
+
+/// A credential a seller's own system uses instead of a login (§6.3f).
+model ApiKey {
+  id         String        @id @default(uuid()) @db.Uuid
+  userId     String        @db.Uuid
+  name       String
+  /// The key's first 12 characters, for its owner to tell keys apart. Not secret.
+  prefix     String
+  /// SHA-256 of the whole key: the only way a presented key is found. The key
+  /// itself is never stored.
+  hash       String        @unique
+  /// At least one. **DB** `CHECK`
+  scopes     ApiKeyScope[]
+  createdAt  DateTime      @default(now()) @db.Timestamptz(3)
+  /// To the minute: written at most once a minute per key.
+  lastUsedAt DateTime?     @db.Timestamptz(3)
+  revokedAt  DateTime?     @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
 }
 
 model Outbox {

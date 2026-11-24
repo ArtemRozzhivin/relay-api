@@ -59,6 +59,9 @@ export const apiEnvSchema = sharedEnvSchema.extend({
   // Off only in the tests, which register hundreds of accounts from one
   // address. Never off in production.
   RATE_LIMITS: z.stringbool().default(true),
+  // The operator's switch for every API key at once (§6.3f): off, no key is
+  // made and none authenticates. Read at boot, so a restart flips it.
+  API_KEYS_ENABLED: z.stringbool().default(true),
   RELAY_FAULT_AFTER_COMMIT: z.stringbool().default(false),
   ARGONID_TIME_COST: z.coerce.number().int().positive().default(2),
   ARGONID_MEMORY_COST: z.coerce.number().int().positive().default(19456),

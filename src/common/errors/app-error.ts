@@ -111,6 +111,24 @@ export class PipelineNotFoundError extends AppError {
   }
 }
 
+export class ApiKeysDisabledError extends AppError {
+  readonly kind = 'FORBIDDEN' as const;
+  readonly code = 'API_KEYS_DISABLED';
+
+  constructor() {
+    super('API keys are turned off on this server');
+  }
+}
+
+export class ApiKeyNotFoundError extends AppError {
+  readonly kind = 'NOT_FOUND' as const;
+  readonly code = 'API_KEY_NOT_FOUND';
+
+  constructor() {
+    super('API key not found');
+  }
+}
+
 export class UploadNotFoundError extends AppError {
   readonly kind = 'UNPROCESSABLE' as const;
   readonly code = 'UPLOAD_NOT_FOUND';
@@ -177,6 +195,17 @@ export class TooManyUnfinishedJobsError extends AppError {
   constructor(type: string, cap: number) {
     super(
       `At most ${cap} ${type} jobs can be unfinished at once; send this one when one of them finishes`,
+    );
+  }
+}
+
+export class TooManyApiKeysError extends AppError {
+  readonly kind = 'LIMIT_REACHED' as const;
+  readonly code = 'TOO_MANY_API_KEYS';
+
+  constructor(max: number) {
+    super(
+      `At most ${max} API keys can be unrevoked at once; revoke one to make another`,
     );
   }
 }

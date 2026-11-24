@@ -898,8 +898,12 @@ partial failure as a first-class outcome.
 
 ### Tasks
 
-- [ ] **F.1 ·** `ApiKey` **model** — `prefix` shown in the UI, SHA-256 `hash`, `scopes`,
-  `lastUsedAt`, `revokedAt`. The secret is displayed once and never stored.
+- [x] **F.1 ·** `ApiKey` **model** — `prefix` shown in the UI, SHA-256 `hash`, `scopes`,
+  `lastUsedAt`, `revokedAt`. The secret is displayed once and never stored. Specified first
+  (§4.10, §6.3f); `POST /api-keys`, `GET /api-keys` and `POST /api-keys/:id/revoke`, one
+  unrevoked key per account. The operator's control: `GET /admin/api-keys`,
+  `POST /admin/api-keys/revoke` for every key or one seller's, and `API_KEYS_ENABLED` to turn keys
+  off. Using a key is F.2.
   ```
   _Hash, not encrypt: nothing ever needs to read the key back, only to compare it._
   ```
@@ -944,6 +948,11 @@ Shape only, so the earlier phases leave room for it:
   a retried batch cannot consume twice
 - [ ] Count limits checked inside a transaction; a downgrade **disables** surplus resources and
   never deletes them
+- [ ] **AI spend per account.** Until this phase nothing limits it: the AI queue's 20 jobs a minute
+  bound every account together, so one account can use all of it. Each job already records what
+  its requests cost (`modelUsage`, D.6), which is what a plan's AI limit counts. Decided
+  2026-11-24 to wait for billing rather than add an interim cap — so a real, paid model is not
+  connected before it
 
 ### Done when
 
