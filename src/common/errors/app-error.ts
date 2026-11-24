@@ -120,6 +120,24 @@ export class ApiKeysDisabledError extends AppError {
   }
 }
 
+export class ApiKeyNotAllowedError extends AppError {
+  readonly kind = 'FORBIDDEN' as const;
+  readonly code = 'API_KEY_NOT_ALLOWED';
+
+  constructor() {
+    super('An API key cannot be used here; sign in instead');
+  }
+}
+
+export class ApiKeyScopeMissingError extends AppError {
+  readonly kind = 'FORBIDDEN' as const;
+  readonly code = 'API_KEY_SCOPE_MISSING';
+
+  constructor(scope: string) {
+    super(`This API key does not have the ${scope} scope`);
+  }
+}
+
 export class ApiKeyNotFoundError extends AppError {
   readonly kind = 'NOT_FOUND' as const;
   readonly code = 'API_KEY_NOT_FOUND';

@@ -10,7 +10,8 @@ import {
 } from '../common/errors/app-error.js';
 import type { ApiEnv } from '../config/env.schema.js';
 import { toPage } from '../common/pagination/cursor.js';
-import { mintApiKey } from './api-key-secret.js';
+import { hashApiKey, mintApiKey } from './api-key-secret.js';
+import { describeError } from '../common/errors/describe-error.js';
 import type {
   CreateApiKeyInput,
   ListAllApiKeysQuery,
@@ -21,6 +22,10 @@ import type {
 // revoking the old key before making the new one, so the seller's script is
 // without a key in between.
 const MAX_UNREVOKED = 1;
+
+// How far behind a key's lastUsedAt may be: a key in a tight loop writes it
+// once a minute, not once a request.
+const LAST_USED_RESOLUTION_MS = 60_000;
 
 // A key as its owner sees it: never the hash, which is all an attacker who
 // read the table would need to recognise a key they hold.
@@ -80,6 +85,68 @@ export class ApiKeysService {
     });
 
     return { ...created, key };
+  }
+
+  /**
+   * The key a request presents, with its owner and scopes, or `null` when no
+   * unrevoked key hashes to it (§6.3f). Read on every request and never
+   * cached, so a revoke takes effect on the next one, on every API instance,
+   * without a restart (A25).
+   *
+   * @throws ApiKeysDisabledError (403) while the operator has keys turned off.
+   */
+  async authenticate(key: string) {
+    if (!this.config.get('API_KEYS_ENABLED', { infer: true })) {
+      throw new ApiKeysDisabledError();
+    }
+
+    const found = await this.prisma.apiKey.findUnique({
+      where: { hash: hashApiKey(key) },
+      select: {
+        id: true,
+        scopes: true,
+        revokedAt: true,
+        lastUsedAt: true,
+        user: { select: { id: true, email: true, role: true } },
+      },
+    });
+
+    if (!found || found.revokedAt !== null) {
+      return null;
+    }
+
+    this.noteUse(found.id, found.lastUsedAt);
+
+    return found;
+  }
+
+  // Not awaited: a request is let in on its key, not on a timestamp, so a
+  // failed write is logged rather than failing the request.
+  private noteUse(id: string, lastUsedAt: Date | null) {
+    const now = Date.now();
+
+    if (lastUsedAt && now - lastUsedAt.getTime() < LAST_USED_RESOLUTION_MS) {
+      return;
+    }
+
+    // Conditional on the column as well: two requests that both read the old
+    // value write it once.
+    this.prisma.apiKey
+      .updateMany({
+        where: {
+          id,
+          OR: [
+            { lastUsedAt: null },
+            { lastUsedAt: { lt: new Date(now - LAST_USED_RESOLUTION_MS) } },
+          ],
+        },
+        data: { lastUsedAt: new Date(now) },
+      })
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `Could not record the use of API key ${id}: ${describeError(error)}`,
+        );
+      });
   }
 
   /** The caller's keys, newest first, revoked ones included. */

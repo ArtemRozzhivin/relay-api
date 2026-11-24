@@ -901,7 +901,10 @@ a slow hash protects a secret a person chose and an attacker can guess; 256 rand
 be guessed, and a key is checked on every request, where a slow hash would cost each one.
 
 **Using it.** `Authorization: Bearer relay_…`, the header a login token uses — and which request
-logs already redact. A key acts as its owner: the same ownership checks, the same rate limits and
+logs already redact; the line that closes a request names the key by its id (§12.1).
+`ApiKeyGuard`, beside `JwtAuthGuard`, lets it in: `401` for a key no unrevoked key hashes to,
+`403 API_KEY_NOT_ALLOWED` on a route for a person, `403 API_KEY_SCOPE_MISSING` for a method its
+scopes do not cover. A key acts as its owner: the same ownership checks, the same rate limits and
 caps, counted per account (D32). `read` lets it make the `GET` requests of jobs, pipelines,
 uploads and products, `write` their `POST`s. It reaches nothing else: not `/auth`, not
 `/api-keys`, not the socket. Only a session makes, lists and revokes keys, so a leaked key
@@ -929,7 +932,7 @@ account or all. `API_KEYS_ENABLED=false` turns the feature off: no key is made
 It is read at boot, so it takes a restart; revoking every key is the immediate stop. An account is
 made an admin in the database — `UPDATE "User" SET role = 'ADMIN' WHERE email = …` — and the role
 reaches its token at its next login. _Built in F.1 (the keys and their revoking) and F.2 (using
-them)._
+them: A25, A26)._
 
 ### 6.4 Validation
 
@@ -1570,7 +1573,7 @@ AppModule  (bootstrap: NestFactory.create)
 ├── PrismaModule            (global; exports PrismaService)
 ├── RedisModule             (global; exports the ioredis client)
 ├── AuthModule              → AuthController, AuthService, TokenService, PasswordService,
-│                             APP_GUARD: JwtAuthGuard
+│                             APP_GUARD: JwtAuthGuard, ApiKeyGuard (§10.2)
 ├── JobsModule              → JobsController, JobsService, OutboxRelayService,
 │                             PipelinesController, PipelinesService (§6.3e)
 │    ├── imports JobCoreModule, StorageModule
@@ -1624,7 +1627,8 @@ All of them in `AppModule`, the guards in the order they run:
 | Token | Provider |
 |---|---|
 | `APP_PIPE` | `StandardSchemaValidationPipe` |
-| `APP_GUARD` | `JwtAuthGuard` (opt out per-route with `@Public()`) |
+| `APP_GUARD` | `JwtAuthGuard` (opt out per-route with `@Public()`). Passes a bearer token that is an API key on to the next |
+| `APP_GUARD` | `ApiKeyGuard`: lets in a request whose bearer token is an API key, on a controller marked `@AllowApiKeys()`, with the scope its method needs (§6.3f). Passes a login token on, so either satisfies a route |
 | `APP_GUARD` | `RateLimitGuard` (a baseline; a stricter limit per-route with `@RateLimit()`). After the JWT guard, so it counts a signed-in caller by account (§15.2) |
 | `APP_GUARD` | `RolesGuard` (a route with `@Roles()` lets in only those roles; one without, everyone the guards before it did). Last, as it reads the role the JWT guard set. Registered with the first admin route, `POST /admin/api-keys/revoke` (§6.3f) |
 | `APP_INTERCEPTOR` | `ResponseEnvelopeInterceptor` |
@@ -1948,8 +1952,8 @@ cases.
 | **A22** | **A failed child does not fail the pipeline.** A 45-product pipeline whose second enrichment batch finds the model down (`[llm:down]`) through every attempt; then the model is back and the batch is re-driven | The batch `DEAD_LETTERED` with `ATTEMPTS_EXHAUSTED`, its 20 products unenriched; its two siblings `SUCCEEDED`. The pipeline `COMPLETED_WITH_ERRORS`, `failedChildren = 1`, the summary counting 25 enriched; every job in a job status. The re-drive `SUCCEEDED` and every product is `READY`, while the pipeline row is unchanged and still has one finalize job | PE |
 | **A23** | **The fan-out is idempotent.** A pipeline's import fails its first attempt right after its fan-out commits (`RELAY_FAULT_AFTER_FAN_OUT`), so its retry fans out again | The import `SUCCEEDED` on attempt 2; one `Job` row per `(stage, batch)`, each with one outbox row; the retry wrote none, every batch refused by `UNIQUE (userId, idempotencyKey)`; `pendingChildren` raised once | PE |
 | **A24** | **The parent cannot be lost.** The API — whose relay is the only thing that enqueues a row a worker wrote — is stopped while the pipeline's last batch waits on the model (`[llm:slow]`); the worker is killed as soon as that batch finishes; both are started again | While both were down, the finalize job and its outbox row were already there, unpublished. Then the relay publishes it (`attempts = 1`), it succeeds on attempt 1, and the pipeline is `COMPLETED` with one finalize job | PE |
-| **A25** | **Revocation is immediate.** Revoke a key, then use it | `401`, with no process restart | PF |
-| **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
+| **A25** | **Revocation is immediate.** A key reads `/jobs`; its owner revokes it; the key is used again at once, to read and to submit | Both later requests `401` from the same API process, never restarted; no job was made. A cached answer fails it | PF |
+| **A26** | **A key's plaintext exists nowhere.** Make a key and use it through both processes — a submit the worker runs, then a read — with JSON logs | The key's requests are logged under its `apiKeyId` with `Authorization` redacted, and the secret part is in neither process's log. Every textual column of every table is searched for it: none holds it; `ApiKey` holds the prefix and the SHA-256 | PF |
 | **A27** | **The backlog can be watched.** Submit 20 jobs with no worker running, then start one | Scraped from the API's own metrics port, `relay_queue_depth` rises by 20 and falls back to where it began; the worker's `relay_job_attempt_duration_seconds_count{outcome="succeeded"}` reaches 20. A job dead-lettered after it raises `relay_dead_letters` and counts as `dead_lettered` on the worker | 8 |
 | **A28** | **A job's story is found by one id.** Under a chosen `X-Request-Id`, submit a job that fails twice, then re-drive it under another; and one that succeeds. Both processes log JSON, as in production | Under the submit's id: the API's lines for the submit, and every worker line of both attempts, the handler's included, each naming the job, its type and its attempt, ending in the dead letter. No line about the job is without it. The re-drive's runs are under the re-drive's id, none under the submit's. A succeeded job's lines end in one saying so | 8 |
 | **A29** | **A provider's rate limit slows only its own jobs.** The AI queue limited to 1 job a second; 4 `ai.enrich` jobs, then 3 `MOCK` jobs, queued before the worker starts | Every job `SUCCEEDED`, and every `ai.enrich` outbox row names `relay-ai`. The `ai.enrich` jobs started at least a window apart; every `MOCK` job finished before the second `ai.enrich` job started | PD |
@@ -2215,7 +2219,7 @@ worker made of it (A28).
 | Line | Fields |
 |---|---|
 | Any line the API writes while it handles a request | `correlationId` |
-| The line that closes a request | `correlationId`, the whole `req` and `res`, `userId` |
+| The line that closes a request | `correlationId`, the whole `req` and `res`, `userId`, and `apiKeyId` when an API key made it — the key's id, never the key; `Authorization` is redacted |
 | Any line the worker writes while it runs a job: the processor's, the handler's, anything they call | `correlationId`, `jobId`; `jobType` and `attempt` once the attempt has claimed the job |
 | A job that stalled, or that the queue abandoned and the `failed` event or the sweep finished | `correlationId`, `jobId` |
 
@@ -2669,6 +2673,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-24 | §6.3f, §10.1, §10.2, §12.1, §14 — using an API key, F.2. `ApiKeyGuard`, beside `JwtAuthGuard`, lets in `Bearer relay_…` on the jobs, pipelines, uploads and products controllers (`@AllowApiKeys()`), `read` for a `GET` and `write` for the rest, as the key's owner; `403` on any other route. Looked up by hash on every request; `lastUsedAt` written at most once a minute, not awaited. The request log line names the key's id. A25 and A26 registered. |
 | 2026-11-24 | §4.10, §6.2, §6.3f, §10.2, §11 — API keys specified, F.1. `relay_` and 32 random bytes, stored as SHA-256 and shown once; `read` and `write` scopes over jobs, pipelines, uploads and products; only a session manages keys; looked up on every request, so revocation needs no restart; one unrevoked key per account. `POST /api-keys`, `GET /api-keys` and `POST /api-keys/:id/revoke` built, and the operator's `GET /admin/api-keys` and `POST /admin/api-keys/revoke`, the first admin routes, which register `RolesGuard`. `API_KEYS_ENABLED` turns keys off. **New migration** `20261124100000_api_key`. |
 | 2026-11-24 | §6.3d, §6.3e, §14 — a failed batch, E.4, which closes PE. `[llm:down]` added to the fake: a provider down fails the attempt, and the batch is dead-lettered once its attempts are spent. A22 registered: the pipeline ends `COMPLETED_WITH_ERRORS`, and a re-drive of the batch fixes its products without reopening it. |
 | 2026-11-23 | §4.3, §6.3d, §6.3e, §14, D24 — a pipeline finishes, E.3. Every finish of a pipeline's job — the worker's, a cancel's, the sweep's — takes its place off `pendingChildren` in its own transaction and counts a failure in `failedChildren`; the one that reaches zero writes `pipeline.finalize` and its outbox row. `pipeline.finalize` joins `JobType` but not the submit union; it writes the status and summary once. `[llm:slow]` added to the fake. A24 registered; A23 now waits for the pipeline to finish. |

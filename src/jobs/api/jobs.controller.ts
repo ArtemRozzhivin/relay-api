@@ -29,6 +29,7 @@ import {
   type RedriveQuery,
   type SubmitJobInput,
 } from '../jobs.schema.js';
+import { AllowApiKeys } from '../../api-keys/allow-api-keys.decorator.js';
 
 // The fingerprint is how the API recognises a retry (D28), the lease is how
 // workers recognise each other (D7), the checkpoint is where a handler resumes
@@ -55,6 +56,7 @@ const toJobView = ({
   },
 });
 
+@AllowApiKeys()
 @Controller('jobs')
 export class JobsController {
   constructor(private readonly jobs: JobsService) {}

@@ -19,7 +19,9 @@ import {
   startPipelineSchema,
   type StartPipelineInput,
 } from '../jobs.schema.js';
+import { AllowApiKeys } from '../../api-keys/allow-api-keys.decorator.js';
 
+@AllowApiKeys()
 @Controller('pipelines')
 export class PipelinesController {
   constructor(private readonly pipelines: PipelinesService) {}

@@ -28,7 +28,8 @@ export const rateLimitOptions = (
  * The limiter, global: every route has the baseline unless it sets its own
  * with `RateLimit`. A signed-in caller is counted by account, so changing
  * address does not reset its count and an office behind one address does not
- * share one — which needs `JwtAuthGuard` to have run first and set the user.
+ * share one — which needs `JwtAuthGuard` and `ApiKeyGuard` to have run first
+ * and set the user, whichever credential it came with.
  */
 @Injectable()
 export class RateLimitGuard extends ThrottlerGuard {

@@ -47,6 +47,25 @@ describe('API keys turned off', () => {
     expect(await prisma.apiKey.count({ where: { userId } })).toBe(0);
   });
 
+  it('lets no key in, a key made before included', async () => {
+    const { userId } = await registerAndLogin(server, 'keys-off');
+
+    users.push(userId);
+
+    const { key, prefix, hash } = mintApiKey();
+
+    await prisma.apiKey.create({
+      data: { userId, name: 'Before', prefix, hash, scopes: ['read'] },
+    });
+
+    const { body } = await request(server)
+      .get('/jobs')
+      .set('Authorization', `Bearer ${key}`)
+      .expect(403);
+
+    expect(body.error.code).toBe('API_KEYS_DISABLED');
+  });
+
   it('still lets an owner see and revoke a key made before', async () => {
     const { token, userId } = await registerAndLogin(server, 'keys-off');
 

@@ -907,13 +907,17 @@ partial failure as a first-class outcome.
   ```
   _Hash, not encrypt: nothing ever needs to read the key back, only to compare it._
   ```
-- [ ] **F.2 ·** `ApiKeyGuard` **beside** `JwtAuthGuard` — either satisfies a job endpoint.
+- [x] **F.2 ·** `ApiKeyGuard` **beside** `JwtAuthGuard` — either satisfies a job endpoint.
+  Each passes the other's credential on. A key reaches the jobs, pipelines, uploads and products
+  controllers, `read` for a `GET` and `write` for the rest, and nothing for a person; it is looked
+  up on every request, so a revoke needs no restart (A25), and its secret is in no row or log
+  (A26).
 - [ ] **F.3 · Swagger** for the public surface, documenting api-key auth.
 
 ### Done when
 
-- [ ] **A25 passes** — a revoked key is refused, and revocation takes effect without a restart
-- [ ] **A26 passes** — the plaintext key appears in no row and no log line
+- [x] **A25 passes** — a revoked key is refused, and revocation takes effect without a restart
+- [x] **A26 passes** — the plaintext key appears in no row and no log line
 
 ---
 

@@ -6,7 +6,9 @@ import {
   listProductsSchema,
   type ListProductsQuery,
 } from './products.schema.js';
+import { AllowApiKeys } from '../api-keys/allow-api-keys.decorator.js';
 
+@AllowApiKeys()
 @Controller('products')
 export class ProductsController {
   constructor(private readonly products: ProductsService) {}

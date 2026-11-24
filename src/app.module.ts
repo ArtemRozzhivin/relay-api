@@ -27,6 +27,7 @@ import {
 } from './common/rate-limit/rate-limit.js';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard.js';
 import { RolesGuard } from './auth/guards/roles.guard.js';
+import { ApiKeyGuard } from './api-keys/api-key.guard.js';
 
 @Module({
   imports: [
@@ -75,6 +76,12 @@ import { RolesGuard } from './auth/guards/roles.guard.js';
     {
       provide: APP_GUARD,
       useClass: JwtAuthGuard,
+    },
+    // Beside the JWT guard: each lets in its own credential and passes the
+    // other's, so a route takes a login or a key.
+    {
+      provide: APP_GUARD,
+      useClass: ApiKeyGuard,
     },
     {
       provide: APP_GUARD,

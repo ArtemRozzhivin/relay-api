@@ -43,6 +43,8 @@ nothing.
 | A pipeline writes each of its batches once                | The import fails after writing them; the retry writes none (A23)  |
 | A pipeline's summary job survives a crash                 | API down and worker killed around the last batch (A24)            |
 | A failed batch does not fail its pipeline                 | One batch dead-letters; the pipeline ends with errors (A22)       |
+| A revoked API key stops working on the next request       | Revoke, then use it at once, same process (A25)                   |
+| An API key's secret is in no row and no log line          | Every text column of every table, both logs (A26)                 |
 
 The full list, with the SQL each test checks, is §14 of the
 [technical specification](docs/TECH_SPEC.md#14-verification-plan).

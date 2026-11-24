@@ -4,7 +4,9 @@ import { CurrentUser } from '../auth/decorators/current-user.decorator.js';
 import type { AuthenticatedUser } from '../auth/auth.types.js';
 import { UploadsService } from './uploads.service.js';
 import { RateLimit } from '../common/rate-limit/rate-limit.js';
+import { AllowApiKeys } from '../api-keys/allow-api-keys.decorator.js';
 
+@AllowApiKeys()
 @Controller('uploads')
 export class UploadsController {
   constructor(private readonly uploads: UploadsService) {}

@@ -14,6 +14,12 @@ const SECRET_BYTES = 32;
 // and nothing towards the 43 that are secret.
 const SHOWN_LENGTH = API_KEY_PREFIX.length + 6;
 
+/**
+ * Whether a bearer token is an API key rather than a login token, which is a
+ * JWT and never begins with the prefix.
+ */
+export const isApiKey = (token: string) => token.startsWith(API_KEY_PREFIX);
+
 /** SHA-256 of a key, hex: what the table stores, and finds a presented key by. */
 export const hashApiKey = (key: string) =>
   createHash('sha256').update(key).digest('hex');
