@@ -98,17 +98,26 @@ export const submitJobSchema = z.discriminatedUnion('type', [
 ]);
 
 export type SubmitJobInput = z.infer<typeof submitJobSchema>;
-export type JobType = SubmitJobInput['type'];
-export type PayloadOf<T extends JobType> = Extract<
-  SubmitJobInput,
-  { type: T }
->['payload'];
+
+// A job only the server writes: a pipeline's summary, written by the
+// transaction that finishes its last job (§6.3e). Outside the submit union, so
+// no client can send one.
+export const pipelineFinalizePayloadSchema = z.object({ pipelineId: z.uuid() });
+
+type SubmittedJobType = SubmitJobInput['type'];
+
+export type JobType = SubmittedJobType | 'pipeline.finalize';
+
+export type PayloadOf<T extends JobType> = T extends SubmittedJobType
+  ? Extract<SubmitJobInput, { type: T }>['payload']
+  : z.infer<typeof pipelineFinalizePayloadSchema>;
 
 // Derived from the union rather than written beside it: a job type exists in
 // exactly one place, so the list cannot drift from what submit() accepts.
-export const JOB_TYPES: readonly JobType[] = submitJobSchema.options.map(
-  (option) => option.shape.type.value,
-);
+export const JOB_TYPES: readonly JobType[] = [
+  ...submitJobSchema.options.map((option) => option.shape.type.value),
+  'pipeline.finalize',
+];
 
 // Every instant a client sends, read one way. A timezone is required, not
 // assumed: "re-drive what died between 02:00 and

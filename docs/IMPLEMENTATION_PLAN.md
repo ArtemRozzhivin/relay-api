@@ -869,7 +869,10 @@ partial failure as a first-class outcome.
   children would bypass the outbox. Minting the key server-side also means
   `UNIQUE (userId, idempotencyKey)` makes the fan-out itself idempotent, for free._
   ```
-- [ ] **E.3 · The parent is enqueued by the transaction that takes** `pendingChildren` **to zero.**
+- [x] **E.3 · The parent is enqueued by the transaction that takes** `pendingChildren` **to zero.**
+  Every finish of a pipeline's job leaves its place in its own transaction; the one that reaches
+  zero writes `pipeline.finalize`, which sets the status and summary once. A24 stops both
+  processes around the last batch's commit and proves the relay still delivers the parent.
   ```
   _Parent-runs-when-children-finish becomes a conditional UPDATE on a counter — the idiom the
   whole engine already uses — and the parent's outbox row is written in that same transaction._
@@ -880,8 +883,8 @@ partial failure as a first-class outcome.
 ### Done when
 
 - [ ] **A22 passes** — a failed child leaves the pipeline `completed_with_errors`, not failed
-- [ ] **A23 passes** — replaying the fan-out cannot create a second row for any batch
-- [ ] **A24 passes** — a crash between the last child committing and the parent being enqueued is
+- [x] **A23 passes** — replaying the fan-out cannot create a second row for any batch
+- [x] **A24 passes** — a crash between the last child committing and the parent being enqueued is
   recovered by the outbox relay
 
 ---

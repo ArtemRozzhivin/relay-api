@@ -568,11 +568,7 @@ describe('the import.csv handler', () => {
 
       const { result, fannedOut } = run(userId, key, { pipelineId: PIPELINE });
 
-      expect(await result).toMatchObject({
-        imported: 3,
-        invalid: 1,
-        batches: { enrich: 1, images: 1 },
-      });
+      expect(await result).toMatchObject({ imported: 3, invalid: 1 });
       expect(fannedOut).toEqual([
         [
           {
@@ -605,9 +601,7 @@ describe('the import.csv handler', () => {
         checkpoint: first.checkpoints.at(-1) as Prisma.JsonValue,
       });
 
-      expect(await again.result).toMatchObject({
-        batches: { enrich: 60, images: 0 },
-      });
+      await again.result;
 
       const skus = again.fannedOut
         .flat()
@@ -623,7 +617,8 @@ describe('the import.csv handler', () => {
       const key = await upload(userId, rowsOf(3));
       const { result, fannedOut } = run(userId, key);
 
-      expect(await result).not.toHaveProperty('batches');
+      await result;
+
       expect(fannedOut).toEqual([]);
     });
   });

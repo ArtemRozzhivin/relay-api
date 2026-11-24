@@ -166,7 +166,7 @@ every line of application code is wrong; constraints listed as **APP** are polic
 |---|---|---|
 | `id` | `uuid` | PK. This is the id returned to the client and the only thing put on the queue (§8.3) |
 | `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE` |
-| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` \| `import.csv` \| `image.process` \| `ai.enrich` today). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
+| `type` | `text` | A value from the `JOB_TYPES` tuple (`MOCK` \| `CHARGE` \| `import.csv` \| `image.process` \| `ai.enrich` \| `pipeline.finalize` today; the last only the server writes, §6.3e). Not a DB enum — the submit schema and the handler registry are the authority (D21) |
 | `payload` | `jsonb` | Validated per-type at the edge (§6.4) |
 | `status` | `JobStatus` enum | See §5 |
 | `attempts` | `int` | Default `0`. Incremented by the worker when it *claims* the job. The retry budget, reset by a re-drive — so **not** the ownership token |
@@ -762,6 +762,7 @@ demand, when a product's name holds a directive:
 | `[llm:malformed-once]` | answers like that until the corrective request, which it answers correctly |
 | `[llm:off-taxonomy]` | gives that product `gadgets`, a category outside the list |
 | `[llm:busy]` | refuses the first request holding it with a 429 and a `Retry-After` of 1 s; per process |
+| `[llm:slow]` | answers every request holding it after 3 s, as a model under load does |
 
 Otherwise it picks a category by a hash of the sku, and up to 3 tags from the words of the name.
 Its token counts are the characters sent and received, over four. A real provider would plug in
@@ -806,10 +807,14 @@ that lost the import nor a re-drive of the import after the pipeline finished fa
 batches carry the pipeline's correlation id and reach their queues through the relay (§4.5).
 They count against no cap: the import that makes them does, and its file is at most 50 MB. A
 client's own `Idempotency-Key` may not begin with `pipeline:` (`400 IDEMPOTENCY_KEY_RESERVED`):
-sharing the server's prefix, it could take a batch's key before the fan-out writes it. The
-import's result gains `batches: { enrich, images }`, how many of each the file called for, so it
-reads the same on the attempt that wrote them and on any that found them written. _Built in
-E.2._
+sharing the server's prefix, it could take a batch's key before the fan-out writes it.
+
+A retry plans again, from the products as they are by then: a batch the first attempt wrote may
+already have run, so the retry's plan can be shorter, and its batch `n` can hold other products
+than the first one's. Its keys are the first attempt's all the same, so each is refused, and every
+product it names is in a batch already written — unless its text or URL changed in between. So
+the import's result does not count batches; `GET /pipelines/:id` counts the ones there are. _Built
+in E.2._
 
 **The counter (D24).** `pendingChildren` starts at 1, for the import, and the fan-out raises it
 while the import still holds that 1, so it cannot reach zero before every batch exists. Each job
@@ -822,9 +827,11 @@ takes the counter to zero also writes the `pipeline.finalize` job and its outbox
 records that the parent is due: a crash after that commit leaves an outbox row the relay
 publishes (A24).
 
-**`pipeline.finalize`** is a job type no client submits. It reads the pipeline's jobs, then
-writes the pipeline's `status`, `summary` and `finishedAt` in one update conditional on the
-status still being `RUNNING`, so a second delivery changes nothing.
+**`pipeline.finalize`** is a job type no client submits: it is in `JobType`, so it needs a
+handler to build, and not in the submit union, so `POST /jobs` refuses it. It reads the
+pipeline's jobs, then writes the pipeline's `status`, `summary` and `finishedAt` in one update
+conditional on the status still being `RUNNING`, so a second delivery changes nothing. _Built in
+E.3, with the counter._
 
 | Status | When |
 |---|---|
@@ -1868,7 +1875,7 @@ cases.
 | **A21** | **Re-enrichment of unchanged products is free.** Enrich 3 products, enrich them again, then once more after one product's description changed | Every job `SUCCEEDED`. The worker's log holds one request to the model for the first job, **none** for the second, with `alreadyReady = 3`, and one about 1 product for the third. `modelUsage` shows the first job's cost, the second's as zero, and the third's below the first's | PD |
 | **A22** | **A failed child does not fail the pipeline.** Force one enrichment batch to fail | `Pipeline.status = 'completed_with_errors'`; sibling batches completed; the failed batch is re-drivable; no `Job` row carries `completed_with_errors` | PE |
 | **A23** | **The fan-out is idempotent.** A pipeline's import fails its first attempt right after its fan-out commits (`RELAY_FAULT_AFTER_FAN_OUT`), so its retry fans out again | The import `SUCCEEDED` on attempt 2; one `Job` row per `(stage, batch)`, each with one outbox row; the retry wrote none, every batch refused by `UNIQUE (userId, idempotencyKey)`; `pendingChildren` raised once | PE |
-| **A24** | **The parent cannot be lost.** Crash between the last child committing and the parent being enqueued | The relay publishes the parent's outbox row; the pipeline finalizes exactly once | PE |
+| **A24** | **The parent cannot be lost.** The API — whose relay is the only thing that enqueues a row a worker wrote — is stopped while the pipeline's last batch waits on the model (`[llm:slow]`); the worker is killed as soon as that batch finishes; both are started again | While both were down, the finalize job and its outbox row were already there, unpublished. Then the relay publishes it (`attempts = 1`), it succeeds on attempt 1, and the pipeline is `COMPLETED` with one finalize job | PE |
 | **A25** | **Revocation is immediate.** Revoke a key, then use it | `401`, with no process restart | PF |
 | **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
 | **A27** | **The backlog can be watched.** Submit 20 jobs with no worker running, then start one | Scraped from the API's own metrics port, `relay_queue_depth` rises by 20 and falls back to where it began; the worker's `relay_job_attempt_duration_seconds_count{outcome="succeeded"}` reaches 20. A job dead-lettered after it raises `relay_dead_letters` and counts as `dead_lettered` on the worker | 8 |
@@ -2257,7 +2264,7 @@ so they move:
 | D21 | ~~Is `Job.type` a Postgres enum or a string owned by the handler registry?~~ | Phase A's registry is the thing that decides it, and either answer is a migration | **DECIDED** — string + registry; closed set kept in one `JOB_TYPES` tuple |
 | D22 | ~~What statuses does the proposal add, and where does `completed_with_errors` live?~~ | It changes the state machine M6 hardened | **DECIDED** — `CANCELLED` + `cancelRequested` on `Job`; `DEAD_LETTERED` keeps its name; `completed_with_errors` on `Pipeline` only |
 | D23 | ~~Who owns a job no HTTP request created?~~ | `Job.userId` is `NOT NULL` and `(userId, idempotencyKey)` is what A1 rests on | **DECIDED** — `userId` stays `NOT NULL`; children get server-minted deterministic keys; webhooks are not `Job` rows |
-| D24 | ~~Fan-out via BullMQ `FlowProducer`, or our own rows through the outbox?~~ | Phase B's import triggers the fan-out; the schema differs per answer | **DECIDED** — our own rows through the outbox; `pendingChildren` counter |
+| D24 | ~~Fan-out via BullMQ `FlowProducer`, or our own rows through the outbox?~~ | Phase B's import triggers the fan-out; the schema differs per answer | **DECIDED** — our own rows through the outbox; `pendingChildren` counter. **Built** in PE (E.2, E.3), §6.3e |
 | D25 | ~~Where does progress live and how often is it written?~~ | Phase A writes it; `GET /jobs/:id` has to answer it after a reconnect | **DECIDED** — `progress Json?` on `Job`, ownership-guarded |
 | D26 | ~~Does a re-drive resume from a checkpoint or restart from zero?~~ | `redrive()` currently clears `result` and resets `attempts` | **DECIDED** — resume from the checkpoint; `?from=start` to restart |
 | D27 | ~~A second ledger for quota, or reuse `SideEffect`?~~ | Phase B's checkpoint and Phase I's quota would otherwise invent two | **DECIDED** — reuse `SideEffect`, `effectKey = '<jobId>:quota:<batchIndex>' |
@@ -2590,6 +2597,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-23 | §4.3, §6.3d, §6.3e, §14, D24 — a pipeline finishes, E.3. Every finish of a pipeline's job — the worker's, a cancel's, the sweep's — takes its place off `pendingChildren` in its own transaction and counts a failure in `failedChildren`; the one that reaches zero writes `pipeline.finalize` and its outbox row. `pipeline.finalize` joins `JobType` but not the submit union; it writes the status and summary once. `[llm:slow]` added to the fake. A24 registered; A23 now waits for the pipeline to finish. |
 | 2026-11-23 | §6.3e, §7.2, §10.1, §11, §14 — a pipeline starts and fans out, E.2. `POST /pipelines` and `GET /pipelines/:id` built; a pipeline's import ends by reading its file again and writing the batches its products need, through `context.fanOut`, under the import's lease and only while it holds its place. A client key beginning with `pipeline:` is refused. A23 registered, with `RELAY_FAULT_AFTER_FAN_OUT`. Nothing takes one off the counter yet, so a pipeline stays `RUNNING` until E.3. |
 | 2026-11-23 | §4.3, §4.9, §6.2, §6.3e — pipelines specified, E.1. `POST /pipelines` writes a `Pipeline` and its import; the import ends by fanning out into `ai.enrich` and `image.process` batches with server-minted keys, in one transaction; each job takes one off `pendingChildren` in the transaction of its first terminal transition, and the one that reaches zero writes `pipeline.finalize`, which sets the status once. `Job` gains `pipelineId` and `pendingInPipeline`. **New migration** `20261123100000_pipeline`. |
 | 2026-11-23 | §10.4 — `src/jobs` split into folders by the question each answers: `api/`, `engine/`, `delivery/`, `events/`, and one folder per job type under `handlers/`. Files moved and imports rewritten, nothing else. Imports point one way, and why there is no repository layer, recorded there. |

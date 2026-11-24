@@ -79,15 +79,26 @@ describe('A23 · a fan-out that runs again writes no batch twice', () => {
     expect(importJob).toMatchObject({
       status: 'SUCCEEDED',
       attempts: 2,
-      result: { imported: PRODUCTS, batches: { enrich: 3, images: 1 } },
+      result: { imported: PRODUCTS },
     });
+    // The line can reach the pipe after the row it describes has committed.
+    await harness.waitUntil(
+      async () => (fanOutsOf(importJob.id).length >= 2 ? true : undefined),
+      { timeoutMs: 10_000, label: 'both fan-outs to be logged' },
+    );
+
+    // The retry plans from the products as they are by then, and the first
+    // attempt's batches may have enriched some already: however many it
+    // planned, it wrote none.
     expect(fanOutsOf(importJob.id)).toEqual([
       'attempt 1 fanned out 4 new of 4 batch(es)',
-      'attempt 2 fanned out 0 new of 4 batch(es)',
+      expect.stringMatching(
+        /^attempt 2 fanned out 0 new of [1-4] batch\(es\)$/,
+      ),
     ]);
 
     const batches = await harness.prisma.job.findMany({
-      where: { pipelineId, type: { not: 'import.csv' } },
+      where: { pipelineId, type: { in: ['ai.enrich', 'image.process'] } },
       include: { outbox: true },
     });
 
@@ -101,11 +112,12 @@ describe('A23 · a fan-out that runs again writes no batch twice', () => {
     );
     expect(batches.map(({ outbox }) => outbox.length)).toEqual([1, 1, 1, 1]);
 
-    // The import's place and one for each batch: raised once, not twice.
-    const pipeline = await harness.prisma.pipeline.findUniqueOrThrow({
-      where: { id: pipelineId },
+    // Raised once for the batches, not twice: a second raise would hold the
+    // counter above zero for ever, and the pipeline would never finish.
+    expect(await harness.waitForPipeline(pipelineId)).toMatchObject({
+      status: 'COMPLETED',
+      pendingChildren: 0,
+      failedChildren: 0,
     });
-
-    expect(pipeline.pendingChildren).toBe(1 + batches.length);
   });
 });

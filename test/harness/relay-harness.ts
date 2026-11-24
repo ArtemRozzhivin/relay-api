@@ -281,6 +281,20 @@ export class RelayHarness {
     }
   }
 
+  /** Waits for a pipeline to finish, whatever it finished as. */
+  waitForPipeline(pipelineId: string, timeoutMs = 60_000) {
+    return this.waitUntil(
+      async () => {
+        const pipeline = await this.prisma.pipeline.findUnique({
+          where: { id: pipelineId },
+        });
+
+        return pipeline && pipeline.status !== 'RUNNING' ? pipeline : undefined;
+      },
+      { timeoutMs, label: `pipeline ${pipelineId} to finish` },
+    );
+  }
+
   waitForJobStatus(jobId: string, statuses: JobStatus[], timeoutMs = 60_000) {
     return this.waitUntil(
       async () => {

@@ -93,6 +93,7 @@ describe('the dead-letter metric', () => {
       'import.csv': 0,
       'image.process': 0,
       'ai.enrich': 0,
+      'pipeline.finalize': 0,
     });
   });
 

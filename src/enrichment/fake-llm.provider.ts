@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { Injectable } from '@nestjs/common';
 import { CATEGORIES } from './taxonomy.js';
 import {
@@ -12,6 +13,10 @@ const DIRECTIVE = /\[llm:([a-z-]+)\]/g;
 
 // Roughly what a tokenizer makes of English text.
 const CHARACTERS_PER_TOKEN = 4;
+
+// Long enough for a test to act while the request is in flight: A24 stops the
+// API before the reply arrives.
+export const SLOW_REPLY_MS = 3000;
 
 const directivesOf = (product: EnrichmentInput) =>
   new Set([...product.name.matchAll(DIRECTIVE)].map(([, name]) => name));
@@ -67,6 +72,10 @@ export class FakeLlmProvider implements LlmProvider {
     if (busy.length > 0) {
       busy.forEach((key) => this.refusedAsBusy.add(key));
       throw new LlmRateLimitError(1000);
+    }
+
+    if (holding(request, 'slow').length > 0) {
+      await sleep(SLOW_REPLY_MS);
     }
 
     const text = this.answer(request);

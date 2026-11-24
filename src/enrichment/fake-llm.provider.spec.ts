@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CATEGORIES } from './taxonomy.js';
-import { FakeLlmProvider } from './fake-llm.provider.js';
+import { FakeLlmProvider, SLOW_REPLY_MS } from './fake-llm.provider.js';
 import { LlmRateLimitError, type EnrichmentInput } from './llm-provider.js';
 
 const product = (sku: string, name: string): EnrichmentInput => ({
@@ -112,5 +112,43 @@ describe('FakeLlmProvider', () => {
     await expect(new FakeLlmProvider().enrich(request)).rejects.toThrow(
       LlmRateLimitError,
     );
+  });
+
+  describe('[llm:slow]', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('answers a request holding it only once its delay has passed', async () => {
+      vi.useFakeTimers();
+
+      let answered = false;
+      const reply = new FakeLlmProvider()
+        .enrich({ products: [product('SLOW-1', 'Desk [llm:slow]'), mug] })
+        .then((answer) => {
+          answered = true;
+
+          return answer;
+        });
+
+      await vi.advanceTimersByTimeAsync(SLOW_REPLY_MS - 1);
+      expect(answered).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(itemsOf((await reply).text)).toHaveLength(2);
+    });
+
+    it('answers a request without it at once', async () => {
+      vi.useFakeTimers();
+
+      let answered = false;
+
+      void new FakeLlmProvider().enrich({ products: [mug] }).then(() => {
+        answered = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(answered).toBe(true);
+    });
   });
 });

@@ -217,18 +217,12 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
     }
 
     // Last, after the report: a pipeline's batches are written once the
-    // import has nothing left that could fail it (§6.3e).
-    const batches = await this.planBatches(context.userId, key, etag);
+    // import has nothing left that could fail it (§6.3e). Not counted in the
+    // result: a retry plans from the products as they are by then, and its
+    // count says nothing about the batches the pipeline has.
+    await context.fanOut(await this.planBatches(context.userId, key, etag));
 
-    await context.fanOut(batches);
-
-    return {
-      ...result,
-      batches: {
-        enrich: batches.filter(({ stage }) => stage === 'enrich').length,
-        images: batches.filter(({ stage }) => stage === 'images').length,
-      },
-    };
+    return result;
   }
 
   // Only the bytes the import began with: a resume over different ones would
