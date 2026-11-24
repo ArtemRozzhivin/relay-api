@@ -281,6 +281,20 @@ export class RelayHarness {
     }
   }
 
+  /** Waits for a pipeline to finish, whatever it finished as. */
+  waitForPipeline(pipelineId: string, timeoutMs = 60_000) {
+    return this.waitUntil(
+      async () => {
+        const pipeline = await this.prisma.pipeline.findUnique({
+          where: { id: pipelineId },
+        });
+
+        return pipeline && pipeline.status !== 'RUNNING' ? pipeline : undefined;
+      },
+      { timeoutMs, label: `pipeline ${pipelineId} to finish` },
+    );
+  }
+
   waitForJobStatus(jobId: string, statuses: JobStatus[], timeoutMs = 60_000) {
     return this.waitUntil(
       async () => {
@@ -385,6 +399,22 @@ export class RelayHarness {
     });
   }
 
+  /** Starts a pipeline over an upload, as `POST /pipelines` (§6.3e). */
+  startPipeline(
+    account: Account,
+    key: string,
+    idempotencyKey = `k-${Math.random().toString(36).slice(2)}`,
+  ) {
+    return this.request('/pipelines', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${account.token}`,
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify({ key }),
+    });
+  }
+
   /**
    * Uploads a file the way a client does — a slip from the API, then the file
    * straight to S3 — and returns the key a job then names.
@@ -412,6 +442,12 @@ export class RelayHarness {
 
   fetchJob(account: Account, jobId: string) {
     return this.request(`/jobs/${jobId}`, {
+      headers: { Authorization: `Bearer ${account.token}` },
+    });
+  }
+
+  fetchPipeline(account: Account, pipelineId: string) {
+    return this.request(`/pipelines/${pipelineId}`, {
       headers: { Authorization: `Bearer ${account.token}` },
     });
   }

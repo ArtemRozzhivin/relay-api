@@ -1,6 +1,6 @@
 import type { Prisma } from '../../generated/prisma/client.js';
 import type { PrismaService } from '../../prisma/prisma.service.js';
-import type { JobContext, ModelUsage } from './job-context.js';
+import type { JobContext, ModelUsage, PipelineBatch } from './job-context.js';
 import type { JobProgress } from './job-progress.js';
 
 /**
@@ -14,6 +14,7 @@ export const recordingContext = ({
   attempt = 1,
   lastAttempt = false,
   checkpoint = null,
+  pipelineId = null,
   client,
 }: {
   /** How many `shouldStop()` calls answer false before one answers true. */
@@ -25,6 +26,9 @@ export const recordingContext = ({
   /** What the context reports an earlier attempt committed. */
   checkpoint?: Prisma.JsonValue | null;
 
+  /** The pipeline the job belongs to; `fanOut()` records what it is handed. */
+  pipelineId?: string | null;
+
   /**
    * The database `commit()` writes through. Without one it throws, which is
    * right for a handler that has no batch to commit.
@@ -35,6 +39,7 @@ export const recordingContext = ({
   const lines: string[] = [];
   const checkpoints: Prisma.InputJsonValue[] = [];
   const usages: ModelUsage[] = [];
+  const fannedOut: PipelineBatch[][] = [];
   let checks = 0;
 
   const context: JobContext = {
@@ -43,6 +48,7 @@ export const recordingContext = ({
     attempt,
     lastAttempt,
     checkpoint,
+    pipelineId,
     reportProgress: async (progress) => {
       reports.push(progress);
     },
@@ -72,6 +78,15 @@ export const recordingContext = ({
     recordModelUsage: async (usage) => {
       usages.push(usage);
     },
+    fanOut: async (batches) => {
+      if (pipelineId === null) {
+        throw new Error('This context belongs to no pipeline');
+      }
+
+      fannedOut.push(batches);
+
+      return batches.length;
+    },
     log: (message) => {
       lines.push(message);
     },
@@ -83,6 +98,7 @@ export const recordingContext = ({
     lines,
     checkpoints,
     usages,
+    fannedOut,
     checks: () => checks,
   };
 };

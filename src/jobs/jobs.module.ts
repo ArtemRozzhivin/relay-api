@@ -9,6 +9,8 @@ import { JobQueues } from './delivery/job-queues.js';
 import { OutboxRelayService } from './delivery/outbox-relay.service.js';
 import { StorageModule } from '../storage/storage.module.js';
 import { QueueMetrics } from './delivery/queue-metrics.js';
+import { PipelinesController } from './api/pipelines.controller.js';
+import { PipelinesService } from './api/pipelines.service.js';
 
 @Module({
   imports: [
@@ -17,7 +19,13 @@ import { QueueMetrics } from './delivery/queue-metrics.js';
     ScheduleModule.forRoot(),
     BullModule.registerQueue({ name: JOBS_QUEUE }, { name: AI_QUEUE }),
   ],
-  controllers: [JobsController],
-  providers: [JobsService, OutboxRelayService, QueueMetrics, JobQueues],
+  controllers: [JobsController, PipelinesController],
+  providers: [
+    JobsService,
+    PipelinesService,
+    OutboxRelayService,
+    QueueMetrics,
+    JobQueues,
+  ],
 })
 export class JobsModule {}

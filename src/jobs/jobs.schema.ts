@@ -31,20 +31,24 @@ export const importCsvPayloadSchema = z.object({
 // A batch: not one product per job, which would make a 20 000-product catalog
 // 20 000 jobs, and not the whole catalog, where one slow image would hold up
 // every other. Which of the skus are the caller's is the handler's to find out.
+export const IMAGE_BATCH_MAX = 50;
+
 export const imageProcessPayloadSchema = z.object({
   skus: z
     .array(storableText().trim().min(1).max(SKU_MAX_LENGTH))
     .min(1)
-    .max(50),
+    .max(IMAGE_BATCH_MAX),
 });
 
 // Fewer than an image batch: the whole batch goes to the model in one request,
 // whose size and price grow with every product in it.
+export const ENRICH_BATCH_MAX = 20;
+
 export const aiEnrichPayloadSchema = z.object({
   skus: z
     .array(storableText().trim().min(1).max(SKU_MAX_LENGTH))
     .min(1)
-    .max(20),
+    .max(ENRICH_BATCH_MAX),
 });
 
 export const chargePayloadSchema = z.object({
@@ -94,17 +98,26 @@ export const submitJobSchema = z.discriminatedUnion('type', [
 ]);
 
 export type SubmitJobInput = z.infer<typeof submitJobSchema>;
-export type JobType = SubmitJobInput['type'];
-export type PayloadOf<T extends JobType> = Extract<
-  SubmitJobInput,
-  { type: T }
->['payload'];
+
+// A job only the server writes: a pipeline's summary, written by the
+// transaction that finishes its last job (§6.3e). Outside the submit union, so
+// no client can send one.
+export const pipelineFinalizePayloadSchema = z.object({ pipelineId: z.uuid() });
+
+type SubmittedJobType = SubmitJobInput['type'];
+
+export type JobType = SubmittedJobType | 'pipeline.finalize';
+
+export type PayloadOf<T extends JobType> = T extends SubmittedJobType
+  ? Extract<SubmitJobInput, { type: T }>['payload']
+  : z.infer<typeof pipelineFinalizePayloadSchema>;
 
 // Derived from the union rather than written beside it: a job type exists in
 // exactly one place, so the list cannot drift from what submit() accepts.
-export const JOB_TYPES: readonly JobType[] = submitJobSchema.options.map(
-  (option) => option.shape.type.value,
-);
+export const JOB_TYPES: readonly JobType[] = [
+  ...submitJobSchema.options.map((option) => option.shape.type.value),
+  'pipeline.finalize',
+];
 
 // Every instant a client sends, read one way. A timezone is required, not
 // assumed: "re-drive what died between 02:00 and
@@ -202,6 +215,16 @@ export const bulkRedriveSchema = deadLetterFilter
 export type BulkRedriveInput = z.infer<typeof bulkRedriveSchema>;
 
 export const jobIdSchema = z.uuid();
+
+// What an import takes, and nothing else: the batches are the server's to
+// decide (§6.3e).
+export const startPipelineSchema = z
+  .object({ key: importCsvPayloadSchema.shape.key })
+  .strict();
+
+export type StartPipelineInput = z.infer<typeof startPipelineSchema>;
+
+export const pipelineIdSchema = z.uuid();
 
 // Resuming is the default and needs no word for it (D26); a restart is the one
 // a caller has to ask for.

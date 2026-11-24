@@ -478,4 +478,97 @@ describe('JobContextFactory', () => {
       expect(Logger.prototype.warn).toHaveBeenCalledTimes(2);
     });
   });
+
+  describe('fanOut', () => {
+    const batches = [
+      { stage: 'enrich', type: 'ai.enrich' as const, payload: { skus: ['A'] } },
+      { stage: 'enrich', type: 'ai.enrich' as const, payload: { skus: ['B'] } },
+    ];
+
+    const fanningOut = (
+      outcome: { holding: boolean; written: number } | null,
+      job: {
+        attempt?: number;
+        pipelineId?: string | null;
+        failAfterFanOut?: boolean;
+      } = {},
+    ) => {
+      const calls: unknown[][] = [];
+      const transitions = {
+        fanOut: async (...args: unknown[]) => {
+          calls.push(args);
+
+          return outcome;
+        },
+      } as unknown as JobTransitionService;
+
+      const context = new JobContextFactory(
+        transitions,
+        {} as JobEventsPublisher,
+      ).create({ ...running, pipelineId: 'a-pipeline', ...job });
+
+      return { context, calls };
+    };
+
+    const logged = () =>
+      vi.mocked(Logger.prototype.log).mock.calls.map(([line]) => line);
+
+    it('hands the batches over under its lease, and says how many were new', async () => {
+      const { context, calls } = fanningOut({ holding: true, written: 1 });
+
+      await expect(context.fanOut(batches)).resolves.toBe(1);
+      expect(calls).toEqual([['a-job', 7, batches]]);
+      expect(logged()).toEqual([
+        'Job a-job attempt 2 fanned out 1 new of 2 batch(es)',
+      ]);
+    });
+
+    it('stops an attempt that no longer owns the job', async () => {
+      const { context } = fanningOut(null);
+
+      await expect(context.fanOut(batches)).rejects.toBeInstanceOf(
+        JobCancelledError,
+      );
+    });
+
+    it('writes nothing for a job that holds no place in its pipeline, and says why', async () => {
+      const { context } = fanningOut({ holding: false, written: 0 });
+
+      await expect(context.fanOut(batches)).resolves.toBe(0);
+      expect(logged()).toEqual([
+        'Job a-job attempt 2 holds no place in its pipeline any more, so writes none of its batches',
+      ]);
+    });
+
+    it('refuses a job that belongs to no pipeline, asking nothing', async () => {
+      const { context, calls } = fanningOut(
+        { holding: true, written: 2 },
+        { pipelineId: null },
+      );
+
+      await expect(context.fanOut(batches)).rejects.toThrow(
+        'Job a-job belongs to no pipeline',
+      );
+      expect(calls).toEqual([]);
+    });
+
+    it('fails a first attempt once its fan-out has committed, when told to', async () => {
+      const { context, calls } = fanningOut(
+        { holding: true, written: 2 },
+        { attempt: 1, failAfterFanOut: true },
+      );
+
+      await expect(context.fanOut(batches)).rejects.toThrow('Injected fault');
+      expect(calls).toHaveLength(1);
+    });
+
+    it('lets the attempt after it through', async () => {
+      const { context } = fanningOut(
+        { holding: true, written: 0 },
+        { attempt: 2, failAfterFanOut: true },
+      );
+
+      await expect(context.fanOut(batches)).resolves.toBe(0);
+    });
+  });
 });

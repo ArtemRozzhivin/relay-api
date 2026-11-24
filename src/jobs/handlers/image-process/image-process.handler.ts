@@ -16,6 +16,7 @@ import { productImageKey } from '../../../storage/object-keys.js';
 import { ProductsService } from '../../../products/products.service.js';
 import { renderSizes } from '../../../images/image-variants.js';
 import { RetryableJobError } from '../../../common/errors/app-error.js';
+import { hasImageForCurrentUrl } from '../../../products/product-state.js';
 
 // What a seller uploads and sharp decodes. Not SVG: it is a document that can
 // refer to other files, and rendering one runs a parser on the seller's input.
@@ -69,11 +70,7 @@ export class ImageProcessJobHandler extends JobHandler<
     // FAILED one is tried again: the seller may have fixed the file behind the
     // same URL, and naming the sku again is how they ask.
     const todo = found.flatMap((product) =>
-      product.imageUrl !== null &&
-      !(
-        product.imageSourceUrl === product.imageUrl &&
-        product.imageStatus === 'READY'
-      )
+      product.imageUrl !== null && !hasImageForCurrentUrl(product)
         ? [{ id: product.id, imageUrl: product.imageUrl }]
         : [],
     );

@@ -125,6 +125,27 @@ export class ProductsService {
    * their last enrichment was made from. A sku the caller has no product for
    * is simply absent.
    */
+  /**
+   * What a pipeline's import needs to decide which of `skus` still need an
+   * enrichment or an image (§6.3e). In no particular order: the caller puts
+   * them in the file's.
+   */
+  forPipeline(userId: string, skus: string[]) {
+    return this.prisma.product.findMany({
+      where: { userId, sku: { in: skus } },
+      select: {
+        sku: true,
+        name: true,
+        description: true,
+        enrichmentStatus: true,
+        enrichmentInputHash: true,
+        imageUrl: true,
+        imageStatus: true,
+        imageSourceUrl: true,
+      },
+    });
+  }
+
   forEnrichment(userId: string, skus: string[]) {
     return this.prisma.product.findMany({
       where: { userId, sku: { in: skus } },

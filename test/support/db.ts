@@ -96,3 +96,25 @@ export const seedJob = (
       ...data,
     },
   });
+
+/**
+ * Writes a pipeline row directly, as {@link seedJob} writes a job: `RUNNING`,
+ * its counter holding the import's place, unless `data` says otherwise.
+ */
+export const seedPipeline = (
+  prisma: PrismaClient,
+  data: Partial<Prisma.PipelineUncheckedCreateInput> & { userId: string },
+) =>
+  prisma.pipeline.create({
+    data: {
+      idempotencyKey: `seed-${randomUUID()}`,
+      requestHash: 'seed',
+      correlationId: 'test',
+      // A pipeline has a finishedAt exactly when its status is final (a CHECK).
+      finishedAt:
+        data.status === undefined || data.status === 'RUNNING'
+          ? null
+          : new Date(),
+      ...data,
+    },
+  });

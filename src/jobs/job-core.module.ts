@@ -10,6 +10,7 @@ import { ChargeJobHandler } from './handlers/charge/charge.handler.js';
 import { ImportCsvJobHandler } from './handlers/import-csv/import-csv.handler.js';
 import { ImageProcessJobHandler } from './handlers/image-process/image-process.handler.js';
 import { AiEnrichJobHandler } from './handlers/ai-enrich/ai-enrich.handler.js';
+import { PipelineFinalizeJobHandler } from './handlers/pipeline-finalize/pipeline-finalize.handler.js';
 import { StorageModule } from '../storage/storage.module.js';
 import { ProductsModule } from '../products/products.module.js';
 import { OutboundModule } from '../outbound/outbound.module.js';
@@ -19,13 +20,15 @@ import type { JobType } from './jobs.schema.js';
 // Keyed by type rather than listed: `Record<JobType, …>` makes a job type with
 // no handler a compile error, which is the one guarantee lost when the
 // processor's `switch (job.type)` went away. Adding a job type means adding an
-// option to the submit union and an entry here. Nothing in src/worker/ changes.
+// option to the submit union — or, for one only the server writes, to `JobType`
+// — and an entry here. Nothing in src/worker/ changes.
 const HANDLERS: Record<JobType, Type<RunnableJobHandler>> = {
   MOCK: MockJobHandler,
   CHARGE: ChargeJobHandler,
   'import.csv': ImportCsvJobHandler,
   'image.process': ImageProcessJobHandler,
   'ai.enrich': AiEnrichJobHandler,
+  'pipeline.finalize': PipelineFinalizeJobHandler,
 };
 
 const handlerProviders = Object.values(HANDLERS);

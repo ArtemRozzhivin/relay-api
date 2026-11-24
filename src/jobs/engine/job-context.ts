@@ -1,5 +1,14 @@
 import type { Prisma } from '../../generated/prisma/client.js';
 import type { JobProgress } from './job-progress.js';
+import type { JobType, PayloadOf } from '../jobs.schema.js';
+
+/**
+ * One batch a pipeline's job hands on (§6.3e): a job of `type`, numbered by
+ * its place among the batches of its `stage`.
+ */
+export type PipelineBatch = {
+  [T in JobType]: { stage: string; type: T; payload: PayloadOf<T> };
+}[JobType];
 
 /**
  * What a handler is allowed to know and do. Handlers receive this rather than
@@ -126,6 +135,29 @@ export interface JobContext {
    * an attempt that lost the job spent was spent all the same.
    */
   recordModelUsage(usage: ModelUsage): Promise<void>;
+
+  /**
+   * The pipeline the job belongs to (§6.3e), or `null` for a job submitted on
+   * its own.
+   */
+  readonly pipelineId: string | null;
+
+  /**
+   * Writes `batches` as jobs of this job's pipeline, with their outbox rows,
+   * and raises the pipeline's count of unfinished jobs by as many, in one
+   * transaction (§6.3e). Each batch's key is its stage and its place among
+   * that stage's batches — `pipeline:<id>:enrich:0` — so a call that runs
+   * again, on a retry, writes only what is not there yet: the unique key
+   * refuses the rest (A23).
+   *
+   * Writes nothing when the job no longer holds its place in the pipeline: a
+   * re-drive after the pipeline counted it, whose batches would arrive after
+   * the pipeline finished.
+   *
+   * @returns how many batches this call wrote.
+   * @throws JobCancelledError when this attempt no longer owns the job.
+   */
+  fanOut(batches: PipelineBatch[]): Promise<number>;
 
   /** Writes one line tagged with the job, the attempt and the request that submitted it. */
   log(message: string): void;

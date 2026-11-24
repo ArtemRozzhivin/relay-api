@@ -12,6 +12,7 @@ describe('queueFor', () => {
       'import.csv': JOBS_QUEUE,
       'image.process': JOBS_QUEUE,
       'ai.enrich': AI_QUEUE,
+      'pipeline.finalize': JOBS_QUEUE,
     });
   });
 });

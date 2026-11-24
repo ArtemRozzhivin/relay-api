@@ -120,6 +120,7 @@ describe('QueueMetrics', () => {
       'import.csv': 0,
       'image.process': 0,
       'ai.enrich': 0,
+      'pipeline.finalize': 0,
     });
   });
 

@@ -23,6 +23,7 @@ import {
   parseFile,
   type ParsedRecord,
 } from './import-csv.parse.js';
+import { FanOutPlan } from './import-csv.fan-out.js';
 
 // One transaction per batch: short enough to keep each one's row locks brief,
 // large enough that a 20 000-row file is 40 round trips rather than 20 000.
@@ -41,6 +42,10 @@ const INVALID_SAMPLES = 10;
 const JUDGED_ROWS = 100;
 
 const REPORT_COLUMNS = ['line', 'reason', ...IMPORT_COLUMNS];
+
+// How many of the file's skus a pipeline's import looks up at once: one query
+// for each, rather than one per product or one for the whole file.
+const LOOKUP_BATCH = 1000;
 
 const count = z.number().int().nonnegative();
 
@@ -205,7 +210,19 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       await this.writeReport(context, key, etag);
     }
 
-    return { rows, imported, invalid, invalidSamples };
+    const result = { rows, imported, invalid, invalidSamples };
+
+    if (context.pipelineId === null) {
+      return result;
+    }
+
+    // Last, after the report: a pipeline's batches are written once the
+    // import has nothing left that could fail it (§6.3e). Not counted in the
+    // result: a retry plans from the products as they are by then, and its
+    // count says nothing about the batches the pipeline has.
+    await context.fanOut(await this.planBatches(context.userId, key, etag));
+
+    return result;
   }
 
   // Only the bytes the import began with: a resume over different ones would
@@ -279,6 +296,61 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       ),
       uploading,
     ]);
+  }
+
+  // The products of the file's valid rows, in file order, each once: what the
+  // import wrote, read back from the same bytes rather than gathered while
+  // writing, since a resumed import never read the rows before its checkpoint.
+  private async planBatches(userId: string, key: string, etag: string) {
+    const { body } = await this.open(key, etag);
+    const plan = new FanOutPlan();
+    const seen = new Set<string>();
+    let unread: string[] = [];
+
+    const lookUp = async () => {
+      const found = new Map(
+        (await this.products.forPipeline(userId, unread)).map((product) => [
+          product.sku,
+          product,
+        ]),
+      );
+
+      for (const sku of unread) {
+        const product = found.get(sku);
+
+        if (product) {
+          plan.add(product);
+        }
+      }
+
+      unread = [];
+    };
+
+    await pipeline(
+      body,
+      parseFile(),
+      nameColumns,
+      async (records: AsyncIterable<ParsedRecord>) => {
+        for await (const { record } of records) {
+          const parsed = csvRowSchema.safeParse(record);
+
+          if (parsed.success && !seen.has(parsed.data.sku)) {
+            seen.add(parsed.data.sku);
+            unread.push(parsed.data.sku);
+
+            if (unread.length === LOOKUP_BATCH) {
+              await lookUp();
+            }
+          }
+        }
+      },
+    );
+
+    if (unread.length > 0) {
+      await lookUp();
+    }
+
+    return plan.batches();
   }
 
   // A checkpoint this version cannot read costs a restart from the top, which

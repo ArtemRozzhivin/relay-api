@@ -1,4 +1,5 @@
 import type { JobsOptions } from 'bullmq';
+import type { Job } from '../../generated/prisma/client.js';
 
 export const JOBS_QUEUE = 'relay-jobs';
 
@@ -26,9 +27,28 @@ export interface JobMessage {
 
 /**
  * An outbox row's `payload`: the queue message, plus what the queue entry's
- * options need. Written by `JobsService`, read back by the relay.
+ * options need. Written by {@link outboxEntry}, read back by the relay.
  */
 export type OutboxMessage = JobMessage & { maxAttempts: number };
+
+/**
+ * The outbox row that delivers `job`. One shape for every message the outbox
+ * carries — a submit, a re-drive, a pipeline's batches — so the relay and the
+ * direct path publish the same thing however a job reached the queue.
+ */
+export const outboxEntry = (
+  job: Pick<Job, 'id' | 'type' | 'maxAttempts'>,
+  correlationId: string,
+) => ({
+  jobId: job.id,
+  queue: queueFor(job.type),
+  jobName: job.type,
+  payload: {
+    jobId: job.id,
+    correlationId,
+    maxAttempts: job.maxAttempts,
+  } satisfies OutboxMessage,
+});
 
 // One queue entry per Outbox row, not per job. A re-drive is a new row and so a
 // new entry, which is what stops BullMQ from silently deduplicating it against

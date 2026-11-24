@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -855,27 +855,38 @@ partial failure as a first-class outcome.
 
 ### Tasks
 
-- [ ] **E.1 ·** `Pipeline` **model** with a `pendingChildren` counter and aggregate counts.
-- [ ] **E.2 · Children are our own rows** (D24), each with a **server-minted deterministic**
+- [x] **E.1 ·** `Pipeline` **model** with a `pendingChildren` counter and aggregate counts.
+  Specified first (§4.9, §6.3e): how a pipeline starts, what its import fans out into, and
+  when it finishes. `Job` gains `pipelineId` and `pendingInPipeline`, the flag that lets each
+  job take one off the counter once.
+- [x] **E.2 · Children are our own rows** (D24), each with a **server-minted deterministic**
   idempotency key `pipeline:<id>:<stage>:<batch>` (D23), enqueued through the outbox.
+  `POST /pipelines` writes the pipeline and its import; the import ends by fanning out the
+  products its file names into the batches they need, in one transaction. A23 fails the import
+  after its fan-out and proves the retry writes nothing twice.
   ```
   _`FlowProducer` would make Redis a second source of truth for pipeline structure and its
   children would bypass the outbox. Minting the key server-side also means
   `UNIQUE (userId, idempotencyKey)` makes the fan-out itself idempotent, for free._
   ```
-- [ ] **E.3 · The parent is enqueued by the transaction that takes** `pendingChildren` **to zero.**
+- [x] **E.3 · The parent is enqueued by the transaction that takes** `pendingChildren` **to zero.**
+  Every finish of a pipeline's job leaves its place in its own transaction; the one that reaches
+  zero writes `pipeline.finalize`, which sets the status and summary once. A24 stops both
+  processes around the last batch's commit and proves the relay still delivers the parent.
   ```
   _Parent-runs-when-children-finish becomes a conditional UPDATE on a counter — the idiom the
   whole engine already uses — and the parent's outbox row is written in that same transaction._
   ```
-- [ ] **E.4 · Child-failure policy** — a failed batch does not fail the pipeline; the pipeline ends
+- [x] **E.4 · Child-failure policy** — a failed batch does not fail the pipeline; the pipeline ends
   `completed_with_errors` (on `Pipeline`, never on `Job` — D22) and the batch stays re-drivable.
+  Built by E.3's status rule; E.4 proves it. A22 takes the model down for one batch
+  (`[llm:down]`), which dead-letters while its siblings succeed, then re-drives it.
 
 ### Done when
 
-- [ ] **A22 passes** — a failed child leaves the pipeline `completed_with_errors`, not failed
-- [ ] **A23 passes** — replaying the fan-out cannot create a second row for any batch
-- [ ] **A24 passes** — a crash between the last child committing and the parent being enqueued is
+- [x] **A22 passes** — a failed child leaves the pipeline `completed_with_errors`, not failed
+- [x] **A23 passes** — replaying the fan-out cannot create a second row for any batch
+- [x] **A24 passes** — a crash between the last child committing and the parent being enqueued is
   recovered by the outbox relay
 
 ---

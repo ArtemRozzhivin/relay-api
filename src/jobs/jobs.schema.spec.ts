@@ -28,14 +28,24 @@ describe('submitJobSchema', () => {
     expect(parsed.success).toBe(false);
   });
 
-  it('lists every type the union accepts', () => {
+  it('lists every type the union accepts, then the one only the server writes', () => {
     expect(JOB_TYPES).toEqual([
       'MOCK',
       'CHARGE',
       'import.csv',
       'image.process',
       'ai.enrich',
+      'pipeline.finalize',
     ]);
+  });
+
+  it("refuses a pipeline's finalize job from a client", () => {
+    const parsed = submitJobSchema.safeParse({
+      type: 'pipeline.finalize',
+      payload: { pipelineId: '6f1c0c2e-6a1b-4f4e-9d65-0a8d5f0c1b2a' },
+    });
+
+    expect(parsed.success).toBe(false);
   });
 });
 

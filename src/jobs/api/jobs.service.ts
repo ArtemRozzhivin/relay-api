@@ -17,8 +17,8 @@ import { Prisma, type Job } from '../../generated/prisma/client.js';
 import {
   jobOptions,
   messageId,
+  outboxEntry,
   queueFor,
-  type OutboxMessage,
 } from '../delivery/job-queue.js';
 import { JobQueues } from '../delivery/job-queues.js';
 import type {
@@ -43,20 +43,6 @@ import { describeError } from '../../common/errors/describe-error.js';
 // Fetched when the seller clicks, so a short life costs nothing: a link that
 // leaks from a browser history is dead within minutes.
 const REPORT_LINK_SECONDS = 300;
-
-// One shape for every message the outbox carries — submit, re-drive and bulk
-// re-drive alike — so the relay and the direct path publish the same thing
-// however a job reached the queue.
-const outboxEntry = (job: Job, correlationId: string) => ({
-  jobId: job.id,
-  queue: queueFor(job.type),
-  jobName: job.type,
-  payload: {
-    jobId: job.id,
-    correlationId,
-    maxAttempts: job.maxAttempts,
-  } satisfies OutboxMessage,
-});
 
 // The caller's dead letters matching a filter, for the list and the bulk
 // re-drive alike. Every filter is optional on its own; the re-drive's schema
@@ -225,10 +211,12 @@ export class JobsService {
     }
   }
 
-  // The direct path (§4.5): enqueued at once rather than on the relay's next
-  // tick. Should anything here fail, the outbox row stays unpublished and the
-  // relay delivers it instead.
-  private async publishNow(job: Job, outboxId: bigint, correlationId: string) {
+  /**
+   * The direct path (§4.5): enqueues a job whose outbox row has just
+   * committed, at once rather than on the relay's next tick. Should anything
+   * here fail, the row stays unpublished and the relay delivers it instead.
+   */
+  async publishNow(job: Job, outboxId: bigint, correlationId: string) {
     await this.queues
       .named(queueFor(job.type))
       .add(
