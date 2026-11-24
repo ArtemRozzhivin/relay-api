@@ -46,6 +46,8 @@ export const estimateCostUsd = (
  * every provider is held to the same rules.
  *
  * @throws LlmRateLimitError when the provider is busy and says for how long.
+ * Anything else it throws — the provider down, say — fails the attempt, and
+ * the job is retried until its attempts are spent.
  */
 export interface LlmProvider {
   readonly model: string;

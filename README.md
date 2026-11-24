@@ -42,6 +42,7 @@ nothing.
 | Enriching an unchanged product again costs nothing        | A second run on the same text asks the model nothing (A21)        |
 | A pipeline writes each of its batches once                | The import fails after writing them; the retry writes none (A23)  |
 | A pipeline's summary job survives a crash                 | API down and worker killed around the last batch (A24)            |
+| A failed batch does not fail its pipeline                 | One batch dead-letters; the pipeline ends with errors (A22)       |
 
 The full list, with the SQL each test checks, is §14 of the
 [technical specification](docs/TECH_SPEC.md#14-verification-plan).

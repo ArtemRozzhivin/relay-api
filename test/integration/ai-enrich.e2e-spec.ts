@@ -371,6 +371,26 @@ describe('the ai.enrich handler', () => {
     ).toBe(true);
   });
 
+  // Not a pause: a provider that is down says nothing of when it will be up,
+  // so the attempt fails and the job's retries are what wait (A22).
+  it('fails the attempt when the model is down, and writes nothing', async () => {
+    const userId = await store(['LAMP', 'Lamp [llm:down]'], ['SOFA', 'Sofa']);
+    const { context, usages } = recordingContext({ userId });
+
+    const failed = await handler
+      .run(context, { skus: ['LAMP', 'SOFA'] })
+      .catch((error: unknown) => error);
+
+    expect(failed).toBeInstanceOf(Error);
+    expect(failed).not.toBeInstanceOf(JobRateLimitedError);
+    expect(failed).toMatchObject({ message: expect.stringMatching(/503/) });
+    expect(await stored(userId)).toEqual({
+      LAMP: { status: null, category: null, tags: [], error: null },
+      SOFA: { status: null, category: null, tags: [], error: null },
+    });
+    expect(usages).toEqual([]);
+  });
+
   it('records nothing for a request the model refused as busy', async () => {
     // Its own product: the fake refuses each busy product once a process.
     const userId = await store(['STOOL', 'Stool [llm:busy]']);

@@ -65,6 +65,12 @@ export class FakeLlmProvider implements LlmProvider {
   private readonly refusedAsBusy = new Set<string>();
 
   async enrich(request: LlmRequest) {
+    if (holding(request, 'down').length > 0) {
+      throw new Error(
+        'The language model is unavailable: 503 Service Unavailable',
+      );
+    }
+
     const busy = holding(request, 'busy')
       .map((product) => JSON.stringify([product.sku, product.name]))
       .filter((key) => !this.refusedAsBusy.has(key));

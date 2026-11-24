@@ -114,6 +114,17 @@ describe('FakeLlmProvider', () => {
     );
   });
 
+  it('fails every request holding [llm:down], as a provider that is down does', async () => {
+    const fake = new FakeLlmProvider();
+    const request = { products: [product('DOWN-1', 'Lamp [llm:down]'), mug] };
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(fake.enrich(request)).rejects.toThrow(/unavailable: 503/);
+    }
+
+    await expect(fake.enrich({ products: [mug] })).resolves.toBeDefined();
+  });
+
   describe('[llm:slow]', () => {
     afterEach(() => {
       vi.useRealTimers();

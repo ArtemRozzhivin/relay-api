@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -877,12 +877,14 @@ partial failure as a first-class outcome.
   _Parent-runs-when-children-finish becomes a conditional UPDATE on a counter — the idiom the
   whole engine already uses — and the parent's outbox row is written in that same transaction._
   ```
-- [ ] **E.4 · Child-failure policy** — a failed batch does not fail the pipeline; the pipeline ends
+- [x] **E.4 · Child-failure policy** — a failed batch does not fail the pipeline; the pipeline ends
   `completed_with_errors` (on `Pipeline`, never on `Job` — D22) and the batch stays re-drivable.
+  Built by E.3's status rule; E.4 proves it. A22 takes the model down for one batch
+  (`[llm:down]`), which dead-letters while its siblings succeed, then re-drives it.
 
 ### Done when
 
-- [ ] **A22 passes** — a failed child leaves the pipeline `completed_with_errors`, not failed
+- [x] **A22 passes** — a failed child leaves the pipeline `completed_with_errors`, not failed
 - [x] **A23 passes** — replaying the fan-out cannot create a second row for any batch
 - [x] **A24 passes** — a crash between the last child committing and the parent being enqueued is
   recovered by the outbox relay
