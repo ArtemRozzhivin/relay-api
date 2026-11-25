@@ -20,12 +20,26 @@ import {
   type StartPipelineInput,
 } from '../jobs.schema.js';
 import { AllowApiKeys } from '../../api-keys/allow-api-keys.decorator.js';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { HttpStatus } from '@nestjs/common';
+import { ApiData, ApiIdempotencyKey } from '../../docs/openapi-schemas.js';
+import { pipelineView, startedPipelineView } from '../jobs.responses.js';
 
+@ApiTags('Pipelines')
 @AllowApiKeys()
 @Controller('pipelines')
 export class PipelinesController {
   constructor(private readonly pipelines: PipelinesService) {}
 
+  @ApiOperation({
+    summary: 'Import a CSV, then enrich and image what it imported',
+  })
+  @ApiIdempotencyKey()
+  @ApiData(
+    HttpStatus.ACCEPTED,
+    startedPipelineView,
+    'The pipeline, with its import queued',
+  )
   // A pipeline is an import and every batch it fans out into. The import cap
   // bounds the work in flight (D32); this bounds the requests, as for a submit.
   @RateLimit(60, minutes(1))
@@ -47,6 +61,10 @@ export class PipelinesController {
     return { ...pipeline, replayed };
   }
 
+  @ApiOperation({
+    summary: 'How a pipeline is going, and its summary once done',
+  })
+  @ApiData(HttpStatus.OK, pipelineView, 'The pipeline')
   @Get(':id')
   findOne(
     @CurrentUser() user: AuthenticatedUser,

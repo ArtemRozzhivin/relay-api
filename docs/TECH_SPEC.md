@@ -501,6 +501,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/admin/api-keys` | admin | `200` / `403` | Every account's keys, newest first, each with its `owner` (`id`, `email`); never the secret or its hash. Filter `?email=`, `?status=active\|revoked`; paged like `/jobs`. See §6.3f |
 | `POST` | `/admin/api-keys/revoke` | admin | `200` / `403` | `{ email?, dryRun? }` → `{ matched, revoked }`: every unrevoked key, or the ones of the account with that email. `dryRun` counts and revokes none. `403` for anyone without the `ADMIN` role. See §6.3f |
 | `POST` | `/uploads` | access | `200` / `429` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. `429 TOO_MANY_UPLOADS` past 20 in 24 hours (D32). See §6.3a |
+| `GET` | `/docs` | — | `200` | The API reference, Swagger UI. `/docs/openapi.json` is the OpenAPI document. See §6.5 |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
 
@@ -965,6 +966,29 @@ Three checks, three homes: shape → pipe (`400`); business rules → service
 different threat: not a bad client, but a schema that moved underneath a row already queued.
 
 ---
+
+### 6.5 The API reference — `/docs` (PF)
+
+`GET /docs` serves the reference a developer integrating with Relay reads — Swagger UI — and
+`GET /docs/openapi.json` the OpenAPI 3.0 document it is drawn from. Both are public, and outside
+the guards: the reference says how to sign in, so it cannot ask for it.
+
+**Drawn from the code, and checked against it.** Requests are documented from the Zod schemas
+the routes validate with — `@nestjs/swagger` reads the schema each `@Body`, `@Query` and `@Param`
+is given, through Zod's Standard JSON Schema — so a field the API accepts and one the reference
+lists cannot differ. Answers have Zod schemas of their own (`*.responses.ts`), strict, which the
+reference shows inside the success envelope; a test calls every public route and parses each
+answer with them, so a field a route adds without documenting it, or a documented one it stops
+giving, fails it. Every operation's `default` answer is the error envelope, documented once.
+
+**Signing in, as the guards decide it.** Two bearer schemes, `session` and `apiKey`.
+`@AllowApiKeys()` marks a controller's routes with both, in the same decorator that lets
+`ApiKeyGuard` accept a key there, so the reference cannot say a key works where it is refused.
+The page's introduction explains sessions, keys and their scopes, the `Idempotency-Key` header,
+the envelope, rate limits and cursors.
+
+Left out: the operator's `/admin` routes, `/health` and `/ready`, which are the platform's, and
+the scaffold `GET /`. _Built in F.3._
 
 ## 7. Reliability rules
 
@@ -1638,7 +1662,7 @@ Request logging — the request id and timing — is pino-http's module middlewa
 interceptor.
 
 What must run before Nest's own middleware — `trust proxy`, request metrics, the request id,
-helmet, CORS, the body parser — and the socket's adapter are applied by `configureApp()` instead,
+helmet, CORS, the body parser — the socket's adapter, and the reference at `/docs` (§6.5) are applied by `configureApp()` instead,
 from `main.ts` and from the tests that boot `AppModule` alike (§15.2).
 
 ### 10.3 Lifecycle order — where it bites
@@ -1819,6 +1843,7 @@ Verified 2026-09-01 against the official NestJS, BullMQ, and Prisma documentatio
 | `nestjs-pino` + `pino` + `pino-http` | 5.x / 10.x / 11.x | pino 10 is required by nestjs-pino 5 |
 | `helmet` | 8.x | Security headers on every response (§15.2) |
 | `@nestjs/throttler` | 6.7.x | Rate limits, with its in-memory storage (§15.2) |
+| `@nestjs/swagger` | 12.1.x | The API reference (§6.5). Reads a route's Standard Schema itself, so Zod needs no adapter. Its UI files pull in `@scarf/scarf`, whose install script phones home; npm's script allowlist leaves it unrun |
 | `@prometheus-io/client` | 0.16.x | The metrics registry (§12.3). Formerly `prom-client`, renamed when the Prometheus project adopted it |
 | `argon2` | latest | `Bun.password` does not exist on Node |
 | `ioredis` | latest | Now an **optional** peer of BullMQ v6, so declare it explicitly |
@@ -2673,6 +2698,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-24 | §6.2, §6.5, §10.2, §13.2 — the API reference, F.3, which closes PF. Swagger UI at `/docs` and the OpenAPI document at `/docs/openapi.json`, public. Requests documented from the Zod schemas the routes validate with; answers from strict Zod schemas of their own, which a test parses every public route's real answer with. `session` and `apiKey` bearer schemes, the second set by `@AllowApiKeys()` itself; the error envelope as every operation's `default`. The admin routes, `/health`, `/ready` and `GET /` left out. `@nestjs/swagger` 12.1 added. |
 | 2026-11-24 | §6.3f, §10.1, §10.2, §12.1, §14 — using an API key, F.2. `ApiKeyGuard`, beside `JwtAuthGuard`, lets in `Bearer relay_…` on the jobs, pipelines, uploads and products controllers (`@AllowApiKeys()`), `read` for a `GET` and `write` for the rest, as the key's owner; `403` on any other route. Looked up by hash on every request; `lastUsedAt` written at most once a minute, not awaited. The request log line names the key's id. A25 and A26 registered. |
 | 2026-11-24 | §4.10, §6.2, §6.3f, §10.2, §11 — API keys specified, F.1. `relay_` and 32 random bytes, stored as SHA-256 and shown once; `read` and `write` scopes over jobs, pipelines, uploads and products; only a session manages keys; looked up on every request, so revocation needs no restart; one unrevoked key per account. `POST /api-keys`, `GET /api-keys` and `POST /api-keys/:id/revoke` built, and the operator's `GET /admin/api-keys` and `POST /admin/api-keys/revoke`, the first admin routes, which register `RolesGuard`. `API_KEYS_ENABLED` turns keys off. **New migration** `20261124100000_api_key`. |
 | 2026-11-24 | §6.3d, §6.3e, §14 — a failed batch, E.4, which closes PE. `[llm:down]` added to the fake: a provider down fails the attempt, and the batch is dead-lettered once its attempts are spent. A22 registered: the pipeline ends `COMPLETED_WITH_ERRORS`, and a re-drive of the batch fixes its products without reopening it. |

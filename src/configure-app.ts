@@ -8,6 +8,7 @@ import type { ServerOptions } from 'socket.io';
 import type { ApiEnv } from './config/env.schema.js';
 import { assignRequestId } from './common/logging/request-id.js';
 import { HttpMetrics } from './metrics/http-metrics.js';
+import { setUpApiDocs } from './docs/api-docs.js';
 
 // The largest body a route takes is an image.process batch: 50 SKUs, about
 // 30 KB even with every character sent as a \u escape.
@@ -16,7 +17,7 @@ const JSON_BODY_LIMIT = '64kb';
 /**
  * The HTTP edge: the client's address, request metrics, the request id,
  * security headers, the body parser, and the origins a browser may call from
- * — over HTTP and over the socket alike.
+ * — over HTTP and over the socket alike — and the API's reference at /docs.
  * Shared by `main.ts` and the tests that boot `AppModule`, so those run against
  * the edge that ships.
  *
@@ -46,6 +47,8 @@ export const configureApp = (app: NestExpressApplication) => {
   app.useBodyParser('json', { limit: JSON_BODY_LIMIT });
 
   app.useWebSocketAdapter(new AllowlistIoAdapter(app, origins));
+
+  setUpApiDocs(app);
 };
 
 // A gateway's decorator is evaluated when its file is imported, before any

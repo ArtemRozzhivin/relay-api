@@ -8,7 +8,10 @@ import { PrismaService } from '../prisma/prisma.service.js';
 import { RedisHealthIndicator } from './redis.health.js';
 import { Public } from '../auth/decorators/public.decorator.js';
 import { NoEnvelope } from '../common/decorators/no-envelope.decorator.js';
+import { ApiExcludeController } from '@nestjs/swagger';
 
+// For the platform that runs the process, not for a client.
+@ApiExcludeController()
 @Controller()
 export class HealthController {
   constructor(

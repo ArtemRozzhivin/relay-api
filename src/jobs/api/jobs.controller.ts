@@ -30,6 +30,16 @@ import {
   type SubmitJobInput,
 } from '../jobs.schema.js';
 import { AllowApiKeys } from '../../api-keys/allow-api-keys.decorator.js';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { HttpStatus } from '@nestjs/common';
+import { ApiData, ApiIdempotencyKey } from '../../docs/openapi-schemas.js';
+import {
+  jobPage,
+  jobView,
+  redrivenView,
+  reportLinkView,
+  submittedJobView,
+} from '../jobs.responses.js';
 
 // The fingerprint is how the API recognises a retry (D28), the lease is how
 // workers recognise each other (D7), the checkpoint is where a handler resumes
@@ -56,11 +66,15 @@ const toJobView = ({
   },
 });
 
+@ApiTags('Jobs')
 @AllowApiKeys()
 @Controller('jobs')
 export class JobsController {
   constructor(private readonly jobs: JobsService) {}
 
+  @ApiOperation({ summary: 'Submit a job; it runs after the answer' })
+  @ApiIdempotencyKey()
+  @ApiData(HttpStatus.ACCEPTED, submittedJobView, 'The job, queued')
   // Each accepted job is work for the worker; many images go in one
   // image.process batch, not one submit each.
   @RateLimit(60, minutes(1))
@@ -82,6 +96,14 @@ export class JobsController {
     return { ...toJobView(job), replayed };
   }
 
+  @ApiOperation({
+    summary: 'Re-drive the dead letters a filter matches, a batch per call',
+  })
+  @ApiData(
+    HttpStatus.ACCEPTED,
+    redrivenView,
+    'How many were re-driven, and how many still match',
+  )
   // Each call can send up to 1000 dead letters back to work. Working through
   // an outage is a loop of calls, and ten a minute is ten thousand jobs.
   @RateLimit(10, minutes(1))
@@ -95,6 +117,8 @@ export class JobsController {
     return this.jobs.redriveMatching(user.id, filter, String(request.id));
   }
 
+  @ApiOperation({ summary: 'Re-drive one dead-lettered job' })
+  @ApiData(HttpStatus.ACCEPTED, jobView, 'The job, queued again')
   // Each re-drive runs a job again, as a submit does.
   @RateLimit(60, minutes(1))
   @Post(':id/retry')
@@ -112,6 +136,12 @@ export class JobsController {
     );
   }
 
+  @ApiOperation({ summary: 'Ask for a job to stop' })
+  @ApiData(
+    HttpStatus.ACCEPTED,
+    jobView,
+    'The job: cancelled, or stopping at its next safe point',
+  )
   @Post(':id/cancel')
   @HttpCode(202)
   async cancel(
@@ -121,6 +151,10 @@ export class JobsController {
     return toJobView(await this.jobs.cancel(user.id, id));
   }
 
+  @ApiOperation({
+    summary: 'The dead letters a filter matches, oldest dead first',
+  })
+  @ApiData(HttpStatus.OK, jobPage, 'A page of dead-lettered jobs')
   // Declared before ':id', which would otherwise take 'dead-letters' for a job
   // id and refuse it as one.
   @Get('dead-letters')
@@ -133,6 +167,8 @@ export class JobsController {
     return { ...page, items: page.items.map(toJobView) };
   }
 
+  @ApiOperation({ summary: 'A job: its status, progress and result' })
+  @ApiData(HttpStatus.OK, jobView, 'The job')
   @Get(':id')
   async findOne(
     @CurrentUser() user: AuthenticatedUser,
@@ -141,6 +177,8 @@ export class JobsController {
     return toJobView(await this.jobs.findOne(user.id, id));
   }
 
+  @ApiOperation({ summary: "A link to download an import's invalid rows" })
+  @ApiData(HttpStatus.OK, reportLinkView, 'Signed for 5 minutes')
   @Get(':id/error-report')
   errorReport(
     @CurrentUser() user: AuthenticatedUser,
@@ -149,6 +187,8 @@ export class JobsController {
     return this.jobs.errorReportLink(user.id, id);
   }
 
+  @ApiOperation({ summary: "The account's jobs, newest first" })
+  @ApiData(HttpStatus.OK, jobPage, 'A page of jobs')
   @Get()
   async findMany(
     @CurrentUser() user: AuthenticatedUser,

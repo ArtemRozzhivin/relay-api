@@ -12,8 +12,11 @@ import { CurrentUser } from '../auth/decorators/current-user.decorator.js';
 import { Roles } from '../auth/decorators/roles.decorator.js';
 import type { AuthenticatedUser } from '../auth/auth.types.js';
 import { RateLimit } from '../common/rate-limit/rate-limit.js';
+import { ApiExcludeController } from '@nestjs/swagger';
 
 // The operator's, not a seller's: keys across accounts (§6.3f).
+// The operator's, not part of the public reference.
+@ApiExcludeController()
 @Roles([Role.ADMIN])
 @Controller('admin/api-keys')
 export class AdminApiKeysController {

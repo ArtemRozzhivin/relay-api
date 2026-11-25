@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF ✓ → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -912,7 +912,9 @@ partial failure as a first-class outcome.
   controllers, `read` for a `GET` and `write` for the rest, and nothing for a person; it is looked
   up on every request, so a revoke needs no restart (A25), and its secret is in no row or log
   (A26).
-- [ ] **F.3 · Swagger** for the public surface, documenting api-key auth.
+- [x] **F.3 · Swagger** for the public surface, documenting api-key auth. `/docs` and
+  `/docs/openapi.json`, drawn from the routes' Zod schemas; the answers' own schemas are checked
+  against every public route's real answer in a test, so the reference cannot drift (§6.5).
 
 ### Done when
 

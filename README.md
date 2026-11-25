@@ -117,6 +117,9 @@ CI runs all three on every pull request.
   state machine, the reliability rules, and every decision with its trade-offs.
 - [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md): the milestones and where each one
   stands.
+- **The API reference** is served by the API itself, at `/docs` (`http://localhost:3000/docs`
+  locally), with the OpenAPI document at `/docs/openapi.json`. It covers signing in with a session
+  or an API key, and every route a client calls.
 
 ## License
 
