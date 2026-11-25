@@ -54,7 +54,7 @@ describe('the image.process handler', () => {
   // A path answered with something other than an image, before `images`.
   const answers = new Map<
     string,
-    { status: number; type?: string; body?: string }
+    { status: number; type?: string; body?: string | Buffer }
   >();
 
   // Runs before the response is sent, so a test can change the world while
@@ -134,6 +134,29 @@ describe('the image.process handler', () => {
       status: 200,
       type: 'image/png',
       body: 'not an image',
+    });
+    // Called a PNG; sharp would decode either from its bytes.
+    answers.set('/vector.png', {
+      status: 200,
+      type: 'image/png',
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>',
+    });
+    answers.set('/scan.png', {
+      status: 200,
+      type: 'image/png',
+      body: await sharp({
+        create: { width: 10, height: 10, channels: 3, background: '#333' },
+      })
+        .tiff()
+        .toBuffer(),
+    });
+    // A JPEG under the name some storefronts and SDKs still send.
+    answers.set('/legacy.jpg', {
+      status: 200,
+      type: 'image/jpg',
+      body: await png(300, 200).then((buffer) =>
+        sharp(buffer).jpeg().toBuffer(),
+      ),
     });
     // Stored landscape, 1000 × 400, with EXIF saying "turn me a quarter":
     // upright it is 400 wide. It also carries a GPS position.
@@ -248,10 +271,11 @@ describe('the image.process handler', () => {
 
     await run(userId, ['PHOTO']).result;
 
-    // Upright it is 400 wide, so medium and large stop there.
+    // Upright it is 400 × 1000: each size is held by its height, and large,
+    // taller than the photo, keeps it as it is.
     expect(await sizesOf(userId, photo.id, url)).toEqual([
-      'webp 200',
-      'webp 400',
+      'webp 80',
+      'webp 240',
       'webp 400',
     ]);
 
@@ -266,6 +290,21 @@ describe('the image.process handler', () => {
 
     expect(metadata.exif).toBeUndefined();
     expect(metadata.orientation).toBeUndefined();
+  });
+
+  it('makes a JPEG served as image/jpg', async () => {
+    const userId = await store();
+    const url = `${base}/legacy.jpg`;
+    const plate = await product(userId, 'PLATE', url);
+
+    expect(await run(userId, ['PLATE']).result).toMatchObject({
+      processed: 1,
+    });
+    expect(await sizesOf(userId, plate.id, url)).toEqual([
+      'webp 200',
+      'webp 300',
+      'webp 300',
+    ]);
   });
 
   it('never enlarges a small image', async () => {
@@ -465,6 +504,16 @@ describe('the image.process handler', () => {
         'an image declaring more pixels than allowed',
         () => `${base}/bomb.png`,
         'Not a readable image: Input image exceeds pixel limit',
+      ],
+      [
+        'an SVG called a PNG',
+        () => `${base}/vector.png`,
+        'Not a readable image: svg is not an accepted image format',
+      ],
+      [
+        'a TIFF called a PNG',
+        () => `${base}/scan.png`,
+        'Not a readable image: tiff is not an accepted image format',
       ],
       [
         'a private address',

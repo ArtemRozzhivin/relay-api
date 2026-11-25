@@ -3,16 +3,37 @@ import { PrismaService } from '../prisma/prisma.service.js';
 import type { Prisma, Product } from '../generated/prisma/client.js';
 import { toPage } from '../common/pagination/cursor.js';
 import { StorageService } from '../storage/storage.service.js';
+import { lockAccount } from '../prisma/account-lock.js';
 import { productImageKey } from '../storage/object-keys.js';
 import { IMAGE_SIZES, type ImageSize } from '../images/image-variants.js';
 import type { ListProductsQuery } from './products.schema.js';
 import { hashEnrichmentInput } from '../enrichment/enrichment-input.js';
 import type { Enrichment } from '../enrichment/enrichment-reply.js';
 
-/** One product as an import writes it, after its row has been validated. */
+// "Not READY for this input", written out: a NOT over the pair would be NULL
+// for a product with no conclusion yet, and so would match none. A status is
+// never set without its input (a CHECK), so these three cover every row.
+const notReady = (
+  status: 'imageStatus' | 'enrichmentStatus',
+  input: 'imageSourceUrl' | 'enrichmentInputHash',
+  value: string,
+): Prisma.ProductWhereInput[] => [
+  { [status]: null },
+  { [status]: 'FAILED' },
+  { [input]: { not: value } },
+];
+
 // Signed per page, never stored: a stored link would have expired by the time
 // anyone opened it. An hour outlives any page a client keeps open.
 const IMAGE_LINK_SECONDS = 3600;
+
+/**
+ * How many products one store may hold (D32). Products are what the bucket's
+ * never-expiring `products/` folder holds images of, and what a pipeline makes
+ * batches from, so this bounds both: at most 250 AI batches a pipeline, about
+ * twelve minutes of the AI queue.
+ */
+export const PRODUCTS_PER_ACCOUNT = 5000;
 
 /** A product's image as a client sees it. */
 export type ProductImage =
@@ -33,6 +54,7 @@ interface EnrichedFrom {
   description: string | null;
 }
 
+/** One product as an import writes it, after its row has been validated. */
 export interface ProductRow {
   sku: string;
   name: string;
@@ -120,8 +142,9 @@ export class ProductsService {
 
   /**
    * Records that the image at `sourceUrl` cannot be made, and why — under the
-   * same condition as `recordImageReady`. `error` is shown to the product's
-   * owner.
+   * same condition as `recordImageReady`, and never over a READY conclusion
+   * about the same URL: of two jobs that raced on one product, the one that
+   * made the image wins. `error` is shown to the product's owner.
    *
    * @returns whether it was recorded.
    */
@@ -143,11 +166,6 @@ export class ProductsService {
   }
 
   /**
-   * The caller's products among `skus`, with the text ai.enrich sends and what
-   * their last enrichment was made from. A sku the caller has no product for
-   * is simply absent.
-   */
-  /**
    * What a pipeline's import needs to decide which of `skus` still need an
    * enrichment or an image (§6.3e). In no particular order: the caller puts
    * them in the file's.
@@ -168,6 +186,11 @@ export class ProductsService {
     });
   }
 
+  /**
+   * The caller's products among `skus`, with the text ai.enrich sends and what
+   * their last enrichment was made from. A sku the caller has no product for
+   * is simply absent.
+   */
   forEnrichment(userId: string, skus: string[]) {
     return this.prisma.product.findMany({
       where: { userId, sku: { in: skus } },
@@ -208,9 +231,10 @@ export class ProductsService {
 
   /**
    * Records that the model gave no usable answer for a product, and why, under
-   * the same condition as `recordEnrichmentReady`. `error` is shown to the
-   * product's owner. Clears any earlier category and tags, which were made from
-   * older text.
+   * the same condition as `recordEnrichmentReady`, and never over a READY
+   * answer made from the same text: of two jobs that raced on one product, the
+   * one that got an answer wins. `error` is shown to the product's owner.
+   * Clears any earlier category and tags, which were made from older text.
    *
    * @returns whether it was recorded.
    */
@@ -234,12 +258,24 @@ export class ProductsService {
     { id, name, description }: EnrichedFrom,
     data: Prisma.ProductUpdateManyMutationInput,
   ) {
+    const inputHash = hashEnrichmentInput({ name, description });
     const { count } = await client.product.updateMany({
-      where: { id, userId, name, description },
-      data: {
-        ...data,
-        enrichmentInputHash: hashEnrichmentInput({ name, description }),
+      where: {
+        id,
+        userId,
+        name,
+        description,
+        ...(data.enrichmentStatus === 'FAILED'
+          ? {
+              OR: notReady(
+                'enrichmentStatus',
+                'enrichmentInputHash',
+                inputHash,
+              ),
+            }
+          : {}),
       },
+      data: { ...data, enrichmentInputHash: inputHash },
     });
 
     return count === 1;
@@ -254,7 +290,14 @@ export class ProductsService {
     error: string | null,
   ) {
     const { count } = await client.product.updateMany({
-      where: { id: productId, userId, imageUrl: sourceUrl },
+      where: {
+        id: productId,
+        userId,
+        imageUrl: sourceUrl,
+        ...(status === 'FAILED'
+          ? { OR: notReady('imageStatus', 'imageSourceUrl', sourceUrl) }
+          : {}),
+      },
       data: {
         imageStatus: status,
         imageSourceUrl: sourceUrl,
@@ -317,6 +360,66 @@ export class ProductsService {
     }
 
     return { ...product, image, enrichment };
+  }
+
+  /** Which of `skus` the store has a product for. */
+  async knownSkus(
+    userId: string,
+    skus: string[],
+    client: Prisma.TransactionClient = this.prisma,
+  ) {
+    const found = await client.product.findMany({
+      where: { userId, sku: { in: skus } },
+      select: { sku: true },
+    });
+
+    return new Set(found.map(({ sku }) => sku));
+  }
+
+  /**
+   * {@link upsertBatch}, keeping the store within {@link PRODUCTS_PER_ACCOUNT}:
+   * a sku it has is always written, a new one only while there is room, in the
+   * batch's order. Counted under the account's lock (D32), so two imports into
+   * one store cannot both take its last places.
+   *
+   * @param tx the transaction the import's checkpoint is written in; the lock
+   * is held until it ends.
+   * @returns how many rows were written, and the new skus refused for want of
+   * room.
+   */
+  async upsertWithinLimit(
+    userId: string,
+    rows: ProductRow[],
+    tx: Prisma.TransactionClient,
+  ) {
+    await lockAccount(tx, userId);
+
+    const skus = [...new Set(rows.map(({ sku }) => sku))];
+    const held = await tx.product.count({ where: { userId } });
+    const known = await this.knownSkus(userId, skus, tx);
+
+    let room = PRODUCTS_PER_ACCOUNT - held;
+    const refused = new Set<string>();
+
+    for (const sku of skus) {
+      if (known.has(sku)) {
+        continue;
+      }
+
+      if (room > 0) {
+        room -= 1;
+      } else {
+        refused.add(sku);
+      }
+    }
+
+    const written = await this.upsertBatch(
+      userId,
+      rows.filter(({ sku }) => !refused.has(sku)),
+      tx,
+    );
+
+    return { written, refused: [...refused] };
   }
 
   /**

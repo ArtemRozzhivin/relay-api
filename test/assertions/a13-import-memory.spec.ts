@@ -9,6 +9,11 @@ import {
 const SMALL = 2_000;
 const LARGE = 20_000;
 
+// The most products a store holds (D32, §15.2). The files name the same ones
+// over and over: what grows is the file, which is what this measures, while
+// the catalog stays within its limit.
+const CATALOG = 5_000;
+
 // About 2 KB a row: 20 000 short rows are a file of under a megabyte, which no
 // reading could tell from noise. These make files of about 4 MB and 39 MB.
 const DESCRIPTION = 'A product description long enough to weigh. '.repeat(42);
@@ -18,13 +23,13 @@ const DESCRIPTION = 'A product description long enough to weigh. '.repeat(42);
 // holds a 500-row batch, about 1 MB, whatever the file's size.
 const BAND_MB = 18;
 
-const csvOf = (prefix: string, rows: number) =>
+const csvOf = (rows: number) =>
   [
     'sku,name,description,price,currency',
     ...Array.from(
       { length: rows },
       (_, index) =>
-        `${prefix}-${index},Product ${index},${DESCRIPTION}${index},${index}.99,EUR`,
+        `SKU-${index % CATALOG},Product ${index},${DESCRIPTION}${index},${index}.99,EUR`,
     ),
   ].join('\n');
 
@@ -54,13 +59,13 @@ describe('A13 · a large import does not grow with the file', () => {
   });
 
   afterAll(async () => {
-    // 42 000 products of 2 KB each would otherwise stay in the database.
+    // 5 000 products of 2 KB each would otherwise stay in the database.
     await harness.prisma.user.deleteMany({ where: { id: account.id } });
     await harness.stop();
   });
 
-  const importPeak = async (prefix: string, rows: number) => {
-    const key = await harness.upload(account, csvOf(prefix, rows));
+  const importPeak = async (rows: number) => {
+    const key = await harness.upload(account, csvOf(rows));
     const from = worker.log.length;
 
     const { body } = await harness.submit(account, {
@@ -89,10 +94,10 @@ describe('A13 · a large import does not grow with the file', () => {
     // first several thousand rows — compiled code, connection buffers — and
     // then levels off; measured before that, the small import would read low
     // and the difference would be warm-up, not the file.
-    await importPeak('WARM', LARGE);
+    await importPeak(LARGE);
 
-    const small = await importPeak('SMALL', SMALL);
-    const large = await importPeak('LARGE', LARGE);
+    const small = await importPeak(SMALL);
+    const large = await importPeak(LARGE);
 
     console.info(
       `A13: live memory peaked at ${small.toFixed(1)} MB for ${SMALL} rows, ${large.toFixed(1)} MB for ${LARGE} (+${(large - small).toFixed(1)} MB; band ${BAND_MB} MB)`,

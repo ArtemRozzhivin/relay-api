@@ -289,7 +289,7 @@ code it gives each item it sells), never by our `id`, so the SKU is the key an i
 | `imageUrl` | `text?` | As written in the file — untrusted until phase C's outbound guard has checked it |
 | `imageStatus` | `text?` | `READY` or `FAILED`: what `image.process` concluded about `imageSourceUrl` (§6.3c). **DB** `CHECK` |
 | `imageSourceUrl` | `text?` | The `imageUrl` that conclusion is about. Set exactly when `imageStatus` is (**DB** `CHECK`). Once an import replaces `imageUrl`, the two differ and the image reads as not processed yet — nothing has to clear the old conclusion |
-| `imageError` | `text?` | Why the image at `imageSourceUrl` could not be used. **DB** `CHECK`: only when `FAILED` |
+| `imageError` | `text?` | Why the image at `imageSourceUrl` could not be used. **DB** `CHECK`: only when `FAILED` — `IS NOT DISTINCT FROM`, so a reason on a product with no conclusion fails it |
 | `enrichmentStatus` | `text?` | `READY` or `FAILED`: what `ai.enrich` concluded from the input `enrichmentInputHash` names (§6.3d). **DB** `CHECK` |
 | `enrichmentInputHash` | `text?` | SHA-256 of the name, description and instructions' version the conclusion was made from. Set exactly when `enrichmentStatus` is (**DB** `CHECK`). Once an import changes the text, the hash no longer matches and the product reads as not enriched yet — nothing has to clear the old conclusion |
 | `enrichmentError` | `text?` | Why the model's answer could not be used. **DB** `CHECK`: only when `FAILED` |
@@ -626,6 +626,14 @@ the header names the columns after parsing rather than through the parser's own 
 option: that option skips the hook for every field past the header's last.
 Rows written before a bad file is discovered stay written.
 
+**The store's limit.** A store holds at most 5 000 products (D32, §15.2). A row for a sku the store
+has is always written; a new sku only while there is room, in the file's order, counted under the
+account's lock so two imports into one store cannot both take its last places. A row past the
+limit is counted with the bad rows, sampled with its line and the reason `The store already holds
+the most products it can (5000); this row's sku would be another`, and listed in the error report
+in its place in the file. The report finds those rows as the import left them, valid with no
+product, and looks their skus up only when the import refused some.
+
 **Progress and cancellation.** After each batch the job reports `processed` — rows read so far,
 bad ones included — with no `total`, because a stream does not know its length. The batch
 boundary is also where a cancellation is honoured: a cancelled import has committed whole batches
@@ -682,10 +690,19 @@ The payload names up to 50 of the caller's skus: a batch, because one job per pr
 the rest. An account can have 50 batches queued or running (D32), so a catalog of 400 sends its
 next batch as one finishes. For each product whose current `imageUrl` has no `READY` result yet, the worker
 downloads it through the guard (§7.9) — `jpeg`, `png`, `webp`, `gif` or `avif`, at most 10 MB, 15 s
-— and makes three WebP sizes with `sharp`: `thumb` 200, `medium` 600 and `large` 1200 pixels wide,
-upright by their EXIF orientation, never enlarged, without the source's metadata, which can carry
-where a photo was taken. A source over 40 megapixels is refused before it is decoded: a small file
-can declare enormous dimensions and take gigabytes to open.
+— and makes three WebP sizes with `sharp`, each fitted inside a square: `thumb` 200, `medium` 600
+and `large` 1200 pixels on their longest side, upright by their EXIF orientation, never enlarged,
+without the source's metadata, which can carry where a photo was taken. Bounding both sides is
+what bounds a product's bytes: by width alone, a 1200 × 16 000 source made 13 MB of sizes, where
+the worst a square allows is about 1.2 MB (measured on 1200 × 1200 noise). A source over
+40 megapixels is refused before it is decoded: a small file can declare enormous dimensions and
+take gigabytes to open.
+
+The type is checked twice. The header first, by its common names and the older `image/jpg`,
+`image/pjpeg` and `image/x-png` some servers still send; then what the bytes are, since `sharp`
+picks its decoder by sniffing them and would decode an SVG — a document that can refer to other
+files — or a TIFF sent under an image header. Bytes that are not one of the five are a permanent
+failure: `Not a readable image: svg is not an accepted image format`.
 
 The sizes go to `products/<userId>/<productId>/<hash of the source URL>/<size>.webp`. The source
 URL is in the key so that a slow job still making a URL the seller has since replaced writes beside
@@ -693,7 +710,9 @@ the new image rather than over it; the key is otherwise fixed, so a re-run overw
 files with the same bytes and needs no ledger. The files are written first and the product
 recorded `READY` second, and only while `imageUrl` still equals the URL that was processed — a
 crash between the two leaves files nothing points at yet, never a row pointing at missing files,
-and an import that replaced the URL meanwhile wins. A replaced URL's old files are not deleted
+and an import that replaced the URL meanwhile wins. A `FAILED` is recorded under the same
+condition and never over a `READY` for the same URL: of two jobs racing on one product, the one
+that made the image wins. A replaced URL's old files are not deleted
 when the new image is recorded: if the seller switches back to the old URL while a slow job is
 still finishing, that job's late delete would remove the files the row points at again. A sweep
 in the worker deletes a folder instead, only when it is neither the current URL's nor the one the
@@ -769,7 +788,9 @@ each worker (§8.4). _Built in D.2 and D.4._
 what it was enriched from — name, description and the version of the instructions — and one whose
 hash matches and whose status is `READY` is skipped without a request, and counted as
 `alreadyReady`. A `FAILED` one is asked again: a model answers differently from one request to the
-next, and naming the sku again is how its owner asks. The write is conditional on the row still
+next, and naming the sku again is how its owner asks. A `FAILED` is never written over a `READY`
+made from the same text: of two jobs racing on one product, the one that got an answer wins. The
+write is conditional on the row still
 holding the name and description that were sent, so an import that changed them meanwhile wins.
 The worker logs a line for each request to the model, under the job's id. _Built in D.3 and D.5._
 
@@ -1999,7 +2020,7 @@ cases.
 | **A11** | **A cancelled job stops at a safe point.** Cancel a job mid-batch | `status = 'CANCELLED'`; effects committed **= batches completed before the flag was seen**, never a partial batch; cancelling an already-finished job is a no-op, not a status change. *In PA the per-step effect is the progress report; the ledger-count form needs batched effects and is asserted with the CSV import (PB)* | PA |
 | **A12** | **Progress cannot go backwards or be forged.** Report progress from a stale attempt | The stale write matches 0 rows; `progress.processed` is monotonic for the life of one submission. An operator re-drive clears it and the count starts again (D25) | PA |
 | **A12b** | **Progress is rate-limited, and the last value still lands.** Report 60 times across 3s, and 100 times as fast as the handler can (about 200 ms, inside one 500 ms window) | Events carrying `progress` are **> 1 and < 20**, not ~60; and the stored value equals the final report in both cases. The second case lands entirely inside one window, so only the processor's flush gets it out; a run slower than the window is reported skipped (inconclusive), since the window's timer may then have sent the last value | PA |
-| **A13** | **A large import does not grow with the file.** In one worker, after a full-size warm-up, import 2 000 and then 20 000 rows of about 2 KB each (4 MB and 39 MB) | The worker's **live memory** — heap and buffers after a forced full collection, read by a probe loaded into it — peaks **less than 18 MB** higher for the large file: half the files' difference, so a worker holding even half of it fails. Measured +2.3 and +2.7 MB; a worker that buffers the file reads +62 MB | PB |
+| **A13** | **A large import does not grow with the file.** In one worker, after a full-size warm-up, import 2 000 and then 20 000 rows of about 2 KB each (4 MB and 39 MB), over the same 5 000 products: the store's limit (D32), so the larger file names each four times | The worker's **live memory** — heap and buffers after a forced full collection, read by a probe loaded into it — peaks **less than 18 MB** higher for the large file: half the files' difference, so a worker holding even half of it fails. Measured +2.3 and +2.7 MB; a worker that buffers the file reads +62 MB | PB |
 | **A14** | **An interrupted import resumes.** `SIGKILL` mid-import, restart | `SELECT count(*) FROM "Product" WHERE "userId"=$1` **= valid rows in the file**, with no duplicate `sku`; the resumed run starts from the checkpoint, not from row 0 | PB |
 | **A15** | **The same file twice is one import.** Submit the same file with the same key | One `Job` row; the second response is the first job; product count unchanged | PB |
 | **A16** | **A hostile image URL reaches nothing private.** `http://localhost`, `http://169.254.169.254`, and a public DNS name resolving to a private address | All three rejected **after resolution, before connect**; the product fails, the batch does not | PC |
@@ -2239,6 +2260,7 @@ holds at once.
 | `image.process` queued or running | 50 batches | `429 TOO_MANY_UNFINISHED_JOBS` | 2 500 products in flight; a larger catalog sends its next batch as one finishes |
 | `ai.enrich` queued or running | 10 batches | `429 TOO_MANY_UNFINISHED_JOBS` | The AI queue runs 20 a minute for every account together, first come first served: ten is half a minute of it, so one account's backlog never holds the others' back for longer |
 | Pipelines running | 1 | `429 TOO_MANY_RUNNING_PIPELINES` | Its batches count against no cap while they hold their place, so the run as a whole is limited |
+| Products | 5 000 | The import reports the row as invalid, with why | What `products/`, which never expires, holds images of — about 6 GB at worst — and what a pipeline makes batches from: at most 250 AI batches, about twelve minutes of the AI queue |
 | Upload slips | 20 in any 24 hours | `429 TOO_MANY_UPLOADS` | Room many times over for a store re-uploading after a mistake. With the 7-day lifecycle, one account holds at most about 8 GB |
 
 - **`MOCK` and `CHARGE` have no cap:** they use neither the bucket nor the model, and the submit
@@ -2663,7 +2685,14 @@ the import's place freed while its batches ran for days. Now 10 unfinished `ai.e
 one running pipeline per account, and a pipeline's batches holding their place leave the caps
 alone. The queues stay first come, first served: one account's largest pipeline still holds the AI
 queue while it runs, and others wait behind it. Taking turns between accounts was weighed and left
-for later.
+for later. With the limit of 5 000 products a store (below), a pipeline makes at most 250 AI
+batches, so the longest such wait is about twelve minutes.
+
+**Extended 2026-11-25** (review fixes, R.3). `products/` never expires, and nothing bounded what
+one account put there: no limit on products, and sizes bounded by width only, so a tall source
+made 13 MB of them. Now 5 000 products a store, and each size fitted inside a square, about
+1.2 MB a product at worst: a full store holds about 6 GB, some $0.15 a month. A replaced URL's
+folder still goes a day after it falls idle (8.8).
 
 **D16 — a replay counts against the rate limit.** The limiter runs before the handler, so it
 cannot tell a replay from a new submit without a database read in front of it — the read the
@@ -2745,6 +2774,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-25 | §4.7, §6.3b, §6.3c, §6.3d, §15.2, D32 — review fixes, R.3: images and storage. Each size is fitted inside a square, not bounded by width alone: a 1200 × 16 000 source made 13 MB a product in a folder that never expires, and now makes about 1.2 MB at worst. A store holds at most 5 000 products: an import writes a known sku always and a new one while there is room, counted under the account's lock, and reports a row past the limit as invalid, with its line, in the result and the error report. The bytes' format is checked as well as the header, so an SVG or TIFF under an image header is refused; `image/jpg`, `image/pjpeg` and `image/x-png` are accepted. A `FAILED` is never written over a `READY` for the same URL or text. `Product_imageError_only_on_failure` is written with `IS NOT DISTINCT FROM`, so it no longer passes on a NULL status. **New migration** `20261125110000_product_image_error_check`. |
 | 2026-11-25 | §6.2, §6.3, §6.3d, §6.3e, §11, §15.2, D32 — review fixes, R.2: one account's share of the shared queues. `ai.enrich` is capped at 10 unfinished per account, on submit and both re-drives; an account runs one pipeline at a time (`429 TOO_MANY_RUNNING_PIPELINES`); a pipeline's batches holding their place no longer fill their owner's caps, which refused the owner's own image submits and the re-drive of the pipeline's own failed batch. The fake model obeys `[llm:…]` only with `FAKE_LLM_DIRECTIVES` on, off by default: any account could pause the AI queue with a product name. |
 | 2026-11-25 | §4.9, §6.2, §6.3c, §6.3d, §6.3e — review fixes, R.1: a pipeline finishes with the right status and counts. An `image.process` or `ai.enrich` batch commits each product's conclusion with a tally in its checkpoint, so its result counts every attempt's work and a summary no longer reads 1 image for a batch that made 50 after one retry. A pipeline's `pipeline.finalize` cannot be cancelled (`409 JOB_NOT_CANCELLABLE`); a cancelled one left the pipeline `RUNNING` for good. The fan-out refuses an import asked to stop, and the import looks for a cancel before planning. `Pipeline.fannedOutAt`, stamped by the fan-out, decides `FAILED`: an import that failed after writing its batches no longer fails a pipeline that ran, and one re-driven after giving its place up no longer completes one that never fanned out. **New migration** `20261125100000_pipeline_fanned_out`. |
 | 2026-11-24 | §6.2, §6.5, §10.2, §13.2 — the API reference, F.3, which closes PF. Swagger UI at `/docs` and the OpenAPI document at `/docs/openapi.json`, public. Requests documented from the Zod schemas the routes validate with; answers from strict Zod schemas of their own, which a test parses every public route's real answer with. `session` and `apiKey` bearer schemes, the second set by `@AllowApiKeys()` itself; the error envelope as every operation's `default`. The admin routes, `/health`, `/ready` and `GET /` left out. `@nestjs/swagger` 12.1 added. |

@@ -43,7 +43,8 @@ A success is \`{ success: true, data, requestId }\`; a failure is
 Too many requests is \`429\` with a \`Retry-After\` in seconds. Too much unfinished work is \`429\`
 too, without one: an account holds at most 3 imports, 50 image batches and 10 AI batches queued
 or running, and runs one pipeline at a time. A place frees when one of them finishes; a
-pipeline's own batches take none.
+pipeline's own batches take none. A store holds at most 5 000 products: an import reports a row
+for a new one past that as invalid, with why, and imports the rest.
 
 Lists are newest first and paged by cursor: pass the \`nextCursor\` a page returns as
 \`?cursor=\`, until it is \`null\`.

@@ -16,14 +16,20 @@ import { productImageKey } from '../../../storage/object-keys.js';
 import { ProductsService } from '../../../products/products.service.js';
 import { renderSizes } from '../../../images/image-variants.js';
 import { RetryableJobError } from '../../../common/errors/app-error.js';
+import { describeError } from '../../../common/errors/describe-error.js';
 import { hasImageForCurrentUrl } from '../../../products/product-state.js';
 import { ProductTally } from '../product-tally.js';
 
-// What a seller uploads and sharp decodes. Not SVG: it is a document that can
-// refer to other files, and rendering one runs a parser on the seller's input.
+// What a seller uploads and sharp decodes, with the older names some servers
+// still send for them. Not SVG: it is a document that can refer to other
+// files. The header is the first check, not the last: renderSizes checks the
+// format the bytes hold.
 const IMAGE_TYPES = new Set([
   'image/jpeg',
+  'image/jpg',
+  'image/pjpeg',
   'image/png',
+  'image/x-png',
   'image/webp',
   'image/gif',
   'image/avif',
@@ -201,7 +207,7 @@ export class ImageProcessJobHandler extends JobHandler<
     } catch (error) {
       // The same bytes decode the same way every time.
       return {
-        reason: `Not a readable image: ${(error as Error).message}`,
+        reason: `Not a readable image: ${describeError(error)}`,
         permanent: true,
       };
     }

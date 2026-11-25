@@ -1,6 +1,9 @@
 import sharp from 'sharp';
 
-/** The sizes every product image is made in, by width. */
+/**
+ * The sizes every product image is made in, by their longest side: a 1200 px
+ * large is at most 1200 × 1200, whatever shape the source.
+ */
 export const IMAGE_SIZES = [
   { name: 'thumb', width: 200 },
   { name: 'medium', width: 600 },
@@ -14,16 +17,35 @@ export type ImageSize = (typeof IMAGE_SIZES)[number]['name'];
 // beyond anything a product page shows.
 const MAX_INPUT_PIXELS = 40_000_000;
 
+// What sharp found in the bytes, whatever the server said they were: sharp
+// picks its decoder by sniffing, so a Content-Type check alone would still
+// hand it an SVG — a document that can refer to other files — or a TIFF. AVIF
+// reads as heif.
+const DECODED_FORMATS: ReadonlySet<string> = new Set([
+  'jpeg',
+  'png',
+  'webp',
+  'gif',
+  'heif',
+]);
+
 /**
  * Makes each size of an image as WebP: turned upright by its EXIF orientation,
- * never enlarged, and without the source's metadata, which can carry the
- * camera's location.
+ * fitted inside a square of the size's side, never enlarged, and without the
+ * source's metadata, which can carry the camera's location. Bounding both
+ * sides is what bounds the bytes: by width alone, a 1200 × 16 000 source made
+ * a 13 MB product in a folder that never expires.
  *
- * @throws when the bytes are not an image sharp can decode, or exceed the
- * pixel limit.
+ * @throws when the bytes are not a photo format sharp can decode, or exceed
+ * the pixel limit.
  */
 export const renderSizes = async (source: Buffer) => {
   const image = sharp(source, { limitInputPixels: MAX_INPUT_PIXELS });
+  const { format } = await image.metadata();
+
+  if (!DECODED_FORMATS.has(format)) {
+    throw new Error(`${format} is not an accepted image format`);
+  }
 
   return Promise.all(
     IMAGE_SIZES.map(async ({ name, width }) => ({
@@ -31,7 +53,12 @@ export const renderSizes = async (source: Buffer) => {
       body: await image
         .clone()
         .rotate()
-        .resize({ width, withoutEnlargement: true })
+        .resize({
+          width,
+          height: width,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
         .webp({ quality: 80 })
         .toBuffer(),
     })),

@@ -4,6 +4,7 @@ import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
 import { ProductsModule } from '../../src/products/products.module.js';
 import {
+  PRODUCTS_PER_ACCOUNT,
   ProductsService,
   type ProductRow,
 } from '../../src/products/products.service.js';
@@ -12,6 +13,7 @@ import {
   createThrowawayUser,
   deleteUsers,
 } from '../support/db.js';
+import { whileLastPlaceIsTaken } from '../support/account-lock.js';
 
 // The upsert is the import's only write, and everything A14 relies on is in
 // what it does on a conflict — so each case is asserted against a real
@@ -210,5 +212,150 @@ describe('the product upsert', () => {
       products.upsertBatch(userId, [row('A-1'), row('B-2', overrides)]),
     ).rejects.toThrow(constraint);
     expect(await catalog(userId)).toEqual([]);
+  });
+
+  describe("the store's limit", () => {
+    // A store `missing` places short of its limit, one of them a known sku.
+    const nearlyFull = async (missing: number) => {
+      const userId = await store();
+
+      await prisma.product.createMany({
+        data: Array.from(
+          { length: PRODUCTS_PER_ACCOUNT - missing },
+          (_, n) => ({ userId, ...row(n === 0 ? 'KNOWN' : `HELD-${n}`) }),
+        ),
+      });
+
+      return userId;
+    };
+
+    const withinLimit = (userId: string, rows: ProductRow[]) =>
+      prisma.$transaction((tx) => products.upsertWithinLimit(userId, rows, tx));
+
+    it('always writes a sku the store has, and new ones while there is room, in order', async () => {
+      const userId = await nearlyFull(2);
+
+      expect(
+        await withinLimit(userId, [
+          row('N-1'),
+          row('KNOWN', { name: 'Renamed' }),
+          row('N-2'),
+          row('N-3'),
+        ]),
+      ).toEqual({ written: 3, refused: ['N-3'] });
+      expect(await prisma.product.count({ where: { userId } })).toBe(
+        PRODUCTS_PER_ACCOUNT,
+      );
+      expect(
+        await prisma.product.findFirst({ where: { userId, sku: 'KNOWN' } }),
+      ).toMatchObject({ name: 'Renamed' });
+    });
+
+    it('takes one place for a sku twice in the batch', async () => {
+      const userId = await nearlyFull(1);
+
+      expect(
+        await withinLimit(userId, [row('N-1'), row('N-1', { priceCents: 5 })]),
+      ).toEqual({ written: 1, refused: [] });
+    });
+
+    // Three imports into one store can run at once (D32): each would count
+    // one free place, and without the lock both would take it.
+    it('waits for an import taking the last place, then refuses', async () => {
+      const userId = await nearlyFull(1);
+
+      const answer = await whileLastPlaceIsTaken(
+        prisma,
+        userId,
+        (tx) => products.upsertBatch(userId, [row('N-1')], tx),
+        () => withinLimit(userId, [row('N-2')]),
+      );
+
+      expect(answer).toEqual({ written: 0, refused: ['N-2'] });
+      expect(await prisma.product.count({ where: { userId } })).toBe(
+        PRODUCTS_PER_ACCOUNT,
+      );
+    });
+  });
+
+  // Two jobs racing on one product: the one that concluded READY wins, and a
+  // late failure about the same input changes nothing.
+  describe('a failure recorded after a success', () => {
+    const URL = 'https://shop.example/a.png';
+
+    it('leaves an image READY for the same URL', async () => {
+      const userId = await store();
+      await products.upsertBatch(userId, [row('A-1', { imageUrl: URL })]);
+      const { id } = (await catalog(userId))[0]!;
+
+      expect(await products.recordImageReady(userId, id, URL)).toBe(true);
+      expect(await products.recordImageFailed(userId, id, URL, 'gave up')).toBe(
+        false,
+      );
+      expect(await catalog(userId)).toMatchObject([
+        { imageStatus: 'READY', imageSourceUrl: URL, imageError: null },
+      ]);
+    });
+
+    it('records a failure about a product with no conclusion yet', async () => {
+      const userId = await store();
+      await products.upsertBatch(userId, [row('A-1', { imageUrl: URL })]);
+      const { id } = (await catalog(userId))[0]!;
+
+      expect(await products.recordImageFailed(userId, id, URL, 'gave up')).toBe(
+        true,
+      );
+      expect(await catalog(userId)).toMatchObject([
+        { imageStatus: 'FAILED', imageError: 'gave up' },
+      ]);
+    });
+
+    it('leaves an enrichment READY for the same text', async () => {
+      const userId = await store();
+      await products.upsertBatch(userId, [row('A-1')]);
+      const { id, name, description } = (await catalog(userId))[0]!;
+      const from = { id, name, description };
+
+      expect(
+        await products.recordEnrichmentReady(userId, from, {
+          category: 'home',
+          tags: ['lamp'],
+        }),
+      ).toBe(true);
+      expect(
+        await products.recordEnrichmentFailed(userId, from, 'malformed'),
+      ).toBe(false);
+      expect(await catalog(userId)).toMatchObject([
+        { enrichmentStatus: 'READY', category: 'home', tags: ['lamp'] },
+      ]);
+    });
+
+    it('records a failure about an enrichment with no conclusion yet', async () => {
+      const userId = await store();
+      await products.upsertBatch(userId, [row('A-1')]);
+      const { id, name, description } = (await catalog(userId))[0]!;
+
+      expect(
+        await products.recordEnrichmentFailed(
+          userId,
+          { id, name, description },
+          'malformed',
+        ),
+      ).toBe(true);
+    });
+  });
+
+  // A CHECK that evaluates to NULL passes: the first form let a reason sit on
+  // a product with no conclusion at all.
+  it('refuses an image error on a product with no conclusion', async () => {
+    const userId = await store();
+    await products.upsertBatch(userId, [row('A-1')]);
+
+    await expect(
+      prisma.product.updateMany({
+        where: { userId },
+        data: { imageError: 'a reason about nothing' },
+      }),
+    ).rejects.toThrow('Product_imageError_only_on_failure');
   });
 });

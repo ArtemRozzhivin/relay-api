@@ -5,13 +5,13 @@ import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
-import { lockAccount } from '../../src/prisma/account-lock.js';
 import { StorageService } from '../../src/storage/storage.service.js';
 import type { Prisma } from '../../src/generated/prisma/client.js';
 import type { JobStatus } from '../../src/generated/prisma/enums.js';
 import { postUploadForm } from '../support/upload-form.js';
 import { registerAndLogin, startApp } from '../support/http.js';
 import { deleteUsers, seedPipeline } from '../support/db.js';
+import { whileLastPlaceIsTaken } from '../support/account-lock.js';
 
 // The documented numbers (§15.2), not the constants that hold them: a client
 // is told these, so changing one is changing the contract.
@@ -132,66 +132,6 @@ describe('per-account caps', () => {
     expect(res.body.error.code).toBe('TOO_MANY_UNFINISHED_JOBS');
     // Nothing here knows when one of the account's jobs will finish.
     expect(res.headers['retry-after']).toBeUndefined();
-  };
-
-  // Whether some connection is waiting on a lock the backend `pid` holds,
-  // asked until one is or the time runs out.
-  const blockedBehind = async (pid: number) => {
-    const deadline = Date.now() + 3_000;
-
-    while (Date.now() < deadline) {
-      const [{ waiting }] = await prisma.$queryRaw<{ waiting: number }[]>`
-        SELECT count(*)::int AS waiting FROM pg_stat_activity
-        WHERE ${pid}::int = ANY (pg_blocking_pids(pid))`;
-
-      if (waiting > 0) {
-        return true;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-
-    return false;
-  };
-
-  // A cap is a count and then a write, and two requests that overlap between
-  // them could both take one free place. Fired together over HTTP they never
-  // overlap — each transaction lasts a couple of milliseconds — so the test
-  // plays the other request itself: it takes the account's lock, fills the
-  // last place, and holds its transaction open while `send` makes the request
-  // under test. That request must be seen waiting behind it — the only thing
-  // the two share is the lock — and, let through, must find the place taken.
-  const whileLastPlaceIsTaken = async <T>(
-    userId: string,
-    fill: (tx: Prisma.TransactionClient) => Promise<unknown>,
-    send: () => Promise<T>,
-  ) => {
-    let filled!: (pid: number) => void;
-    let release!: () => void;
-    const placeFilled = new Promise<number>((resolve) => (filled = resolve));
-    const released = new Promise<void>((resolve) => (release = resolve));
-
-    const other = prisma.$transaction(
-      async (tx) => {
-        await lockAccount(tx, userId);
-        const [{ pid }] = await tx.$queryRaw<{ pid: number }[]>`
-          SELECT pg_backend_pid() AS pid`;
-        await fill(tx);
-        filled(pid);
-        await released;
-      },
-      { timeout: 10_000 },
-    );
-
-    const holder = await placeFilled;
-    const answer = send();
-    const waited = await blockedBehind(holder);
-    release();
-    await other;
-
-    expect(waited, 'the request never waited for the account lock').toBe(true);
-
-    return answer;
   };
 
   const unfinishedRow = (userId: string, type: string) => ({
@@ -348,6 +288,7 @@ describe('per-account caps', () => {
       await seed(userId, 'image.process', IMAGE_BATCHES - 1);
 
       const answer = await whileLastPlaceIsTaken(
+        prisma,
         userId,
         (tx) => tx.job.create({ data: unfinishedRow(userId, 'image.process') }),
         async () =>
@@ -476,7 +417,7 @@ describe('per-account caps', () => {
         tx.job.create({ data: unfinishedRow(userId, 'import.csv') });
 
       expectCapped(
-        await whileLastPlaceIsTaken(userId, fill, async () =>
+        await whileLastPlaceIsTaken(prisma, userId, fill, async () =>
           request(server)
             .post(`/jobs/${dead!.id}/retry`)
             .set('Authorization', `Bearer ${token}`),
@@ -488,7 +429,7 @@ describe('per-account caps', () => {
         data: { status: 'CANCELLED', finishedAt: new Date() },
       });
 
-      const bulk = await whileLastPlaceIsTaken(userId, fill, async () =>
+      const bulk = await whileLastPlaceIsTaken(prisma, userId, fill, async () =>
         request(server)
           .post('/jobs/retry')
           .set('Authorization', `Bearer ${token}`)
@@ -557,6 +498,7 @@ describe('per-account caps', () => {
       });
 
       const answer = await whileLastPlaceIsTaken(
+        prisma,
         userId,
         (tx) => tx.uploadSlip.create({ data: slipRow() }),
         async () => slip(token),

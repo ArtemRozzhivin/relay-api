@@ -20,6 +20,7 @@ import {
   mintUploadKey,
 } from '../../src/storage/object-keys.js';
 import { ProductsModule } from '../../src/products/products.module.js';
+import { PRODUCTS_PER_ACCOUNT } from '../../src/products/products.service.js';
 import { ImportCsvJobHandler } from '../../src/jobs/handlers/import-csv/import-csv.handler.js';
 import { JobCancelledError } from '../../src/jobs/engine/job-handler.js';
 import type { Prisma } from '../../src/generated/prisma/client.js';
@@ -531,6 +532,96 @@ describe('the import.csv handler', () => {
 
   // §6.3e: an import that belongs to a pipeline ends by handing its products
   // on, as batches of the stages each still needs.
+  // D32: the store's images never expire, so the store itself is bounded.
+  describe("past the store's limit", () => {
+    const OVER =
+      "The store already holds the most products it can (5000); this row's sku would be another";
+
+    it('updates what the store has, imports new rows while there is room, and reports the rest by line', async () => {
+      const userId = await store();
+
+      await prisma.product.createMany({
+        data: Array.from({ length: PRODUCTS_PER_ACCOUNT - 2 }, (_, n) => ({
+          userId,
+          sku: n === 0 ? 'KNOWN' : `HELD-${n}`,
+          name: 'Held',
+          priceCents: 100,
+          currency: 'EUR',
+        })),
+      });
+
+      const key = await upload(
+        userId,
+        [
+          'sku,name,price,currency',
+          'N-1,New one,1,EUR',
+          'BAD,,x,EUR',
+          'N-2,New two,1,EUR',
+          'KNOWN,Renamed,1,EUR',
+          'N-3,New three,1,EUR',
+          'N-4,New four,1,EUR',
+        ].join('\n'),
+      );
+
+      expect(await run(userId, key).result).toMatchObject({
+        rows: 6,
+        imported: 3,
+        invalid: 3,
+        invalidSamples: [
+          { line: 3, reason: expect.stringMatching(/^name:/) },
+          { line: 6, reason: OVER },
+          { line: 7, reason: OVER },
+        ],
+      });
+      expect(
+        await prisma.product.findFirst({ where: { userId, sku: 'KNOWN' } }),
+      ).toMatchObject({ name: 'Renamed' });
+
+      // In the file's order, the invalid row and the refused ones together.
+      expect(
+        (await reportOf(userId))?.rows.map(({ line, sku, reason }) => ({
+          line,
+          sku,
+          over: reason === OVER,
+        })),
+      ).toEqual([
+        { line: '3', sku: 'BAD', over: false },
+        { line: '6', sku: 'N-3', over: true },
+        { line: '7', sku: 'N-4', over: true },
+      ]);
+    });
+
+    it('carries the count of refused rows across a resume', async () => {
+      const userId = await store();
+
+      // One place left, and the file's second half already in the store: the
+      // resumed attempt refuses nothing, so only what the first attempt
+      // recorded can tell the report to look for refused rows.
+      await prisma.product.createMany({
+        data: Array.from({ length: PRODUCTS_PER_ACCOUNT - 1 }, (_, n) => ({
+          userId,
+          sku: n < 500 ? `SKU-${500 + n}` : `HELD-${n}`,
+          name: 'Held',
+          priceCents: 100,
+          currency: 'EUR',
+        })),
+      });
+
+      const key = await upload(userId, rowsOf(1000));
+      // Stopped after its first batch, which takes the last place.
+      const first = run(userId, key, { stopAfterChecks: 0 });
+
+      await expect(first.result).rejects.toBeInstanceOf(JobCancelledError);
+
+      const again = run(userId, key, {
+        checkpoint: first.checkpoints.at(-1) as Prisma.JsonValue,
+      });
+
+      expect(await again.result).toMatchObject({ imported: 501, invalid: 499 });
+      expect((await reportOf(userId))?.rows).toHaveLength(499);
+    });
+  });
+
   describe('in a pipeline', () => {
     const PIPELINE = 'a-pipeline';
 
