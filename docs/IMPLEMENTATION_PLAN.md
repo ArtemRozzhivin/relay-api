@@ -39,7 +39,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF ✓ → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -898,18 +898,28 @@ partial failure as a first-class outcome.
 
 ### Tasks
 
-- [ ] **F.1 ·** `ApiKey` **model** — `prefix` shown in the UI, SHA-256 `hash`, `scopes`,
-  `lastUsedAt`, `revokedAt`. The secret is displayed once and never stored.
+- [x] **F.1 ·** `ApiKey` **model** — `prefix` shown in the UI, SHA-256 `hash`, `scopes`,
+  `lastUsedAt`, `revokedAt`. The secret is displayed once and never stored. Specified first
+  (§4.10, §6.3f); `POST /api-keys`, `GET /api-keys` and `POST /api-keys/:id/revoke`, one
+  unrevoked key per account. The operator's control: `GET /admin/api-keys`,
+  `POST /admin/api-keys/revoke` for every key or one seller's, and `API_KEYS_ENABLED` to turn keys
+  off. Using a key is F.2.
   ```
   _Hash, not encrypt: nothing ever needs to read the key back, only to compare it._
   ```
-- [ ] **F.2 ·** `ApiKeyGuard` **beside** `JwtAuthGuard` — either satisfies a job endpoint.
-- [ ] **F.3 · Swagger** for the public surface, documenting api-key auth.
+- [x] **F.2 ·** `ApiKeyGuard` **beside** `JwtAuthGuard` — either satisfies a job endpoint.
+  Each passes the other's credential on. A key reaches the jobs, pipelines, uploads and products
+  controllers, `read` for a `GET` and `write` for the rest, and nothing for a person; it is looked
+  up on every request, so a revoke needs no restart (A25), and its secret is in no row or log
+  (A26).
+- [x] **F.3 · Swagger** for the public surface, documenting api-key auth. `/docs` and
+  `/docs/openapi.json`, drawn from the routes' Zod schemas; the answers' own schemas are checked
+  against every public route's real answer in a test, so the reference cannot drift (§6.5).
 
 ### Done when
 
-- [ ] **A25 passes** — a revoked key is refused, and revocation takes effect without a restart
-- [ ] **A26 passes** — the plaintext key appears in no row and no log line
+- [x] **A25 passes** — a revoked key is refused, and revocation takes effect without a restart
+- [x] **A26 passes** — the plaintext key appears in no row and no log line
 
 ---
 
@@ -944,6 +954,11 @@ Shape only, so the earlier phases leave room for it:
   a retried batch cannot consume twice
 - [ ] Count limits checked inside a transaction; a downgrade **disables** surplus resources and
   never deletes them
+- [ ] **AI spend per account.** Until this phase nothing limits it: the AI queue's 20 jobs a minute
+  bound every account together, so one account can use all of it. Each job already records what
+  its requests cost (`modelUsage`, D.6), which is what a plan's AI limit counts. Decided
+  2026-11-24 to wait for billing rather than add an interim cap — so a real, paid model is not
+  connected before it
 
 ### Done when
 

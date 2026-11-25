@@ -35,7 +35,7 @@ export const startApp = async () => {
  *
  * @param label names the test in the email, so a leftover row says where it
  * came from.
- * @returns its access token and user id.
+ * @returns its access token, user id and email.
  */
 export const registerAndLogin = async (server: Server, label: string) => {
   const email = `${label}-${randomUUID()}@example.com`;
@@ -53,5 +53,19 @@ export const registerAndLogin = async (server: Server, label: string) => {
   return {
     token: body.data.accessToken as string,
     userId: body.data.user.id as string,
+    email,
   };
+};
+
+/**
+ * Logs an account in again: the token carries the role the account had at
+ * login, so a test that promotes one needs a new token.
+ */
+export const logIn = async (server: Server, email: string) => {
+  const { body } = await request(server)
+    .post('/auth/login')
+    .send({ email, password: PASSWORD })
+    .expect(200);
+
+  return body.data.accessToken as string;
 };

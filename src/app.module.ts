@@ -12,6 +12,7 @@ import { JobsModule } from './jobs/jobs.module.js';
 import { EventsModule } from './events/events.module.js';
 import { UploadsModule } from './uploads/uploads.module.js';
 import { ProductsModule } from './products/products.module.js';
+import { ApiKeysModule } from './api-keys/api-keys.module.js';
 import { BullModule } from '@nestjs/bullmq';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { DomainExceptionFilter } from './common/filters/domain-exception.filter.js';
@@ -25,6 +26,8 @@ import {
   rateLimitOptions,
 } from './common/rate-limit/rate-limit.js';
 import { JwtAuthGuard } from './auth/guards/jwt-auth.guard.js';
+import { RolesGuard } from './auth/guards/roles.guard.js';
+import { ApiKeyGuard } from './api-keys/api-key.guard.js';
 
 @Module({
   imports: [
@@ -57,6 +60,7 @@ import { JwtAuthGuard } from './auth/guards/jwt-auth.guard.js';
     EventsModule,
     UploadsModule,
     ProductsModule,
+    ApiKeysModule,
   ],
   controllers: [AppController],
   providers: [
@@ -66,16 +70,28 @@ import { JwtAuthGuard } from './auth/guards/jwt-auth.guard.js';
       provide: APP_PIPE,
       useClass: StandardSchemaValidationPipe,
     },
-    // Both here, in this order: global guards run in the order they are
+    // All here, in this order: global guards run in the order they are
     // registered, and the limiter counts a signed-in caller by the account
     // the JWT guard has just read.
     {
       provide: APP_GUARD,
       useClass: JwtAuthGuard,
     },
+    // Beside the JWT guard: each lets in its own credential and passes the
+    // other's, so a route takes a login or a key.
+    {
+      provide: APP_GUARD,
+      useClass: ApiKeyGuard,
+    },
     {
       provide: APP_GUARD,
       useClass: RateLimitGuard,
+    },
+    // Last: it reads the role the JWT guard put on the request, and lets
+    // through every route that names none.
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
     },
     {
       provide: APP_FILTER,

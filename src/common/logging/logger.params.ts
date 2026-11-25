@@ -32,7 +32,12 @@ export function buildLoggerParams(config: ConfigService<ApiEnv, true>): Params {
         ignore: (req) => req.url === '/health' || req.url === '/ready',
       },
 
-      customProps: (req) => ({ userId: (req as Request).user?.id }),
+      // The key's id, never the key: which of an account's keys made a
+      // request is what its owner asks after a leak (§6.3f).
+      customProps: (req) => ({
+        userId: (req as Request).user?.id,
+        apiKeyId: (req as Request).user?.apiKeyId,
+      }),
 
       transport:
         nodeEnv === 'production'

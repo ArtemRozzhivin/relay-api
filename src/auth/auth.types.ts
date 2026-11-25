@@ -12,4 +12,6 @@ export interface AuthenticatedUser {
   id: string;
   email: string;
   role: Role;
+  /** Set when the request authenticated with an API key rather than a login. */
+  apiKeyId?: string;
 }

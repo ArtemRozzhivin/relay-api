@@ -43,6 +43,8 @@ nothing.
 | A pipeline writes each of its batches once                | The import fails after writing them; the retry writes none (A23)  |
 | A pipeline's summary job survives a crash                 | API down and worker killed around the last batch (A24)            |
 | A failed batch does not fail its pipeline                 | One batch dead-letters; the pipeline ends with errors (A22)       |
+| A revoked API key stops working on the next request       | Revoke, then use it at once, same process (A25)                   |
+| An API key's secret is in no row and no log line          | Every text column of every table, both logs (A26)                 |
 
 The full list, with the SQL each test checks, is §14 of the
 [technical specification](docs/TECH_SPEC.md#14-verification-plan).
@@ -92,6 +94,13 @@ Set `METRICS_PORT` on either process to have it serve Prometheus metrics on that
 Behind a reverse proxy, set `TRUST_PROXY` to it, or every client shares the rate limits of the
 proxy's address ([§15.2](docs/TECH_SPEC.md#152-phase-8--written-2026-11-12)).
 
+To make an account an admin — needed for `GET /admin/api-keys` and `POST /admin/api-keys/revoke` —
+register it, then run the line below and log in again; the role reaches the token at login.
+
+```bash
+echo "UPDATE \"User\" SET role = 'ADMIN' WHERE email = 'you@example.com';" | npx prisma db execute --stdin
+```
+
 ## Tests
 
 | Tier        | Command                    | What it covers                                                          |
@@ -108,6 +117,9 @@ CI runs all three on every pull request.
   state machine, the reliability rules, and every decision with its trade-offs.
 - [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md): the milestones and where each one
   stands.
+- **The API reference** is served by the API itself, at `/docs` (`http://localhost:3000/docs`
+  locally), with the OpenAPI document at `/docs/openapi.json`. It covers signing in with a session
+  or an API key, and every route a client calls.
 
 ## License
 

@@ -13,9 +13,9 @@ export const limitParam = z.coerce
 
 // Opaque on purpose: a client that cannot read the position cannot come to
 // depend on its fields, so a list can change what it orders by. It is not
-// signed, because there is nothing to protect: every list is filtered to the
-// caller's own rows on the server, so an edited cursor only moves the caller
-// through their own data.
+// signed, because there is nothing to protect: every list is filtered on the
+// server to the rows its caller may see, so an edited cursor only moves the
+// caller through those.
 const encodeCursor = (position: Record<string, string>) =>
   Buffer.from(JSON.stringify(position)).toString('base64url');
 

@@ -364,6 +364,26 @@ what is about all of them.
 | `createdAt` | `timestamptz(3)` | |
 | `finishedAt` | `timestamptz(3)?` | **DB** `CHECK ((status = 'RUNNING') = (finishedAt IS NULL))`, as on `Job` |
 
+### 4.10 `ApiKey` — phase F
+
+A credential a seller's own system uses instead of a login (§6.3f). The secret is shown once, when
+the key is made, and stored only as its hash.
+
+| Column | Type | Constraints / notes |
+|---|---|---|
+| `id` | `uuid` | PK |
+| `userId` | `uuid` | **DB** FK → `User`, `ON DELETE CASCADE`. Whose account the key acts as |
+| `name` | `text` | The owner's label for it — "Nightly catalog sync" — 1–100 characters |
+| `prefix` | `text` | The key's first 12 characters, `relay_` and six more, shown in the list so the owner can tell their keys apart. Not secret, and not unique |
+| `hash` | `text` | SHA-256 of the whole key, hex. **DB** `UNIQUE`: the only way a presented key is found. Internal — never in a response |
+| `scopes` | `ApiKeyScope[]` | `read`, `write` or both. **DB** `CHECK (cardinality(scopes) >= 1)` |
+| `createdAt` | `timestamptz(3)` | |
+| `lastUsedAt` | `timestamptz(3)?` | When a request last authenticated with it, to the minute (§6.3f) |
+| `revokedAt` | `timestamptz(3)?` | Set once. A revoked key never authenticates again; the row stays, so the owner can see it and when it stopped |
+
+**DB** index `(userId, createdAt)` for the list. A revoked key is kept, not deleted: what it was
+and when it was last used is what its owner looks at after a leak.
+
 ---
 
 ## 5. Job state machine
@@ -475,7 +495,13 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
 | `POST` | `/pipelines` | access | **`202`** / `422` / `429` | An import that goes on to enrich and image the products it imported, then sums them up. `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`. The same `422`s and `429` as `POST /jobs` for an `import.csv`, a replay included. See §6.3e |
 | `GET` | `/pipelines/:id` | access | `200` | Its status, how many of its jobs of each type are in each status, and the summary once finished. 404 for a pipeline you don't own. See §6.3e |
+| `POST` | `/api-keys` | session | **`201`** / `403` / `429` | `{ name, scopes }` → the key's view with `key`, the secret, which is in this response and nowhere else. `403 API_KEYS_DISABLED` while the operator has keys turned off; `429 TOO_MANY_API_KEYS` when the caller already has an unrevoked key. See §6.3f |
+| `GET` | `/api-keys` | session | `200` | The caller's keys, newest first, revoked ones included; never the secret or its hash |
+| `POST` | `/api-keys/:id/revoke` | session | `200` | Revokes the key at once (A25). A key already revoked answers the same, its `revokedAt` unchanged. 404 for a key you don't own |
+| `GET` | `/admin/api-keys` | admin | `200` / `403` | Every account's keys, newest first, each with its `owner` (`id`, `email`); never the secret or its hash. Filter `?email=`, `?status=active\|revoked`; paged like `/jobs`. See §6.3f |
+| `POST` | `/admin/api-keys/revoke` | admin | `200` / `403` | `{ email?, dryRun? }` → `{ matched, revoked }`: every unrevoked key, or the ones of the account with that email. `dryRun` counts and revokes none. `403` for anyone without the `ADMIN` role. See §6.3f |
 | `POST` | `/uploads` | access | `200` / `429` | A signed upload slip for one CSV, sent straight to S3 — the API never sees the file. `429 TOO_MANY_UPLOADS` past 20 in 24 hours (D32). See §6.3a |
+| `GET` | `/docs` | — | `200` | The API reference, Swagger UI. `/docs/openapi.json` is the OpenAPI document. See §6.5 |
 | `GET` | `/health` | — | `200` | Liveness — process is up. No dependency checks |
 | `GET` | `/ready` | — | `200`/`503` | Readiness — Postgres and Redis reachable *now* |
 
@@ -863,6 +889,52 @@ batch — and the summary once finished.
 AI batches run at the AI queue's 20 a minute (§8.4): a 20 000-product import's 1 000 enrichment
 batches take 50 minutes, and the pipeline finishes when the last of them does.
 
+### 6.3f API keys — a seller's own system, without a login (PF)
+
+A login gives a token that expires in minutes, which suits a person. A seller's script — a
+nightly import, a sync with their shop — has no person to log in, so it uses an API key: a
+long-lived secret its owner makes once and puts in the script's configuration.
+
+**The key** is `relay_` and 43 characters of base64url: 32 random bytes. The prefix makes a
+leaked key recognisable, to its owner and to secret scanners. Only its SHA-256 is stored, and
+the secret is returned once, by the request that made it (A26). Not Argon2, as for a password:
+a slow hash protects a secret a person chose and an attacker can guess; 256 random bits cannot
+be guessed, and a key is checked on every request, where a slow hash would cost each one.
+
+**Using it.** `Authorization: Bearer relay_…`, the header a login token uses — and which request
+logs already redact; the line that closes a request names the key by its id (§12.1).
+`ApiKeyGuard`, beside `JwtAuthGuard`, lets it in: `401` for a key no unrevoked key hashes to,
+`403 API_KEY_NOT_ALLOWED` on a route for a person, `403 API_KEY_SCOPE_MISSING` for a method its
+scopes do not cover. A key acts as its owner: the same ownership checks, the same rate limits and
+caps, counted per account (D32). `read` lets it make the `GET` requests of jobs, pipelines,
+uploads and products, `write` their `POST`s. It reaches nothing else: not `/auth`, not
+`/api-keys`, not the socket. Only a session makes, lists and revokes keys, so a leaked key
+cannot make itself a successor or revoke its owner's others.
+
+**Revocation is immediate** (A25). Every request looks its key up by hash, unrevoked; nothing
+caches the answer, so a key revoked a moment ago is refused on the next request, by every API
+instance, with no restart. The lookup is one indexed read.
+
+**`lastUsedAt`** is written at most once a minute per key, and after the request has been let
+through rather than as part of it: a key in a tight loop must not turn every request into a
+write, and a failed write is logged, never a failed request.
+
+An account holds **one** unrevoked key (`429 TOO_MANY_API_KEYS`): a seller connects one system,
+and there is one key to account for. Rotating it means revoking the old key before making the new
+one, so the seller's script is without a key for the moment in between.
+
+**The operator's control**, for the `ADMIN` role only. `GET /admin/api-keys` lists every
+account's keys with their owner and `lastUsedAt`, so a revoke is not made blind.
+`POST /admin/api-keys/revoke` revokes every unrevoked key, or one seller's by their email: the
+answer to a leak that is not one seller's, or to a seller who should no longer have one. `dryRun`
+counts what it would revoke. Each revoke is logged with the admin's id and whether it was one
+account or all. `API_KEYS_ENABLED=false` turns the feature off: no key is made
+(`403 API_KEYS_DISABLED`) and none authenticates, while owners can still list and revoke theirs.
+It is read at boot, so it takes a restart; revoking every key is the immediate stop. An account is
+made an admin in the database — `UPDATE "User" SET role = 'ADMIN' WHERE email = …` — and the role
+reaches its token at its next login. _Built in F.1 (the keys and their revoking) and F.2 (using
+them: A25, A26)._
+
 ### 6.4 Validation
 
 Nest 12's first-party `StandardSchemaValidationPipe` with Zod schemas, registered globally.
@@ -894,6 +966,29 @@ Three checks, three homes: shape → pipe (`400`); business rules → service
 different threat: not a bad client, but a schema that moved underneath a row already queued.
 
 ---
+
+### 6.5 The API reference — `/docs` (PF)
+
+`GET /docs` serves the reference a developer integrating with Relay reads — Swagger UI — and
+`GET /docs/openapi.json` the OpenAPI 3.0 document it is drawn from. Both are public, and outside
+the guards: the reference says how to sign in, so it cannot ask for it.
+
+**Drawn from the code, and checked against it.** Requests are documented from the Zod schemas
+the routes validate with — `@nestjs/swagger` reads the schema each `@Body`, `@Query` and `@Param`
+is given, through Zod's Standard JSON Schema — so a field the API accepts and one the reference
+lists cannot differ. Answers have Zod schemas of their own (`*.responses.ts`), strict, which the
+reference shows inside the success envelope; a test calls every public route and parses each
+answer with them, so a field a route adds without documenting it, or a documented one it stops
+giving, fails it. Every operation's `default` answer is the error envelope, documented once.
+
+**Signing in, as the guards decide it.** Two bearer schemes, `session` and `apiKey`.
+`@AllowApiKeys()` marks a controller's routes with both, in the same decorator that lets
+`ApiKeyGuard` accept a key there, so the reference cannot say a key works where it is refused.
+The page's introduction explains sessions, keys and their scopes, the `Idempotency-Key` header,
+the envelope, rate limits and cursors.
+
+Left out: the operator's `/admin` routes, `/health` and `/ready`, which are the platform's, and
+the scaffold `GET /`. _Built in F.3._
 
 ## 7. Reliability rules
 
@@ -1502,7 +1597,7 @@ AppModule  (bootstrap: NestFactory.create)
 ├── PrismaModule            (global; exports PrismaService)
 ├── RedisModule             (global; exports the ioredis client)
 ├── AuthModule              → AuthController, AuthService, TokenService, PasswordService,
-│                             APP_GUARD: JwtAuthGuard
+│                             APP_GUARD: JwtAuthGuard, ApiKeyGuard (§10.2)
 ├── JobsModule              → JobsController, JobsService, OutboxRelayService,
 │                             PipelinesController, PipelinesService (§6.3e)
 │    ├── imports JobCoreModule, StorageModule
@@ -1511,7 +1606,8 @@ AppModule  (bootstrap: NestFactory.create)
 ├── EventsModule            → EventsGateway (+ the bridge subscriber, D8)
 ├── HealthModule            → Terminus: Postgres + Redis
 ├── UploadsModule           → UploadsController, UploadsService (signs upload slips)
-└── ProductsModule          → ProductsController, ProductsService
+├── ProductsModule          → ProductsController, ProductsService
+└── ApiKeysModule           → ApiKeysController, ApiKeysService (§6.3f)
 
 WorkerModule  (bootstrap: NestFactory.createApplicationContext)
 ├── ConfigModule / LoggerModule / PrismaModule   (same modules, worker env schema)
@@ -1555,17 +1651,18 @@ All of them in `AppModule`, the guards in the order they run:
 | Token | Provider |
 |---|---|
 | `APP_PIPE` | `StandardSchemaValidationPipe` |
-| `APP_GUARD` | `JwtAuthGuard` (opt out per-route with `@Public()`) |
+| `APP_GUARD` | `JwtAuthGuard` (opt out per-route with `@Public()`). Passes a bearer token that is an API key on to the next |
+| `APP_GUARD` | `ApiKeyGuard`: lets in a request whose bearer token is an API key, on a controller marked `@AllowApiKeys()`, with the scope its method needs (§6.3f). Passes a login token on, so either satisfies a route |
 | `APP_GUARD` | `RateLimitGuard` (a baseline; a stricter limit per-route with `@RateLimit()`). After the JWT guard, so it counts a signed-in caller by account (§15.2) |
+| `APP_GUARD` | `RolesGuard` (a route with `@Roles()` lets in only those roles; one without, everyone the guards before it did). Last, as it reads the role the JWT guard set. Registered with the first admin route, `POST /admin/api-keys/revoke` (§6.3f) |
 | `APP_INTERCEPTOR` | `ResponseEnvelopeInterceptor` |
 | `APP_FILTER` | `DomainExceptionFilter` |
 
 Request logging — the request id and timing — is pino-http's module middleware, not an
-interceptor. `RolesGuard` and `@Roles()` exist for a first admin-only route and are not registered
-until one does.
+interceptor.
 
 What must run before Nest's own middleware — `trust proxy`, request metrics, the request id,
-helmet, CORS, the body parser — and the socket's adapter are applied by `configureApp()` instead,
+helmet, CORS, the body parser — the socket's adapter, and the reference at `/docs` (§6.5) are applied by `configureApp()` instead,
 from `main.ts` and from the tests that boot `AppModule` alike (§15.2).
 
 ### 10.3 Lifecycle order — where it bites
@@ -1647,6 +1744,7 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `CORS_ORIGINS` | csv | ✓ | — | The origins a browser may call from, over HTTP and the socket alike. Empty: none (§15.2) |
 | `TRUST_PROXY` | hops or csv? | ✓ | — | The proxy whose `X-Forwarded-For` names the client: a hop count, or its addresses (`loopback`, a subnet). Unset: none, and the address is the connection's. `true` is refused (§15.2) |
 | `RATE_LIMITS` | bool | ✓ | — | Default `true`. `false` only in the test tiers, which register every account from one address |
+| `API_KEYS_ENABLED` | bool | ✓ | — | Default `true`. `false` turns every API key off: none is made, none authenticates. Read at boot (§6.3f) |
 | `ARGONID_TIME_COST` / `ARGONID_MEMORY_COST` | int | ✓ | — | Defaults `2` and `19456` (KiB): OWASP's minimum for Argon2id. Every registration and login pays it, so raise them as far as the host's latency allows, never lower |
 | `AWS_REGION` | str | ✓ | ✓ | The bucket's region (D29) |
 | `S3_BUCKET` | str | ✓ | ✓ | The dev bucket locally and in CI, the prod bucket when deployed |
@@ -1745,6 +1843,7 @@ Verified 2026-09-01 against the official NestJS, BullMQ, and Prisma documentatio
 | `nestjs-pino` + `pino` + `pino-http` | 5.x / 10.x / 11.x | pino 10 is required by nestjs-pino 5 |
 | `helmet` | 8.x | Security headers on every response (§15.2) |
 | `@nestjs/throttler` | 6.7.x | Rate limits, with its in-memory storage (§15.2) |
+| `@nestjs/swagger` | 12.1.x | The API reference (§6.5). Reads a route's Standard Schema itself, so Zod needs no adapter. Its UI files pull in `@scarf/scarf`, whose install script phones home; npm's script allowlist leaves it unrun |
 | `@prometheus-io/client` | 0.16.x | The metrics registry (§12.3). Formerly `prom-client`, renamed when the Prometheus project adopted it |
 | `argon2` | latest | `Bun.password` does not exist on Node |
 | `ioredis` | latest | Now an **optional** peer of BullMQ v6, so declare it explicitly |
@@ -1878,8 +1977,8 @@ cases.
 | **A22** | **A failed child does not fail the pipeline.** A 45-product pipeline whose second enrichment batch finds the model down (`[llm:down]`) through every attempt; then the model is back and the batch is re-driven | The batch `DEAD_LETTERED` with `ATTEMPTS_EXHAUSTED`, its 20 products unenriched; its two siblings `SUCCEEDED`. The pipeline `COMPLETED_WITH_ERRORS`, `failedChildren = 1`, the summary counting 25 enriched; every job in a job status. The re-drive `SUCCEEDED` and every product is `READY`, while the pipeline row is unchanged and still has one finalize job | PE |
 | **A23** | **The fan-out is idempotent.** A pipeline's import fails its first attempt right after its fan-out commits (`RELAY_FAULT_AFTER_FAN_OUT`), so its retry fans out again | The import `SUCCEEDED` on attempt 2; one `Job` row per `(stage, batch)`, each with one outbox row; the retry wrote none, every batch refused by `UNIQUE (userId, idempotencyKey)`; `pendingChildren` raised once | PE |
 | **A24** | **The parent cannot be lost.** The API — whose relay is the only thing that enqueues a row a worker wrote — is stopped while the pipeline's last batch waits on the model (`[llm:slow]`); the worker is killed as soon as that batch finishes; both are started again | While both were down, the finalize job and its outbox row were already there, unpublished. Then the relay publishes it (`attempts = 1`), it succeeds on attempt 1, and the pipeline is `COMPLETED` with one finalize job | PE |
-| **A25** | **Revocation is immediate.** Revoke a key, then use it | `401`, with no process restart | PF |
-| **A26** | **A key's plaintext exists nowhere.** Create a key, then grep | The secret appears in no row and no log line; only `prefix` and the SHA-256 `hash` are stored | PF |
+| **A25** | **Revocation is immediate.** A key reads `/jobs`; its owner revokes it; the key is used again at once, to read and to submit | Both later requests `401` from the same API process, never restarted; no job was made. A cached answer fails it | PF |
+| **A26** | **A key's plaintext exists nowhere.** Make a key and use it through both processes — a submit the worker runs, then a read — with JSON logs | The key's requests are logged under its `apiKeyId` with `Authorization` redacted, and the secret part is in neither process's log. Every textual column of every table is searched for it: none holds it; `ApiKey` holds the prefix and the SHA-256 | PF |
 | **A27** | **The backlog can be watched.** Submit 20 jobs with no worker running, then start one | Scraped from the API's own metrics port, `relay_queue_depth` rises by 20 and falls back to where it began; the worker's `relay_job_attempt_duration_seconds_count{outcome="succeeded"}` reaches 20. A job dead-lettered after it raises `relay_dead_letters` and counts as `dead_lettered` on the worker | 8 |
 | **A28** | **A job's story is found by one id.** Under a chosen `X-Request-Id`, submit a job that fails twice, then re-drive it under another; and one that succeeds. Both processes log JSON, as in production | Under the submit's id: the API's lines for the submit, and every worker line of both attempts, the handler's included, each naming the job, its type and its attempt, ending in the dead letter. No line about the job is without it. The re-drive's runs are under the re-drive's id, none under the submit's. A succeeded job's lines end in one saying so | 8 |
 | **A29** | **A provider's rate limit slows only its own jobs.** The AI queue limited to 1 job a second; 4 `ai.enrich` jobs, then 3 `MOCK` jobs, queued before the worker starts | Every job `SUCCEEDED`, and every `ai.enrich` outbox row names `relay-ai`. The `ai.enrich` jobs started at least a window apart; every `MOCK` job finished before the second `ai.enrich` job started | PD |
@@ -2145,7 +2244,7 @@ worker made of it (A28).
 | Line | Fields |
 |---|---|
 | Any line the API writes while it handles a request | `correlationId` |
-| The line that closes a request | `correlationId`, the whole `req` and `res`, `userId` |
+| The line that closes a request | `correlationId`, the whole `req` and `res`, `userId`, and `apiKeyId` when an API key made it — the key's id, never the key; `Authorization` is redacted |
 | Any line the worker writes while it runs a job: the processor's, the handler's, anything they call | `correlationId`, `jobId`; `jobType` and `attempt` once the attempt has claimed the job |
 | A job that stalled, or that the queue abandoned and the `failed` event or the sweep finished | `correlationId`, `jobId` |
 
@@ -2599,6 +2698,9 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-24 | §6.2, §6.5, §10.2, §13.2 — the API reference, F.3, which closes PF. Swagger UI at `/docs` and the OpenAPI document at `/docs/openapi.json`, public. Requests documented from the Zod schemas the routes validate with; answers from strict Zod schemas of their own, which a test parses every public route's real answer with. `session` and `apiKey` bearer schemes, the second set by `@AllowApiKeys()` itself; the error envelope as every operation's `default`. The admin routes, `/health`, `/ready` and `GET /` left out. `@nestjs/swagger` 12.1 added. |
+| 2026-11-24 | §6.3f, §10.1, §10.2, §12.1, §14 — using an API key, F.2. `ApiKeyGuard`, beside `JwtAuthGuard`, lets in `Bearer relay_…` on the jobs, pipelines, uploads and products controllers (`@AllowApiKeys()`), `read` for a `GET` and `write` for the rest, as the key's owner; `403` on any other route. Looked up by hash on every request; `lastUsedAt` written at most once a minute, not awaited. The request log line names the key's id. A25 and A26 registered. |
+| 2026-11-24 | §4.10, §6.2, §6.3f, §10.2, §11 — API keys specified, F.1. `relay_` and 32 random bytes, stored as SHA-256 and shown once; `read` and `write` scopes over jobs, pipelines, uploads and products; only a session manages keys; looked up on every request, so revocation needs no restart; one unrevoked key per account. `POST /api-keys`, `GET /api-keys` and `POST /api-keys/:id/revoke` built, and the operator's `GET /admin/api-keys` and `POST /admin/api-keys/revoke`, the first admin routes, which register `RolesGuard`. `API_KEYS_ENABLED` turns keys off. **New migration** `20261124100000_api_key`. |
 | 2026-11-24 | §6.3d, §6.3e, §14 — a failed batch, E.4, which closes PE. `[llm:down]` added to the fake: a provider down fails the attempt, and the batch is dead-lettered once its attempts are spent. A22 registered: the pipeline ends `COMPLETED_WITH_ERRORS`, and a re-drive of the batch fixes its products without reopening it. |
 | 2026-11-23 | §4.3, §6.3d, §6.3e, §14, D24 — a pipeline finishes, E.3. Every finish of a pipeline's job — the worker's, a cancel's, the sweep's — takes its place off `pendingChildren` in its own transaction and counts a failure in `failedChildren`; the one that reaches zero writes `pipeline.finalize` and its outbox row. `pipeline.finalize` joins `JobType` but not the submit union; it writes the status and summary once. `[llm:slow]` added to the fake. A24 registered; A23 now waits for the pipeline to finish. |
 | 2026-11-23 | §6.3e, §7.2, §10.1, §11, §14 — a pipeline starts and fans out, E.2. `POST /pipelines` and `GET /pipelines/:id` built; a pipeline's import ends by reading its file again and writing the batches its products need, through `context.fanOut`, under the import's lease and only while it holds its place. A client key beginning with `pipeline:` is refused. A23 registered, with `RELAY_FAULT_AFTER_FAN_OUT`. Nothing takes one off the counter yet, so a pipeline stays `RUNNING` until E.3. |

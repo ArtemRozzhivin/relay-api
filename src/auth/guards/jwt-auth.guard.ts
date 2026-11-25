@@ -9,6 +9,8 @@ import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator.js';
 import type { AccessTokenPayload } from '../auth.types.js';
+import { bearerToken } from '../bearer-token.js';
+import { isApiKey } from '../../api-keys/api-key-secret.js';
 
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
@@ -25,10 +27,15 @@ export class JwtAuthGuard implements CanActivate {
     if (isPublic) return true;
 
     const request = context.switchToHttp().getRequest<Request>();
-    const token = this.extractTokenFromHeader(request);
+    const token = bearerToken(request);
 
     if (!token) {
       throw new UnauthorizedException();
+    }
+
+    // An API key: ApiKeyGuard, which runs next, lets it in or refuses it.
+    if (isApiKey(token)) {
+      return true;
     }
 
     try {
@@ -45,11 +52,5 @@ export class JwtAuthGuard implements CanActivate {
     }
 
     return true;
-  }
-
-  private extractTokenFromHeader(request: Request) {
-    const [type, token] = request.headers.authorization?.split(' ') ?? [];
-
-    return type === 'Bearer' ? token : undefined;
   }
 }
