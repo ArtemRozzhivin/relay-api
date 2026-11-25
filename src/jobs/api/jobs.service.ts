@@ -40,6 +40,7 @@ import {
 import { lockAccount } from '../../prisma/account-lock.js';
 import { toPage } from '../../common/pagination/cursor.js';
 import { describeError } from '../../common/errors/describe-error.js';
+import { isUniqueViolation } from '../../prisma/unique-violation.js';
 
 // Fetched when the seller clicks, so a short life costs nothing: a link that
 // leaks from a browser history is dead within minutes.
@@ -144,10 +145,7 @@ export class JobsService {
         return { job, outboxId: outbox.id };
       });
     } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
+      if (isUniqueViolation(error)) {
         const existing = await this.prisma.job.findUniqueOrThrow({
           where: { userId_idempotencyKey: { userId, idempotencyKey } },
         });

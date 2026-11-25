@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { pipeline } from 'node:stream/promises';
+import { pipeline as streamPipeline } from 'node:stream/promises';
 import { CsvError } from 'csv-parse';
 import { stringify } from 'csv-stringify';
 import { z } from 'zod';
@@ -179,7 +179,7 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       // A pipeline rather than .pipe(): when the loop stops early — a
       // cancellation, a failed write — every stage is destroyed, the S3
       // download included, instead of left open.
-      await pipeline(
+      await streamPipeline(
         file,
         parseFile(),
         nameColumns,
@@ -350,7 +350,7 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       });
 
     await Promise.all([
-      pipeline(
+      streamPipeline(
         body,
         parseFile(),
         nameColumns,
@@ -411,7 +411,7 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       unread = [];
     };
 
-    await pipeline(
+    await streamPipeline(
       body,
       parseFile(),
       nameColumns,

@@ -1,7 +1,7 @@
 import type { Prisma } from '../../generated/prisma/client.js';
-import type { JobStatus } from '../../generated/prisma/enums.js';
 import { TooManyUnfinishedJobsError } from '../../common/errors/app-error.js';
 import type { JobType } from '../jobs.schema.js';
+import { UNFINISHED_STATUSES } from '../engine/job-statuses.js';
 
 /**
  * How many jobs of a type one account can have queued or running at once
@@ -24,15 +24,13 @@ export const UNFINISHED_CAPS: ReadonlyMap<string, number> = new Map<
   ['ai.enrich', 10],
 ]);
 
-const UNFINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
-
 // The jobs a cap counts. Not a pipeline's batch still holding its place: a
 // pipeline is limited as a whole, one running per account, and counting its
 // batches would refuse its owner's own submits — and the re-drive of a failed
 // batch of that same pipeline — until they drained (§6.3e). Its import counts
 // like any import, and a batch re-driven after its first finish like any job.
 const COUNTED: Prisma.JobWhereInput = {
-  status: { in: UNFINISHED },
+  status: { in: UNFINISHED_STATUSES },
   OR: [{ pendingInPipeline: false }, { type: 'import.csv' }],
 };
 

@@ -15,6 +15,7 @@ import { StorageService } from '../../../storage/storage.service.js';
 import { productImageKey } from '../../../storage/object-keys.js';
 import { ProductsService } from '../../../products/products.service.js';
 import { renderSizes } from '../../../images/image-variants.js';
+import { RENDERED_FORMAT } from '../../../images/image-output.js';
 import { RetryableJobError } from '../../../common/errors/app-error.js';
 import { describeError } from '../../../common/errors/describe-error.js';
 import { hasImageForCurrentUrl } from '../../../products/product-state.js';
@@ -103,7 +104,7 @@ export class ImageProcessJobHandler extends JobHandler<
               size.name,
             ),
             Readable.from([size.body]),
-            { contentType: 'image/webp' },
+            { contentType: RENDERED_FORMAT.contentType },
           );
         }
 

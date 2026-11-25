@@ -7,6 +7,8 @@ import { Registry } from '@prometheus-io/client';
 import request from 'supertest';
 import { startApp } from '../support/http.js';
 import { samples, sum, type Labels } from '../support/metrics.js';
+import { IMAGE_BATCH_MAX } from '../../src/jobs/jobs.schema.js';
+import { SKU_MAX_LENGTH } from '../../src/products/products.schema.js';
 
 const ALLOWED = 'https://dashboard.example';
 const OTHER = 'https://elsewhere.example';
@@ -110,6 +112,30 @@ describe('the HTTP edge', () => {
       expect(res.body.error.code).toBe('PAYLOAD_TOO_LARGE');
       expect(res.body.requestId).toBe(res.headers['x-request-id']);
       expect(res.headers['access-control-allow-origin']).toBe(ALLOWED);
+    });
+
+    // Past the parser, the route refuses it for the token it lacks: the
+    // largest legal batch, written as long as JSON allows, is never a 413.
+    it('takes the largest body a route accepts, every character escaped', async () => {
+      const escaped = (text: string) =>
+        [...text]
+          .map(
+            (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`,
+          )
+          .join('');
+      const sku = escaped('S'.repeat(SKU_MAX_LENGTH));
+      const body = `{"type":"image.process","payload":{"skus":[${Array.from(
+        { length: IMAGE_BATCH_MAX },
+        () => `"${sku}"`,
+      ).join(',')}]}}`;
+
+      const res = await request(server)
+        .post('/jobs')
+        .set('Content-Type', 'application/json')
+        .send(body);
+
+      expect(body.length).toBeGreaterThan(30_000);
+      expect(res.status).toBe(401);
     });
 
     it('names the request that sent malformed JSON', async () => {

@@ -5,10 +5,15 @@ import { toPage } from '../common/pagination/cursor.js';
 import { StorageService } from '../storage/storage.service.js';
 import { lockAccount } from '../prisma/account-lock.js';
 import { productImageKey } from '../storage/object-keys.js';
-import { IMAGE_SIZES, type ImageSize } from '../images/image-variants.js';
+import { IMAGE_SIZES, type ImageSize } from '../images/image-output.js';
 import type { ListProductsQuery } from './products.schema.js';
 import { hashEnrichmentInput } from '../enrichment/enrichment-input.js';
 import type { Enrichment } from '../enrichment/enrichment-reply.js';
+import {
+  enrichmentState,
+  imageState,
+  type Conclusion,
+} from './product-state.js';
 
 // "Not READY for this input", written out: a NOT over the pair would be NULL
 // for a product with no conclusion yet, and so would match none. A status is
@@ -286,7 +291,7 @@ export class ProductsService {
     userId: string,
     productId: string,
     sourceUrl: string,
-    status: 'READY' | 'FAILED',
+    status: Conclusion,
     error: string | null,
   ) {
     const { count } = await client.product.updateMany({
@@ -308,8 +313,8 @@ export class ProductsService {
     return count === 1;
   }
 
-  // The image columns describe the URL they were concluded for; the client is
-  // told what they mean for the URL the product has now.
+  // The columns describe the input they were concluded about; the client is
+  // told what they mean for the input the product has now (product-state.ts).
   private async toView({
     imageStatus,
     imageSourceUrl,
@@ -322,18 +327,20 @@ export class ProductsService {
     ...product
   }: Product) {
     let image: ProductImage | null = null;
+    const imageNow = imageState({ ...product, imageStatus, imageSourceUrl });
 
     if (product.imageUrl === null) {
       image = null;
-    } else if (imageSourceUrl !== product.imageUrl) {
+    } else if (imageNow === 'PENDING') {
       image = { status: 'PENDING' };
-    } else if (imageStatus === 'FAILED') {
+    } else if (imageNow === 'FAILED') {
       image = { status: 'FAILED', error: imageError };
     } else {
+      const { imageUrl } = product;
       const links = await Promise.all(
         IMAGE_SIZES.map(async ({ name }) => {
           const { url } = await this.storage.signDownload(
-            productImageKey(product.userId, product.id, imageSourceUrl, name),
+            productImageKey(product.userId, product.id, imageUrl, name),
             IMAGE_LINK_SECONDS,
           );
 
@@ -348,12 +355,15 @@ export class ProductsService {
     }
 
     let enrichment: ProductEnrichment;
+    const enrichmentNow = enrichmentState({
+      ...product,
+      enrichmentStatus,
+      enrichmentInputHash,
+    });
 
-    // Never enriched, or enriched from text the product has since replaced:
-    // either way there is no answer for what it says now.
-    if (enrichmentInputHash !== hashEnrichmentInput(product)) {
+    if (enrichmentNow === 'PENDING') {
       enrichment = { status: 'PENDING' };
-    } else if (enrichmentStatus === 'FAILED') {
+    } else if (enrichmentNow === 'FAILED') {
       enrichment = { status: 'FAILED', error: enrichmentError };
     } else {
       enrichment = { status: 'READY', category: category!, tags };

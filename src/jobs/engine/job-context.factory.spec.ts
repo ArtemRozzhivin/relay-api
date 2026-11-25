@@ -8,6 +8,7 @@ import {
 import type { JobEventsPublisher } from '../events/job-events.publisher.js';
 import type { JobTransitionService } from './job-transition.service.js';
 import type { JobProgress } from './job-progress.js';
+import type { PipelineBatch } from './job-context.js';
 import { JobCancelledError } from './job-handler.js';
 
 const WINDOW_MS = 500;
@@ -480,9 +481,9 @@ describe('JobContextFactory', () => {
   });
 
   describe('fanOut', () => {
-    const batches = [
-      { stage: 'enrich', type: 'ai.enrich' as const, payload: { skus: ['A'] } },
-      { stage: 'enrich', type: 'ai.enrich' as const, payload: { skus: ['B'] } },
+    const batches: PipelineBatch[] = [
+      { stage: 'enrich', type: 'ai.enrich', payload: { skus: ['A'] } },
+      { stage: 'enrich', type: 'ai.enrich', payload: { skus: ['B'] } },
     ];
 
     const fanningOut = (

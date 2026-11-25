@@ -9,8 +9,9 @@ import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { JobTransitionService } from '../jobs/engine/job-transition.service.js';
 import { JobEventsPublisher } from '../jobs/events/job-events.publisher.js';
-import { messageId, type OutboxMessage } from '../jobs/delivery/job-queue.js';
+import { messageId, readOutboxMessage } from '../jobs/delivery/job-queue.js';
 import { JobQueues } from '../jobs/delivery/job-queues.js';
+import { UNFINISHED_STATUSES } from '../jobs/engine/job-statuses.js';
 import type { JobStatus } from '../generated/prisma/enums.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';
@@ -92,7 +93,7 @@ export class StrandedJobSweeper
     for (;;) {
       const page = await this.prisma.job.findMany({
         where: {
-          status: { in: ['RUNNING', 'QUEUED'] },
+          status: { in: UNFINISHED_STATUSES },
           // Not Prisma's `cursor`, which reads from the cursor row and skips
           // it with OFFSET 1: once the sweep has finished a page's last row,
           // that row is out of the filter, and the offset skips the next one.
@@ -131,8 +132,11 @@ export class StrandedJobSweeper
         if (latest && (status === 'RUNNING' || latest.publishedAt !== null)) {
           // The delivery's own correlationId, a re-drive's when a re-drive
           // queued it, so the line that ends the job joins the run it ends
-          // (§12.1). Json in the schema: an OutboxMessage by agreement.
-          const { correlationId } = latest.payload as unknown as OutboxMessage;
+          // (§12.1). Only for the log: a payload it cannot read names no run,
+          // and the job is checked all the same.
+          const correlationId = readOutboxMessage(
+            latest.payload,
+          )?.correlationId;
 
           await this.logContext.runInContext(
             () =>

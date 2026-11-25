@@ -966,3 +966,36 @@ Shape only, so the earlier phases leave room for it:
 - [ ] The same webhook delivered twice changes state once; out-of-order events still converge
 - [ ] Two parallel imports near the limit never exceed it in total
 - [ ] Access is never granted without a verified webhook
+
+# Later · What the review fixes parked
+
+The review of PC–PE (2026-11-24) proposed these too. Each is sound, and none is a bug: they make
+the code easier to change, at the cost of a change wide enough to deserve its own branch and test
+pass. Listed so they are not lost; R.5 did the small ones.
+
+- [ ] **One accept flow for a submit and a pipeline.** `PipelinesService.start` copies `submit`'s
+  upload check and its replay on a taken idempotency key, and injects `JobsService` only for
+  `publishNow`. Extract `isOwnUpload` beside the upload keys, and `publishNow` into a publisher in
+  `jobs/delivery/` that both services inject
+- [ ] **One owner of the `Pipeline` row.** The finalize handler is the only handler given
+  `PrismaService`, and writes the pipeline's final status itself while `JobTransitionService` writes
+  its counter. Move the finalize read and write beside `leavePipeline`
+- [ ] **One list of queues.** It is kept in five places: `QUEUES`, `JobQueues`, and
+  `BullModule.registerQueue` and the providers in both root modules. A `JobDeliveryModule` built
+  from `QUEUES`, imported by both roots
+- [ ] **`JobsProcessor.run()` split by outcome.** About 250 lines, one `catch` holding the
+  cancellation, the shutdown hand-back, the rate limit and the failure. Private methods that each
+  return the attempt's outcome
+- [ ] **Shared test setup.** Some 15 specs copy a register-and-clean-up wrapper, and three the
+  upload of a CSV through a slip. A tracked-accounts helper and `uploadCsv` in `test/support`,
+  which would also delete the accounts the harness creates — it deletes none today
+- [ ] **The product status columns as an enum.** `imageStatus` and `enrichmentStatus` are text with
+  a `CHECK`, every other status a Prisma enum. The code now types them as `Conclusion`; the enum
+  is a migration
+- [ ] **One way to read an import's file.** `import.csv` opens the upload and pipes it through the
+  parser in three places that differ only in what consumes the rows
+- [ ] **One formatter of Zod issues**, for a model's reply and an import's row alike
+- [ ] **A18 to prove the batches ran at once.** It shows none stalled, not that two overlapped
+- [ ] **A14's eleven claims.** Twice on 2026-11-25 the import was claimed 11 times in a second
+  with one queue delivery in Redis, then passed seven runs in a row on a clean database. Not
+  explained; look again if CI shows it

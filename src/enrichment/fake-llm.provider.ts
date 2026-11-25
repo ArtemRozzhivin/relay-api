@@ -54,8 +54,6 @@ export interface FakeLlmOptions {
  * that a busy product is refused once per process and then answered.
  */
 export class FakeLlmProvider implements LlmProvider {
-  readonly model = 'fake';
-
   // The fake charges nothing. A price in the range small hosted models charge
   // gives the cost a job records something to show.
   readonly price = {

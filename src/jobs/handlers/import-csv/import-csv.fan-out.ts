@@ -1,4 +1,5 @@
 import { ENRICH_BATCH_MAX, IMAGE_BATCH_MAX } from '../../jobs.schema.js';
+import { chunked } from '../../../common/collections/chunked.js';
 import type { PipelineBatch } from '../../engine/job-context.js';
 import {
   hasImageForCurrentUrl,
@@ -14,11 +15,6 @@ export type ImportBatch = Extract<
 /** A product as the fan-out reads it. */
 export type FanOutProduct = Parameters<typeof isEnrichedForCurrentText>[0] &
   Parameters<typeof hasImageForCurrentUrl>[0] & { sku: string };
-
-const chunked = (skus: string[], size: number) =>
-  Array.from({ length: Math.ceil(skus.length / size) }, (_, index) =>
-    skus.slice(index * size, (index + 1) * size),
-  );
 
 /**
  * Sorts a pipeline's products into its batches as they are read (§6.3e). A
@@ -47,12 +43,12 @@ export class FanOutPlan {
   batches(): ImportBatch[] {
     return [
       ...chunked(this.enrich, ENRICH_BATCH_MAX).map((skus) => ({
-        stage: 'enrich',
+        stage: 'enrich' as const,
         type: 'ai.enrich' as const,
         payload: { skus },
       })),
       ...chunked(this.images, IMAGE_BATCH_MAX).map((skus) => ({
-        stage: 'images',
+        stage: 'images' as const,
         type: 'image.process' as const,
         payload: { skus },
       })),

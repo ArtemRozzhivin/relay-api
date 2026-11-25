@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
-import { Prisma, type Pipeline } from '../../generated/prisma/client.js';
+import type { Pipeline } from '../../generated/prisma/client.js';
 import type { JobStatus } from '../../generated/prisma/enums.js';
 import {
   IdempotencyKeyReusedError,
@@ -17,6 +17,7 @@ import type { StartPipelineInput } from '../jobs.schema.js';
 import { JobsService } from './jobs.service.js';
 import { requestHash } from './request-hash.js';
 import { assertUnderCap } from './unfinished-caps.js';
+import { isUniqueViolation } from '../../prisma/unique-violation.js';
 
 interface StartArgs {
   userId: string;
@@ -98,10 +99,7 @@ export class PipelinesService {
         return { pipeline, job, outboxId: outbox.id };
       });
     } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
+      if (isUniqueViolation(error)) {
         const existing = await this.prisma.pipeline.findUniqueOrThrow({
           where: { userId_idempotencyKey: { userId, idempotencyKey } },
         });

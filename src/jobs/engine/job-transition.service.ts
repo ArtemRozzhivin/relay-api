@@ -12,8 +12,8 @@ import type { AttemptFailedError, DeadLetterError } from './job-error-codes.js';
 import type { ModelUsage, PipelineBatch } from './job-context.js';
 import { outboxEntry } from '../delivery/job-queue.js';
 import { pipelineKey } from './pipeline-keys.js';
-
-const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
+import { UNFINISHED_STATUSES } from './job-statuses.js';
+import { chunked } from '../../common/collections/chunked.js';
 
 const FINISHED: ReadonlySet<unknown> = new Set<JobStatus>([
   'SUCCEEDED',
@@ -173,7 +173,7 @@ export class JobTransitionService {
   }
 
   claim(jobId: string) {
-    return this.move(jobId, NOT_FINISHED, {
+    return this.move(jobId, UNFINISHED_STATUSES, {
       status: 'RUNNING',
       attempts: { increment: 1 },
       lease: { increment: 1 },
@@ -232,7 +232,7 @@ export class JobTransitionService {
   abandon(jobId: string, error: DeadLetterError) {
     return this.move(
       jobId,
-      NOT_FINISHED,
+      UNFINISHED_STATUSES,
       { status: 'DEAD_LETTERED', error, finishedAt: new Date() },
       { where: { attempts: { gt: 0 } } },
     );
@@ -323,7 +323,7 @@ export class JobTransitionService {
   requestCancel(jobId: string) {
     return this.move(
       jobId,
-      NOT_FINISHED,
+      UNFINISHED_STATUSES,
       { cancelRequested: true },
       { where: { type: { not: 'pipeline.finalize' } } },
     );
@@ -360,7 +360,7 @@ export class JobTransitionService {
   cancelBeforeClaim(jobId: string) {
     return this.move(
       jobId,
-      NOT_FINISHED,
+      UNFINISHED_STATUSES,
       { status: 'CANCELLED', finishedAt: new Date() },
       { where: { cancelRequested: true, effectCommitted: false } },
     );
@@ -568,11 +568,11 @@ export class JobTransitionService {
 
         let written = 0;
 
-        for (let start = 0; start < rows.length; start += INSERT_CHUNK) {
+        for (const chunk of chunked(rows, INSERT_CHUNK)) {
           // A batch an earlier attempt wrote is skipped, not returned, so only
           // the new ones get an outbox row and a place in the counter.
           const created = await tx.job.createManyAndReturn({
-            data: rows.slice(start, start + INSERT_CHUNK),
+            data: chunk,
             skipDuplicates: true,
             select: { id: true, type: true, maxAttempts: true },
           });

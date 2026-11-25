@@ -9,10 +9,14 @@ import type { ApiEnv } from './config/env.schema.js';
 import { assignRequestId } from './common/logging/request-id.js';
 import { HttpMetrics } from './metrics/http-metrics.js';
 import { setUpApiDocs } from './docs/api-docs.js';
+import { IMAGE_BATCH_MAX } from './jobs/jobs.schema.js';
+import { SKU_MAX_LENGTH } from './products/products.schema.js';
 
-// The largest body a route takes is an image.process batch: 50 SKUs, about
-// 30 KB even with every character sent as a \u escape.
-const JSON_BODY_LIMIT = '64kb';
+// The largest body a route takes is an image.process batch: every sku at its
+// longest, and every character sent as a six-byte \u escape — some 30 KB —
+// with as much again for the rest of the body. Worked out from the limits it
+// follows, so raising one of them raises this too.
+const JSON_BODY_LIMIT = IMAGE_BATCH_MAX * SKU_MAX_LENGTH * 6 * 2;
 
 /**
  * The HTTP edge: the client's address, request metrics, the request id,

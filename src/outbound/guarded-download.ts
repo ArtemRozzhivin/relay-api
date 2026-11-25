@@ -224,8 +224,10 @@ export class GuardedDownloader {
             // The size cap counts the bytes received, so they must be the
             // bytes of the file and not of a compressed stream of it.
             'accept-encoding': 'identity',
+            // Who is asking, for the owner of the host. No version: a copy
+            // of one here only drifts from package.json, as `1.0` had.
             'user-agent':
-              'Relay/1.0 (+https://github.com/ArtemRozzhivin/relay-api)',
+              'Relay (+https://github.com/ArtemRozzhivin/relay-api)',
           },
         },
         resolve,
