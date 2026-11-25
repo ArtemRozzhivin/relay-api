@@ -30,6 +30,12 @@ export interface OpenedObject {
   etag: string;
 }
 
+// Taken before signing, and to the second, as a policy's expiry and a link's
+// X-Amz-Date are written: the time a client is told is never later than the
+// one S3 holds it to.
+const expiryFromNow = (seconds: number) =>
+  new Date(Math.floor(Date.now() / 1000 + seconds) * 1000);
+
 /** A signed permission to upload one object, as an HTML form would (presigned POST). */
 export interface UploadSlip {
   url: string;
@@ -94,9 +100,7 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
     maxBytes: number,
     expiresInSeconds: number,
   ): Promise<UploadSlip> {
-    // Taken before signing, so the time a client is told is never later than
-    // the one S3 will hold it to.
-    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
+    const expiresAt = expiryFromNow(expiresInSeconds);
 
     const { url, fields } = await createPresignedPost(this.client, {
       Bucket: this.bucket,
@@ -216,9 +220,7 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
     key: string,
     expiresInSeconds: number,
   ): Promise<DownloadLink> {
-    // Taken before signing, like an upload slip's, so the time a client is
-    // told is never later than the one S3 holds the link to.
-    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
+    const expiresAt = expiryFromNow(expiresInSeconds);
 
     const url = await getSignedUrl(
       this.client,

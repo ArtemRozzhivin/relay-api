@@ -26,6 +26,7 @@ import {
   createThrowawayUser,
   deleteUsers,
   seedJob,
+  seedPipeline,
 } from '../support/db.js';
 
 // The sweep decides from the queue's state, so each state is built for real in
@@ -291,6 +292,71 @@ describe('the stranded-job sweep', () => {
   // nothing else is touched. This test's ids start ffffffff and so sort after
   // every other row, which puts page boundaries among them whatever else is
   // in the table.
+  // As a leftover of an early pipeline build was: a batch still holding its
+  // place on a pipeline whose counter is already 0, so the dead letter's own
+  // write breaks the pipeline's CHECK — on every sweep, and before this, for
+  // every row after it too.
+  it('goes on past a job Postgres refuses to dead-letter, and names it', async () => {
+    const pipeline = await seedPipeline(prisma, {
+      userId,
+      pendingChildren: 0,
+    });
+    const [refusedId, nextId] = [randomUUID(), randomUUID()].sort();
+    const stranded = async (id: string, pipelineId?: string) => {
+      await seedJob(prisma, {
+        id,
+        userId,
+        status: 'RUNNING',
+        attempts: 1,
+        startedAt: new Date(),
+        ...(pipelineId ? { pipelineId, pendingInPipeline: true } : {}),
+      });
+      await prisma.outbox.create({
+        data: {
+          jobId: id,
+          queue: JOBS_QUEUE,
+          jobName: 'MOCK',
+          payload: { jobId: id, correlationId: 'sweep', maxAttempts: 1 },
+        },
+      });
+    };
+
+    await stranded(refusedId, pipeline.id);
+    await stranded(nextId);
+
+    const ours = new Set<string>([refusedId, nextId]);
+    const decide = sweeper.finishIfStranded.bind(sweeper);
+    const spy = vi
+      .spyOn(sweeper, 'finishIfStranded')
+      .mockImplementation(async (job, now) =>
+        ours.has(job.id) ? decide(job, now) : null,
+      );
+    const logged: unknown[] = [];
+    const errors = vi
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation((line: unknown) => {
+        logged.push(line);
+      });
+
+    try {
+      await sweeper.sweep();
+    } finally {
+      spy.mockRestore();
+      errors.mockRestore();
+    }
+
+    expect((await row(refusedId)).status).toBe('RUNNING');
+    expect((await row(nextId)).status).toBe('DEAD_LETTERED');
+    expect(logged).toContainEqual(
+      expect.stringMatching(
+        new RegExp(
+          `^Job ${refusedId} is stranded, but the sweep could not dead-letter it: .*Pipeline_counts_not_negative`,
+          's',
+        ),
+      ),
+    );
+  });
+
   it("asks about every candidate once, under its delivery's correlationId, though it finishes the last row of a page", async () => {
     const run = randomUUID().slice(0, 4);
     const id = (n: number) =>

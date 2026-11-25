@@ -159,8 +159,8 @@ export class StrandedJobSweeper
    * are the queue still doing its job — a stalled one goes back to waiting and
    * is redelivered — so they are left alone.
    *
-   * @returns the dead-lettered row, or `null` if the job is not stranded or
-   * something else finished it first.
+   * @returns the dead-lettered row, or `null` if the job is not stranded,
+   * something else finished it first, or Postgres refused to finish it.
    */
   async finishIfStranded(job: SweepCandidate, now = Date.now()) {
     const entry = await this.queues
@@ -180,14 +180,28 @@ export class StrandedJobSweeper
       return null;
     }
 
-    const abandoned = await this.transitions.abandonStranded(
-      job.id,
-      { status: job.status, lease: job.lease, outboxId: job.outboxId },
-      {
-        code: 'DELIVERY_ABANDONED',
-        message: `The queue no longer delivers this job (its entry is ${found})`,
-      },
-    );
+    let abandoned: Awaited<ReturnType<JobTransitionService['abandonStranded']>>;
+
+    try {
+      abandoned = await this.transitions.abandonStranded(
+        job.id,
+        { status: job.status, lease: job.lease, outboxId: job.outboxId },
+        {
+          code: 'DELIVERY_ABANDONED',
+          message: `The queue no longer delivers this job (its entry is ${found})`,
+        },
+      );
+    } catch (error) {
+      // A finish Postgres refuses — a CHECK the row's own data breaks — is that
+      // row's, and refused again on every sweep: thrown, it would stop each one
+      // here, and no row after it would ever be checked. A queue that cannot
+      // be asked still stops the sweep above, as it would for every row.
+      this.logger.error(
+        `Job ${job.id} is stranded, but the sweep could not dead-letter it: ${describeError(error)}`,
+      );
+
+      return null;
+    }
 
     if (abandoned) {
       await this.events.jobUpdated(abandoned);

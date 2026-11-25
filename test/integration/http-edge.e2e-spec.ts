@@ -126,6 +126,24 @@ describe('the HTTP edge', () => {
       expect(res.headers['x-request-id']).toBe('trace-42');
     });
 
+    // It is stored on the jobs the request submits and shown to their owner.
+    it.each([
+      ['too long', 'a'.repeat(129)],
+      ['not shaped like an id', '<script>alert(1)</script>'],
+    ])('replaces a request id %s with its own', async (_label, sent) => {
+      const res = await login('{"email":').set('X-Request-Id', sent);
+
+      expect(res.body.requestId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(res.headers['x-request-id']).toBe(res.body.requestId);
+    });
+
+    it('keeps a request id of the longest length it allows', async () => {
+      const longest = 'a'.repeat(128);
+      const res = await login('{"email":').set('X-Request-Id', longest);
+
+      expect(res.body.requestId).toBe(longest);
+    });
+
     it('does not parse a form', async () => {
       const res = await request(server)
         .post('/auth/login')

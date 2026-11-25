@@ -338,6 +338,22 @@ describe('the job API contract', () => {
         Date.now(),
       );
 
+      // What S3 holds the link to: signed at X-Amz-Date, to the second, for
+      // X-Amz-Expires seconds. The time the client is told is never later.
+      const signed = new URL(body.data.url).searchParams;
+      const signedAt = Date.parse(
+        signed
+          .get('X-Amz-Date')!
+          .replace(
+            /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/,
+            '$1-$2-$3T$4:$5:$6Z',
+          ),
+      );
+
+      expect(Date.parse(body.data.expiresAt)).toBeLessThanOrEqual(
+        signedAt + Number(signed.get('X-Amz-Expires')) * 1000,
+      );
+
       const download = await fetch(body.data.url);
 
       expect(download.status).toBe(200);

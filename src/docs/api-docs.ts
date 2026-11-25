@@ -38,7 +38,8 @@ same key with a different body is \`422 IDEMPOTENCY_KEY_REUSED\`. A key may not 
 
 A success is \`{ success: true, data, requestId }\`; a failure is
 \`{ success: false, error: { code, message }, requestId }\`, \`error.code\` saying which. Quote the
-\`requestId\` — also in the \`X-Request-Id\` header — when asking about a request.
+\`requestId\` — also in the \`X-Request-Id\` header — when asking about a request. Send an
+\`X-Request-Id\` of your own, up to 128 letters, digits and \`_.:-\`, and it is used instead.
 
 Too many requests is \`429\` with a \`Retry-After\` in seconds. Too much unfinished work is \`429\`
 too, without one: an account holds at most 3 imports, 50 image batches and 10 AI batches queued

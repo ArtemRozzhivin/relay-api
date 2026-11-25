@@ -584,8 +584,12 @@ POST /uploads                      (no body)
 - **Send it as a form:** `multipart/form-data` to `url`, every entry of `fields` first, then the
   file as `file`, **last** — S3 ignores anything after the file. Success is S3's `204`.
 - **S3 enforces the signed policy itself**: that key, a size of 1 byte to `maxBytes` (50 MB), and
-  the 5-minute expiry. Breaking any of them is S3's answer, not ours: `403` for a changed key or
+  the 60-second expiry. Breaking any of them is S3's answer, not ours: `403` for a changed key or
   an expired slip, `400 EntityTooLarge` / `EntityTooSmall` for the size.
+- **Ask for a slip when the file is ready.** The upload must start within the 60 seconds; S3
+  checks the time when it starts, so a slow connection still finishes. Short because a slip is
+  not spent by its first upload: until it expires, every `POST` of it stores the file again, and
+  S3 bills each one.
 - `200`, not `201`: nothing exists yet. What the API records is that a slip was given (§4.8): an
   account can start **20 uploads in any 24 hours**, and the next is `429 TOO_MANY_UPLOADS` (D32).
   An upload the client never follows with a job is an orphan; the bucket's lifecycle rule removes
@@ -775,7 +779,12 @@ and the job waits without spending an attempt. The handler throws `JobRateLimite
 processor sets the pause on the queue in Redis — every worker waits, as every job there would ask
 the same busy provider — hands the attempt back, and puts the entry back at the head of the queue.
 A wait under a second is taken as a second. The pause lives in the limiter's own key, so it also
-ends the window that was running: after it, the count starts again. Only a queue with a limiter can
+ends the window that was running: after it, the count starts again. **Twenty hand-backs a
+delivery are free;** after them each 429 counts as an attempt, and the job ends as any failure
+does, its owner told the service was busy. A provider that stays busy — a monthly quota spent
+answers 429 until the month ends — would otherwise hold the job and pause its queue for ever.
+BullMQ counts them: every start of an entry, and only a failure as an attempt made, a re-drive
+being a new entry. Only a queue with a limiter can
 be paused, so on `relay-jobs` the same error is an ordinary failure. A 429 on the corrective
 request runs the job again, which asks only about what the first reply left without an answer:
 what it did answer was recorded before the corrective request. These jobs run on a queue of their
@@ -1215,6 +1224,11 @@ Worth stating precisely, because the mental model most people have is wrong:
   is visible and one re-drive by `errorCode` brings them all back. The sweep costs one Redis read
   per unfinished job per tick, and pages by `id > last` rather than an offset, since the last row
   of a page is often the one it has just finished.
+- **A row the sweep cannot finish is logged and passed over.** A finish Postgres refuses — a
+  `CHECK` the row's own data breaks — is refused on every sweep, so thrown it would stop each one
+  at that row, and no row after it would ever be checked. It is logged with the reason and left
+  for someone to repair. A queue that cannot be asked still stops the sweep: that is true of every
+  row.
 
 ### 7.6a Shutdown — a deploy hands running work back
 
@@ -1333,6 +1347,8 @@ themselves:
 - **Public unicast addresses only — an allow-list.** Every other range has a name in `ipaddr.js`
   (loopback, private, link-local, carrier-grade NAT, multicast, and the IPv6 forms that carry an
   IPv4 address inside: mapped, NAT64, 6to4, Teredo), so none has to be remembered to be refused.
+  One has no name there — `::/96`, the deprecated IPv4-compatible form, which reads as unicast —
+  so an IPv6 address must also be in `2000::/3`, the block public addresses are given from.
 - **The address is checked inside the connection's own DNS lookup**, on the addresses it will
   connect to — every one of them, since a name answering one public and one private address
   leaves the choice to the connection. Checking the name first and connecting after would resolve
@@ -1343,14 +1359,15 @@ themselves:
   normalised `2130706433` and `0x7f.1` to `127.0.0.1`.
 - **Redirects are followed by hand, at most 3, and each is checked like the first URL** — a
   redirect to the metadata service is the classic way past a guard that looks only at the URL it
-  was given.
+  was given. A `Location` that is not a URL fails for good: it is the server's answer.
 - **One timeout for the whole download, a byte cap counted as the bytes arrive** — a declared
   length can be absent or a lie — and a content-type the caller names.
 
 Every failure says whether asking again could change it: a refused address, a 404, a 4xx other
 than 408 and 429, a host that does not exist or a certificate that does not verify are permanent;
-a timeout, a 5xx, a 408 or a 429 are not (§7.7). A message names what was refused, never what a
-host name resolved to: it reaches the URL's owner as the product's `image.error` (§6.3c), and a
+a timeout, a 5xx, a 408, a 429 or a host none of whose addresses answered are not (§7.7). A
+network failure is named by its code — `ECONNREFUSED`, not Node's message, which carries the
+address. A message names what was refused, never what a host name resolved to: it reaches the URL's owner as the product's `image.error` (§6.3c), and a
 resolved internal address would map the network for whoever asks. For the same reason a name that
 does not exist is answered exactly as one that resolves privately: told apart, the two would let a
 seller list which internal names exist, one URL at a time.
@@ -1797,7 +1814,7 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `JOB_MAX_ATTEMPTS` | int | ✓ | ✓ | Default ceiling |
 | `LOG_LEVEL` | enum | ✓ | ✓ | |
 | `CORS_ORIGINS` | csv | ✓ | — | The origins a browser may call from, over HTTP and the socket alike. Empty: none (§15.2) |
-| `TRUST_PROXY` | hops or csv? | ✓ | — | The proxy whose `X-Forwarded-For` names the client: a hop count, or its addresses (`loopback`, a subnet). Unset: none, and the address is the connection's. `true` is refused (§15.2) |
+| `TRUST_PROXY` | hops or csv? | ✓ | — | The proxy whose `X-Forwarded-For` names the client: a hop count, or its addresses (`loopback`, `linklocal`, `uniquelocal`, an address, `address/bits`). Unset or `false`: none, and the address is the connection's. `true` is refused, and so is an entry Express could not read, by name, before the API starts (§15.2) |
 | `RATE_LIMITS` | bool | ✓ | — | Default `true`. `false` only in the test tiers, which register every account from one address |
 | `API_KEYS_ENABLED` | bool | ✓ | — | Default `true`. `false` turns every API key off: none is made, none authenticates. Read at boot (§6.3f) |
 | `ARGONID_TIME_COST` / `ARGONID_MEMORY_COST` | int | ✓ | — | Defaults `2` and `19456` (KiB): OWASP's minimum for Argon2id. Every registration and login pays it, so raise them as far as the host's latency allows, never lower |
@@ -1850,7 +1867,7 @@ never the API's — and serves nothing when it is unset. Every series carries `r
 
 | Metric | From | What it is |
 |---|---|---|
-| `relay_job_attempt_duration_seconds{type, outcome}` | worker | A histogram of every claimed attempt, from its claim to its outcome. `outcome` is `succeeded`, `retrying`, `dead_lettered`, `cancelled`, `handed_back` (stopped for a shutdown, uncounted), `rate_limited` (refused by a busy service; the queue waits, uncounted), `superseded` (another attempt had taken the job over) or `unrecorded` (the outcome could not be written; the queue delivers the job again) |
+| `relay_job_attempt_duration_seconds{type, outcome}` | worker | A histogram of every claimed attempt, from its claim to its outcome. `outcome` is `succeeded`, `retrying`, `dead_lettered`, `cancelled`, `handed_back` (stopped for a shutdown, uncounted), `rate_limited` (refused by a busy service; the queue waits, uncounted the first 20 times a delivery), `superseded` (another attempt had taken the job over) or `unrecorded` (the outcome could not be written; the queue delivers the job again) |
 | `relay_queue_depth{queue,state}` | API | Unfinished jobs by queue and where they wait: `outbox` (committed, not yet queued), `waiting`, `prioritized`, `delayed`, `active`. Read when scraped |
 | `relay_dead_letters{type}` | API | Dead-lettered jobs nobody has re-driven, every type listed. Read when scraped |
 | `relay_http_request_duration_seconds{method, route, status}` | API | A histogram of every response, from the first middleware. `route` is the matched pattern (`/jobs/:id`), or `unmatched` for a `404` or a body the parser refused |
@@ -2326,7 +2343,9 @@ worker made of it (A28).
   "Running job".
 - **The id is the client's when it sends one** (`X-Request-Id`), so it can be quoted back. A job
   that failed for an internal reason shows its owner the id the worker logged the reason under
-  (§7.7).
+  (§7.7). Only one shaped like an id is kept — up to 128 letters, digits and `_.:-` — since it is
+  logged, stored on every job the request submits and shown to their owner; any other gets one of
+  ours, which the response's header carries.
 - `status` had been listed as a standard field and is not one: it changes during an attempt, so
   a field bound when the attempt starts would be wrong by its end, and each line says what
   happened.
@@ -2694,6 +2713,11 @@ made 13 MB of them. Now 5 000 products a store, and each size fitted inside a sq
 1.2 MB a product at worst: a full store holds about 6 GB, some $0.15 a month. A replaced URL's
 folder still goes a day after it falls idle (8.8).
 
+**Extended 2026-11-25** (review fixes, R.4). A slip is not spent by its first upload: until it
+expires, every `POST` of it stores the file again, each billed as a `PUT`. It lasted 5 minutes and
+lasts one now. S3 checks the time when an upload starts, not when it ends — measured: a 5-second
+slip whose body took 12 s to send was stored — so a slow 50 MB upload still finishes.
+
 **D16 — a replay counts against the rate limit.** The limiter runs before the handler, so it
 cannot tell a replay from a new submit without a database read in front of it — the read the
 limit exists to bound. Nothing is lost by counting it: a client refused `429` for a replay retries
@@ -2774,6 +2798,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-25 | §6.3a, §6.3d, §7.6, §7.9, §11, §12.1, §12.3, D32 — review fixes, R.4: the edges. `TRUST_PROXY=false` reads as unset, `TRUE` is refused like `true`, and an entry Express could not read is refused by name before the API starts — it used to pass and crash the boot. A client's `X-Request-Id` is kept only when it is up to 128 letters, digits and `_.:-`; it is stored on jobs and shown to their owner. An upload slip lasts 60 s, not 300: until it expires every `POST` of it stores the file again, and S3 checks the time when an upload starts, so a slow upload still finishes. The `expiresAt` of a slip and a download link is to the second, as S3 writes its own, so it is never later than S3's. The download guard allows IPv6 only in `2000::/3`, refusing `::/96`, which `ipaddr.js` calls unicast; a redirect to something that is not a URL fails for good; a host none of whose addresses answered is named by its error code, not an empty reason, and no network failure names an address. A busy service's hand-backs are free 20 times a delivery, then each counts as an attempt, and its owner is told the service was busy. The stranded-job sweep logs a row Postgres refuses to finish and goes on to the next; one such row stopped every sweep. |
 | 2026-11-25 | §4.7, §6.3b, §6.3c, §6.3d, §15.2, D32 — review fixes, R.3: images and storage. Each size is fitted inside a square, not bounded by width alone: a 1200 × 16 000 source made 13 MB a product in a folder that never expires, and now makes about 1.2 MB at worst. A store holds at most 5 000 products: an import writes a known sku always and a new one while there is room, counted under the account's lock, and reports a row past the limit as invalid, with its line, in the result and the error report. The bytes' format is checked as well as the header, so an SVG or TIFF under an image header is refused; `image/jpg`, `image/pjpeg` and `image/x-png` are accepted. A `FAILED` is never written over a `READY` for the same URL or text. `Product_imageError_only_on_failure` is written with `IS NOT DISTINCT FROM`, so it no longer passes on a NULL status. **New migration** `20261125110000_product_image_error_check`. |
 | 2026-11-25 | §6.2, §6.3, §6.3d, §6.3e, §11, §15.2, D32 — review fixes, R.2: one account's share of the shared queues. `ai.enrich` is capped at 10 unfinished per account, on submit and both re-drives; an account runs one pipeline at a time (`429 TOO_MANY_RUNNING_PIPELINES`); a pipeline's batches holding their place no longer fill their owner's caps, which refused the owner's own image submits and the re-drive of the pipeline's own failed batch. The fake model obeys `[llm:…]` only with `FAKE_LLM_DIRECTIVES` on, off by default: any account could pause the AI queue with a product name. |
 | 2026-11-25 | §4.9, §6.2, §6.3c, §6.3d, §6.3e — review fixes, R.1: a pipeline finishes with the right status and counts. An `image.process` or `ai.enrich` batch commits each product's conclusion with a tally in its checkpoint, so its result counts every attempt's work and a summary no longer reads 1 image for a batch that made 50 after one retry. A pipeline's `pipeline.finalize` cannot be cancelled (`409 JOB_NOT_CANCELLABLE`); a cancelled one left the pipeline `RUNNING` for good. The fan-out refuses an import asked to stop, and the import looks for a cancel before planning. `Pipeline.fannedOutAt`, stamped by the fan-out, decides `FAILED`: an import that failed after writing its batches no longer fails a pipeline that ran, and one re-driven after giving its place up no longer completes one that never fanned out. **New migration** `20261125100000_pipeline_fanned_out`. |
