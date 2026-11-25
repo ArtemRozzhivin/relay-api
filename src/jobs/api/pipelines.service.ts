@@ -5,6 +5,7 @@ import type { JobStatus } from '../../generated/prisma/enums.js';
 import {
   IdempotencyKeyReusedError,
   PipelineNotFoundError,
+  TooManyRunningPipelinesError,
   UploadNotFoundError,
 } from '../../common/errors/app-error.js';
 import { StorageService } from '../../storage/storage.service.js';
@@ -45,6 +46,8 @@ export class PipelinesService {
    * @throws TooManyUnfinishedJobsError (429) when the caller already has as many
    * unfinished imports as it may (D32). A replay is answered as one all the
    * same.
+   * @throws TooManyRunningPipelinesError (429) when another of the caller's
+   * pipelines is still running.
    */
   async start({ userId, idempotencyKey, correlationId, input }: StartArgs) {
     await this.checkUpload(userId, idempotencyKey, input.key);
@@ -76,6 +79,17 @@ export class PipelinesService {
         });
 
         await assertUnderCap(tx, userId, job.type);
+
+        // One at a time (D32): its batches count against no cap, so the
+        // pipeline as a whole is what is limited. Counted after the write, as
+        // the caps are, so the count includes this one.
+        const running = await tx.pipeline.count({
+          where: { userId, status: 'RUNNING' },
+        });
+
+        if (running > 1) {
+          throw new TooManyRunningPipelinesError();
+        }
 
         const outbox = await tx.outbox.create({
           data: outboxEntry(job, correlationId),

@@ -171,6 +171,32 @@ describe('pipelines over HTTP', () => {
     expect(await pipelinesOf(userId)).toBe(0);
   });
 
+  // Its batches count against no cap, so the run as a whole is what is
+  // limited (D32): one at a time.
+  it('runs one pipeline at a time for an account', async () => {
+    const { token, userId } = await register('one-at-a-time');
+    const key = await uploaded(token);
+    const idempotencyKey = randomUUID();
+    const first = await start(token, { key }, idempotencyKey).expect(202);
+
+    const refused = await start(token, { key }).expect(429);
+
+    expect(refused.body.error.code).toBe('TOO_MANY_RUNNING_PIPELINES');
+    // The place frees when the pipeline finishes, which nothing here knows.
+    expect(refused.headers['retry-after']).toBeUndefined();
+    expect(await pipelinesOf(userId)).toBe(1);
+
+    // A replay of the running one is still answered as one.
+    await start(token, { key }, idempotencyKey).expect(202);
+
+    await prisma.pipeline.update({
+      where: { id: first.body.data.id },
+      data: { status: 'COMPLETED', finishedAt: new Date() },
+    });
+
+    await start(token, { key }).expect(202);
+  });
+
   it('refuses a body with more than the key', async () => {
     const { token } = await register('strict');
     const key = await uploaded(token);

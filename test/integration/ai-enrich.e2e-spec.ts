@@ -90,6 +90,8 @@ describe('the ai.enrich handler', () => {
     );
 
   beforeAll(async () => {
+    // These cases make the fake fail through product names.
+    vi.stubEnv('FAKE_LLM_DIRECTIVES', 'true');
     moduleRef = await createTestModule({
       imports: [PrismaModule, ProductsModule, EnrichmentModule],
       providers: [AiEnrichJobHandler],
@@ -105,6 +107,7 @@ describe('the ai.enrich handler', () => {
   afterAll(async () => {
     await deleteUsers(prisma, users);
     await moduleRef?.close();
+    vi.unstubAllEnvs();
   });
 
   it('records a listed category and tags for each product, in one request', async () => {

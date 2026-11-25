@@ -235,7 +235,11 @@ export class RelayHarness {
   }
 
   startWorker(name = 'worker', env: NodeJS.ProcessEnv = {}) {
-    return this.spawnNode(name, 'dist/worker.js', env);
+    // The assertions about the model make it fail through product names.
+    return this.spawnNode(name, 'dist/worker.js', {
+      FAKE_LLM_DIRECTIVES: 'true',
+      ...env,
+    });
   }
 
   async stop() {

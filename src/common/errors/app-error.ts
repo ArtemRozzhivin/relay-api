@@ -230,6 +230,17 @@ export class TooManyUnfinishedJobsError extends AppError {
   }
 }
 
+// 429 like a cap on jobs, and for the same reason no Retry-After: the place
+// frees when the running pipeline finishes.
+export class TooManyRunningPipelinesError extends AppError {
+  readonly kind = 'LIMIT_REACHED' as const;
+  readonly code = 'TOO_MANY_RUNNING_PIPELINES';
+
+  constructor() {
+    super('One pipeline can run at a time; start the next when it finishes');
+  }
+}
+
 export class TooManyApiKeysError extends AppError {
   readonly kind = 'LIMIT_REACHED' as const;
   readonly code = 'TOO_MANY_API_KEYS';

@@ -37,6 +37,9 @@ export const sharedEnvSchema = z.object({
   // Unset, the process serves no metrics: a port is opened only where a
   // deployment asks for one.
   METRICS_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  // Whether the fake model obeys `[llm:…]` in product names (§6.3d). On only
+  // for the tests, like the RELAY_FAULT_ switches: never in production.
+  FAKE_LLM_DIRECTIVES: z.stringbool().default(false),
 });
 
 export const apiEnvSchema = sharedEnvSchema.extend({

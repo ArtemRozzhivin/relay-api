@@ -485,7 +485,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/auth/login` | — | `200` | Access + refresh pair |
 | `POST` | `/auth/refresh` | refresh token | `200` | Rotation: presented token revoked, new pair issued |
 | `POST` | `/auth/logout` | refresh token | `204` | Idempotent — revoking an already-revoked token is a no-op |
-| `POST` | `/jobs` | access | **`202`** / `422` / `429` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded; `429 TOO_MANY_UNFINISHED_JOBS` when the caller already has 3 `import.csv` or 50 `image.process` jobs queued or running — a replay is answered as one all the same (D32). See §6.3 |
+| `POST` | `/jobs` | access | **`202`** / `422` / `429` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded; `429 TOO_MANY_UNFINISHED_JOBS` when the caller already has 3 `import.csv`, 50 `image.process` or 10 `ai.enrich` jobs queued or running, a pipeline's batches still holding their place not counted — a replay is answered as one all the same (D32). See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
@@ -494,7 +494,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. Read a batch before sending it with `GET /jobs/dead-letters`. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409`. `409 JOB_NOT_CANCELLABLE` for a pipeline's `pipeline.finalize`, which is what finishes the pipeline (§6.3e) |
-| `POST` | `/pipelines` | access | **`202`** / `422` / `429` | An import that goes on to enrich and image the products it imported, then sums them up. `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`. The same `422`s and `429` as `POST /jobs` for an `import.csv`, a replay included. See §6.3e |
+| `POST` | `/pipelines` | access | **`202`** / `422` / `429` | An import that goes on to enrich and image the products it imported, then sums them up. `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`. The same `422`s and `429` as `POST /jobs` for an `import.csv`, a replay included; `429 TOO_MANY_RUNNING_PIPELINES` while another of the caller's pipelines is running (D32). See §6.3e |
 | `GET` | `/pipelines/:id` | access | `200` | Its status, how many of its jobs of each type are in each status, and the summary once finished. 404 for a pipeline you don't own. See §6.3e |
 | `POST` | `/api-keys` | session | **`201`** / `403` / `429` | `{ name, scopes }` → the key's view with `key`, the secret, which is in this response and nowhere else. `403 API_KEYS_DISABLED` while the operator has keys turned off; `429 TOO_MANY_API_KEYS` when the caller already has an unrevoked key. See §6.3f |
 | `GET` | `/api-keys` | session | `200` | The caller's keys, newest first, revoked ones included; never the secret or its hash |
@@ -546,8 +546,9 @@ that is not on the row, that stops being true and a stored-response table become
 `202`, not `200` or `201`: the work has been *accepted*, not *done*. The client polls
 `GET /jobs/:id` or listens on the socket.
 
-**Capped types.** An account can have 3 `import.csv` and 50 `image.process` jobs queued or
-running at once (D32, §15.2). One more is `429 TOO_MANY_UNFINISHED_JOBS`, with no `Retry-After`:
+**Capped types.** An account can have 3 `import.csv`, 50 `image.process` and 10 `ai.enrich`
+jobs queued or running at once (D32, §15.2), and one pipeline running. A pipeline's batches still
+holding their place in it are not counted (§6.3e). One more is `429 TOO_MANY_UNFINISHED_JOBS`, with no `Retry-After`:
 the place frees when one of the account's own jobs finishes, which `job.updated` reports.
 
 **Payload per type.** The union in §6.4 is the authority; unknown keys are a `400`.
@@ -785,7 +786,10 @@ asked no model. _Built in D.6._
 **The provider is an interface,** `LlmProvider`, and PD builds one implementation:
 `FakeLlmProvider`, deterministic, with no key and no cost. A real model fails rarely and costs
 money each time, so the fake is the only way to test those failures, and it produces each on
-demand, when a product's name holds a directive:
+demand, when a product's name holds a directive and `FAKE_LLM_DIRECTIVES` is on. It is off by
+default and never on in production, like the `RELAY_FAULT_` switches: any account writes product
+names, and `[llm:busy]` pauses the AI queue every account shares. Off, a name with a directive is
+answered like any other. The assertion harness turns it on for the workers it starts.
 
 | In the name | The fake |
 |---|---|
@@ -845,8 +849,13 @@ commits nothing is written that a cancel would leave behind; a cancel that arriv
 waits for its lock, and finds the batches written. The fan-out stamps `fannedOutAt`, once, even when no
 product needed a batch. The
 batches carry the pipeline's correlation id and reach their queues through the relay (§4.5).
-They count against no cap: the import that makes them does, and its file is at most 50 MB. A
-client's own `Idempotency-Key` may not begin with `pipeline:` (`400 IDEMPOTENCY_KEY_RESERVED`):
+While they hold their place they count against no cap, and take none of the account's places: a
+pipeline is limited as a whole instead. An account runs one at a time
+(`429 TOO_MANY_RUNNING_PIPELINES`), and its import counts against the import cap. Counting its
+batches would refuse the owner's own submits — and the re-drive of a failed batch of that same
+pipeline — until a large catalog drained. A batch re-driven after its first finish no longer holds
+a place, and counts like any job. A finalize that dead-letters leaves the pipeline running, and
+the account without a pipeline, until its owner re-drives it. A client's own `Idempotency-Key` may not begin with `pipeline:` (`400 IDEMPOTENCY_KEY_RESERVED`):
 sharing the server's prefix, it could take a batch's key before the fan-out writes it.
 
 A retry plans again, from the products as they are by then: a batch the first attempt wrote may
@@ -1763,6 +1772,7 @@ validators directly — no Joi). **Misconfiguration crashes startup, never a req
 | `RELAY_FAULT_AFTER_COMMIT` | bool | ✓ | — | Tests only (A6). Default `false` |
 | `RELAY_FAULT_SKIP_ABANDON` | bool | — | ✓ | Tests only (A5d). Default `false` |
 | `RELAY_FAULT_AFTER_FAN_OUT` | bool | — | ✓ | Tests only (A23): fails an import's first attempt right after its fan-out commits. Default `false` |
+| `FAKE_LLM_DIRECTIVES` | bool | ✓ | ✓ | Tests only: the fake model obeys `[llm:…]` in product names (§6.3d). Default `false`; never in production |
 | `JOB_MAX_ATTEMPTS` | int | ✓ | ✓ | Default ceiling |
 | `LOG_LEVEL` | enum | ✓ | ✓ | |
 | `CORS_ORIGINS` | csv | ✓ | — | The origins a browser may call from, over HTTP and the socket alike. Empty: none (§15.2) |
@@ -2227,9 +2237,14 @@ holds at once.
 |---|---|---|---|
 | `import.csv` queued or running | 3 | `429 TOO_MANY_UNFINISHED_JOBS` | Each holds one download of up to 50 MB, and a store imports one catalog at a time |
 | `image.process` queued or running | 50 batches | `429 TOO_MANY_UNFINISHED_JOBS` | 2 500 products in flight; a larger catalog sends its next batch as one finishes |
+| `ai.enrich` queued or running | 10 batches | `429 TOO_MANY_UNFINISHED_JOBS` | The AI queue runs 20 a minute for every account together, first come first served: ten is half a minute of it, so one account's backlog never holds the others' back for longer |
+| Pipelines running | 1 | `429 TOO_MANY_RUNNING_PIPELINES` | Its batches count against no cap while they hold their place, so the run as a whole is limited |
 | Upload slips | 20 in any 24 hours | `429 TOO_MANY_UPLOADS` | Room many times over for a store re-uploading after a mistake. With the 7-day lifecycle, one account holds at most about 8 GB |
 
-- **`MOCK` and `CHARGE` have no cap:** they do no S3 work, and the submit rate bounds them.
+- **`MOCK` and `CHARGE` have no cap:** they use neither the bucket nor the model, and the submit
+  rate bounds them.
+- **A pipeline's batch holding its place is not counted** (§6.3e): the pipeline is capped as a
+  whole. Re-driven after its first finish, it counts.
 - **Every way back to work is capped:** a submit, a re-drive, and a bulk re-drive — without the
   last, one call would bring a thousand dead imports back at once. A bulk re-drive brings back a
   capped type only as far as there is room, and the rest stay dead-lettered, in `remaining`. A
@@ -2642,6 +2657,14 @@ to 2, which is cents, and cost every dead import older than a day its re-drive. 
 account's imports make over a day. **Trigger** for a daily allowance of import attempts per
 account: the alarm fires. The alarm was set on 2026-11-19, at $5 a month.
 
+**Extended 2026-11-25** (review fixes, R.2). The review found one account could hold the shared
+queues: `ai.enrich` had no cap on any path, a pipeline's fan-out wrote every batch with none, and
+the import's place freed while its batches ran for days. Now 10 unfinished `ai.enrich` jobs and
+one running pipeline per account, and a pipeline's batches holding their place leave the caps
+alone. The queues stay first come, first served: one account's largest pipeline still holds the AI
+queue while it runs, and others wait behind it. Taking turns between accounts was weighed and left
+for later.
+
 **D16 — a replay counts against the rate limit.** The limiter runs before the handler, so it
 cannot tell a replay from a new submit without a database read in front of it — the read the
 limit exists to bound. Nothing is lost by counting it: a client refused `429` for a replay retries
@@ -2722,6 +2745,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-25 | §6.2, §6.3, §6.3d, §6.3e, §11, §15.2, D32 — review fixes, R.2: one account's share of the shared queues. `ai.enrich` is capped at 10 unfinished per account, on submit and both re-drives; an account runs one pipeline at a time (`429 TOO_MANY_RUNNING_PIPELINES`); a pipeline's batches holding their place no longer fill their owner's caps, which refused the owner's own image submits and the re-drive of the pipeline's own failed batch. The fake model obeys `[llm:…]` only with `FAKE_LLM_DIRECTIVES` on, off by default: any account could pause the AI queue with a product name. |
 | 2026-11-25 | §4.9, §6.2, §6.3c, §6.3d, §6.3e — review fixes, R.1: a pipeline finishes with the right status and counts. An `image.process` or `ai.enrich` batch commits each product's conclusion with a tally in its checkpoint, so its result counts every attempt's work and a summary no longer reads 1 image for a batch that made 50 after one retry. A pipeline's `pipeline.finalize` cannot be cancelled (`409 JOB_NOT_CANCELLABLE`); a cancelled one left the pipeline `RUNNING` for good. The fan-out refuses an import asked to stop, and the import looks for a cancel before planning. `Pipeline.fannedOutAt`, stamped by the fan-out, decides `FAILED`: an import that failed after writing its batches no longer fails a pipeline that ran, and one re-driven after giving its place up no longer completes one that never fanned out. **New migration** `20261125100000_pipeline_fanned_out`. |
 | 2026-11-24 | §6.2, §6.5, §10.2, §13.2 — the API reference, F.3, which closes PF. Swagger UI at `/docs` and the OpenAPI document at `/docs/openapi.json`, public. Requests documented from the Zod schemas the routes validate with; answers from strict Zod schemas of their own, which a test parses every public route's real answer with. `session` and `apiKey` bearer schemes, the second set by `@AllowApiKeys()` itself; the error envelope as every operation's `default`. The admin routes, `/health`, `/ready` and `GET /` left out. `@nestjs/swagger` 12.1 added. |
 | 2026-11-24 | §6.3f, §10.1, §10.2, §12.1, §14 — using an API key, F.2. `ApiKeyGuard`, beside `JwtAuthGuard`, lets in `Bearer relay_…` on the jobs, pipelines, uploads and products controllers (`@AllowApiKeys()`), `read` for a `GET` and `write` for the rest, as the key's owner; `403` on any other route. Looked up by hash on every request; `lastUsedAt` written at most once a minute, not awaited. The request log line names the key's id. A25 and A26 registered. |

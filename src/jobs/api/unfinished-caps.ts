@@ -5,8 +5,8 @@ import type { JobType } from '../jobs.schema.js';
 
 /**
  * How many jobs of a type one account can have queued or running at once
- * (D32). Only the types whose work reads or writes the bucket; the others are
- * bounded by the submit rate alone.
+ * (D32): the types whose work costs money, or holds a queue every account
+ * shares. `MOCK` and `CHARGE` are bounded by the submit rate alone.
  */
 export const UNFINISHED_CAPS: ReadonlyMap<string, number> = new Map<
   JobType,
@@ -18,9 +18,23 @@ export const UNFINISHED_CAPS: ReadonlyMap<string, number> = new Map<
   // 2 500 products in flight; a larger catalog sends its next batch as one
   // finishes.
   ['image.process', 50],
+  // The AI queue runs 20 a minute for every account together, first come
+  // first served: ten is half a minute of it, so one account's backlog never
+  // holds the others' work back for longer than that.
+  ['ai.enrich', 10],
 ]);
 
 const UNFINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
+
+// The jobs a cap counts. Not a pipeline's batch still holding its place: a
+// pipeline is limited as a whole, one running per account, and counting its
+// batches would refuse its owner's own submits — and the re-drive of a failed
+// batch of that same pipeline — until they drained (§6.3e). Its import counts
+// like any import, and a batch re-driven after its first finish like any job.
+const COUNTED: Prisma.JobWhereInput = {
+  status: { in: UNFINISHED },
+  OR: [{ pendingInPipeline: false }, { type: 'import.csv' }],
+};
 
 /** Whether a job of this type counts against a cap, and so needs `lockAccount` before it is written. */
 export const isCapped = (type: string) => UNFINISHED_CAPS.has(type);
@@ -45,7 +59,7 @@ export const assertUnderCap = async (
   }
 
   const unfinished = await tx.job.count({
-    where: { userId, type, status: { in: UNFINISHED } },
+    where: { userId, type, ...COUNTED },
   });
 
   if (unfinished > cap) {
@@ -65,8 +79,8 @@ export const roomLeft = async (
     by: ['type'],
     where: {
       userId,
-      status: { in: UNFINISHED },
       type: { in: [...UNFINISHED_CAPS.keys()] },
+      ...COUNTED,
     },
     _count: { _all: true },
   });

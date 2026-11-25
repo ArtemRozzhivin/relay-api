@@ -11,12 +11,13 @@ import type { Prisma } from '../../src/generated/prisma/client.js';
 import type { JobStatus } from '../../src/generated/prisma/enums.js';
 import { postUploadForm } from '../support/upload-form.js';
 import { registerAndLogin, startApp } from '../support/http.js';
-import { deleteUsers } from '../support/db.js';
+import { deleteUsers, seedPipeline } from '../support/db.js';
 
 // The documented numbers (§15.2), not the constants that hold them: a client
 // is told these, so changing one is changing the contract.
 const IMPORTS = 3;
 const IMAGE_BATCHES = 50;
+const AI_BATCHES = 10;
 const UPLOAD_SLIPS_PER_DAY = 20;
 
 // Caps are filled with seeded rows wherever the test needs them to stay full:
@@ -55,7 +56,15 @@ describe('per-account caps', () => {
     {
       status = 'QUEUED',
       finishedAt,
-    }: { status?: JobStatus; finishedAt?: Date } = {},
+      pipelineId,
+      holding = pipelineId !== undefined,
+    }: {
+      status?: JobStatus;
+      finishedAt?: Date;
+      /** Batches of this pipeline, holding their place in it unless told not. */
+      pipelineId?: string;
+      holding?: boolean;
+    } = {},
   ) =>
     prisma.job.createManyAndReturn({
       data: Array.from({ length: count }, () => ({
@@ -63,6 +72,8 @@ describe('per-account caps', () => {
         type,
         payload: {},
         status,
+        pipelineId,
+        pendingInPipeline: holding,
         // A job has a finishedAt exactly when it is finished (a CHECK).
         finishedAt:
           finishedAt ??
@@ -287,6 +298,51 @@ describe('per-account caps', () => {
       );
     });
 
+    it(`refuses an enrichment past ${AI_BATCHES} unfinished`, async () => {
+      const { token, userId } = await register('enrich');
+      await seed(userId, 'ai.enrich', AI_BATCHES);
+
+      expectCapped(
+        await submit(token, { type: 'ai.enrich', payload: { skus: ['A-1'] } }),
+      );
+    });
+
+    // A pipeline is limited as a whole (§6.3e). Counting its batches would
+    // refuse the owner's own work until a large catalog drained.
+    it("counts no pipeline's batch still holding its place", async () => {
+      const { token, userId } = await register('pipeline-held');
+      const { id: pipelineId } = await seedPipeline(prisma, { userId });
+      await seed(userId, 'image.process', IMAGE_BATCHES + 10, { pipelineId });
+      await seed(userId, 'ai.enrich', AI_BATCHES + 10, { pipelineId });
+
+      await submit(token, {
+        type: 'image.process',
+        payload: { skus: ['A-1'] },
+      }).expect(202);
+      await submit(token, {
+        type: 'ai.enrich',
+        payload: { skus: ['A-1'] },
+      }).expect(202);
+    });
+
+    // Its first finish gave its place up: from then on it is the owner's to
+    // re-drive, and counts like any job.
+    it("counts a pipeline's batch re-driven after its first finish", async () => {
+      const { token, userId } = await register('pipeline-redriven');
+      const { id: pipelineId } = await seedPipeline(prisma, { userId });
+      await seed(userId, 'image.process', IMAGE_BATCHES, {
+        pipelineId,
+        holding: false,
+      });
+
+      expectCapped(
+        await submit(token, {
+          type: 'image.process',
+          payload: { skus: ['A-1'] },
+        }),
+      );
+    });
+
     it('waits for a request taking the last place, then refuses', async () => {
       const { token, userId } = await register('race');
       await seed(userId, 'image.process', IMAGE_BATCHES - 1);
@@ -325,6 +381,34 @@ describe('per-account caps', () => {
       await redrive(first!.id).expect(202);
       expectCapped(await redrive(second!.id));
       expect(await statusOf(second!.id)).toBe('DEAD_LETTERED');
+    });
+
+    // A22's re-drive, with the rest of its pipeline still queued: the review
+    // found it refused while 50 of the pipeline's image batches waited.
+    it("re-drives a pipeline's failed batch while its siblings hold their places", async () => {
+      const { token, userId } = await register('redrive-pipeline');
+      const { id: pipelineId } = await seedPipeline(prisma, { userId });
+      await seed(userId, 'image.process', IMAGE_BATCHES + 10, { pipelineId });
+      const [one, other] = await seed(userId, 'image.process', 2, {
+        status: 'DEAD_LETTERED',
+        finishedAt: died(5),
+        pipelineId,
+        holding: false,
+      });
+
+      await request(server)
+        .post(`/jobs/${one!.id}/retry`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(202);
+
+      const { body } = await request(server)
+        .post('/jobs/retry')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ type: 'image.process', errorCode: 'ATTEMPTS_EXHAUSTED' })
+        .expect(202);
+
+      expect(body.data).toEqual({ redriven: 1, remaining: 0 });
+      expect(await statusOf(other!.id)).toBe('QUEUED');
     });
 
     it('brings back in bulk only as many as there is room for', async () => {

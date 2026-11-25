@@ -40,8 +40,13 @@ A success is \`{ success: true, data, requestId }\`; a failure is
 \`{ success: false, error: { code, message }, requestId }\`, \`error.code\` saying which. Quote the
 \`requestId\` — also in the \`X-Request-Id\` header — when asking about a request.
 
-Too many requests is \`429\` with a \`Retry-After\` in seconds. Lists are newest first and paged by
-cursor: pass the \`nextCursor\` a page returns as \`?cursor=\`, until it is \`null\`.
+Too many requests is \`429\` with a \`Retry-After\` in seconds. Too much unfinished work is \`429\`
+too, without one: an account holds at most 3 imports, 50 image batches and 10 AI batches queued
+or running, and runs one pipeline at a time. A place frees when one of them finishes; a
+pipeline's own batches take none.
+
+Lists are newest first and paged by cursor: pass the \`nextCursor\` a page returns as
+\`?cursor=\`, until it is \`null\`.
 `.trim();
 
 /**
