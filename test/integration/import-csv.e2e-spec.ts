@@ -612,6 +612,20 @@ describe('the import.csv handler', () => {
       expect(skus.at(-1)).toBe('SKU-1199');
     });
 
+    // A file of one partial batch: the loop never reaches a boundary to look
+    // for the request, so only the look before the fan-out sees it.
+    it('fans out nothing when asked to stop during its last batch', async () => {
+      const userId = await store();
+      const key = await upload(userId, rowsOf(300));
+      const { result, fannedOut } = run(userId, key, {
+        pipelineId: PIPELINE,
+        stopAfterChecks: 0,
+      });
+
+      await expect(result).rejects.toBeInstanceOf(JobCancelledError);
+      expect(fannedOut).toEqual([]);
+    });
+
     it('fans out nothing when it belongs to no pipeline', async () => {
       const userId = await store();
       const key = await upload(userId, rowsOf(3));

@@ -869,7 +869,8 @@ partial failure as a first-class outcome.
   children would bypass the outbox. Minting the key server-side also means
   `UNIQUE (userId, idempotencyKey)` makes the fan-out itself idempotent, for free._
   ```
-- [x] **E.3 · The parent is enqueued by the transaction that takes** `pendingChildren` **to zero.**
+- [x] **E.3 · The parent is written, with its outbox row, by the transaction that takes**
+  `pendingChildren` **to zero.**
   Every finish of a pipeline's job leaves its place in its own transaction; the one that reaches
   zero writes `pipeline.finalize`, which sets the status and summary once. A24 stops both
   processes around the last batch's commit and proves the relay still delivers the parent.

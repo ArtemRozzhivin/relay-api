@@ -216,6 +216,13 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       return result;
     }
 
+    // Before the plan reads the file again: a cancel during the last batch
+    // came after the loop's last look. The fan-out refuses one that arrives
+    // while the plan is made.
+    if (await context.shouldStop()) {
+      throw new JobCancelledError();
+    }
+
     // Last, after the report: a pipeline's batches are written once the
     // import has nothing left that could fail it (§6.3e). Not counted in the
     // result: a retry plans from the products as they are by then, and its

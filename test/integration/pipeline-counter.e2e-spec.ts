@@ -226,6 +226,22 @@ describe("a pipeline's counter", () => {
     expect(await pipelineOf(pipelineId)).toMatchObject({ pendingChildren: 0 });
   });
 
+  // Nothing writes a second finalize, so a cancelled one would leave its
+  // pipeline RUNNING for good.
+  it("refuses a cancel of the pipeline's finalize job", async () => {
+    const { pipelineId, jobs } = await waitingOn(1);
+
+    await transitions.succeed(jobs[0]!.id, 1, {});
+
+    const [finalize] = await finalizeJobsOf(pipelineId);
+
+    expect(await transitions.requestCancel(finalize!.id)).toBeNull();
+    expect(await transitions.cancelQueued(finalize!.id)).toBeNull();
+    expect(
+      await prisma.job.findUniqueOrThrow({ where: { id: finalize!.id } }),
+    ).toMatchObject({ status: 'QUEUED', cancelRequested: false });
+  });
+
   it('finishes a job outside any pipeline as before', async () => {
     const userId = await createThrowawayUser(prisma, 'counter');
 

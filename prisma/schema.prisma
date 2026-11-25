@@ -136,10 +136,14 @@ model Pipeline {
   correlationId   String
   status          PipelineStatus @default(RUNNING)
   /// Its jobs not yet finished for the first time, the import included; the
-  /// transaction that takes it to 0 enqueues `pipeline.finalize` (D24). **DB** `CHECK`
+  /// transaction that takes it to 0 writes `pipeline.finalize` and its outbox row (D24).
+  /// **DB** `CHECK`
   pendingChildren Int            @default(1)
   /// Its jobs that did not succeed the first time they finished. **DB** `CHECK`
   failedChildren  Int            @default(0)
+  /// When the import's batches were written, in the transaction that wrote them; never
+  /// set on a `FAILED` pipeline (§6.3e). **DB** `CHECK`
+  fannedOutAt     DateTime?      @db.Timestamptz(3)
   summary         Json?
   createdAt       DateTime       @default(now()) @db.Timestamptz(3)
   /// Set exactly when the status is final. **DB** `CHECK`

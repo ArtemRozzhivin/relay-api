@@ -7,6 +7,7 @@ import sharp from 'sharp';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
+import type { Prisma } from '../../src/generated/prisma/client.js';
 import { StorageModule } from '../../src/storage/storage.module.js';
 import { StorageService } from '../../src/storage/storage.service.js';
 import {
@@ -85,7 +86,7 @@ describe('the image.process handler', () => {
     skus: string[],
     options: Parameters<typeof recordingContext>[0] = {},
   ) => {
-    const recorded = recordingContext({ userId, ...options });
+    const recorded = recordingContext({ userId, client: prisma, ...options });
 
     return { ...recorded, result: handler.run(recorded.context, { skus }) };
   };
@@ -508,10 +509,14 @@ describe('the image.process handler', () => {
 
       answers.delete(down);
 
-      expect(await run(userId, ['A-DOWN', 'B-UP']).result).toMatchObject({
-        processed: 1,
-        alreadyReady: 1,
-      });
+      // The retry, from where the first attempt got to: it makes only the one
+      // left, and counts both — B-UP is this job's work, not someone else's.
+      expect(
+        await run(userId, ['A-DOWN', 'B-UP'], {
+          attempt: 2,
+          checkpoint: first.checkpoints.at(-1) as Prisma.JsonValue,
+        }).result,
+      ).toMatchObject({ processed: 2, alreadyReady: 0 });
       expect(hits.get(up)).toBe(1);
     });
 

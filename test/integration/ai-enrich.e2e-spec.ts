@@ -11,6 +11,7 @@ import {
 import type { TestingModule } from '@nestjs/testing';
 import { PrismaModule } from '../../src/prisma/prisma.module.js';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
+import type { Prisma } from '../../src/generated/prisma/client.js';
 import { ProductsModule } from '../../src/products/products.module.js';
 import { ProductsService } from '../../src/products/products.service.js';
 import { EnrichmentModule } from '../../src/enrichment/enrichment.module.js';
@@ -60,7 +61,7 @@ describe('the ai.enrich handler', () => {
   };
 
   const run = (userId: string, skus: string[]) =>
-    handler.run(recordingContext({ userId }).context, { skus });
+    handler.run(recordingContext({ userId, client: prisma }).context, { skus });
 
   const stored = async (userId: string) =>
     Object.fromEntries(
@@ -325,8 +326,10 @@ describe('the ai.enrich handler', () => {
       .spyOn(llm, 'enrich')
       .mockImplementationOnce(real)
       .mockRejectedValueOnce(new LlmRateLimitError(1000));
+    const skus = ['MUG', 'GADGET'];
+    const first = recordingContext({ userId, client: prisma });
 
-    await expect(run(userId, ['MUG', 'GADGET'])).rejects.toBeInstanceOf(
+    await expect(handler.run(first.context, { skus })).rejects.toBeInstanceOf(
       JobRateLimitedError,
     );
     expect(await stored(userId)).toMatchObject({
@@ -336,9 +339,18 @@ describe('the ai.enrich handler', () => {
 
     enrich.mockClear();
 
-    expect(await run(userId, ['MUG', 'GADGET'])).toMatchObject({
+    // The run after the hand-back, from where the first got to: it counts MUG
+    // as its own, not as found ready.
+    const again = recordingContext({
+      userId,
+      client: prisma,
+      checkpoint: first.checkpoints.at(-1) as Prisma.JsonValue,
+    });
+
+    expect(await handler.run(again.context, { skus })).toMatchObject({
+      enriched: 1,
       failed: 1,
-      alreadyReady: 1,
+      alreadyReady: 0,
     });
     expect(asked(enrich)).toEqual([['GADGET'], ['GADGET']]);
   });
@@ -347,7 +359,7 @@ describe('the ai.enrich handler', () => {
   it('records what every reply used, the corrective one included', async () => {
     const userId = await store(['MUG', 'Mug [llm:malformed-once]']);
     const enrich = vi.spyOn(llm, 'enrich');
-    const { context, usages } = recordingContext({ userId });
+    const { context, usages } = recordingContext({ userId, client: prisma });
 
     await handler.run(context, { skus: ['MUG'] });
 
@@ -375,7 +387,7 @@ describe('the ai.enrich handler', () => {
   // so the attempt fails and the job's retries are what wait (A22).
   it('fails the attempt when the model is down, and writes nothing', async () => {
     const userId = await store(['LAMP', 'Lamp [llm:down]'], ['SOFA', 'Sofa']);
-    const { context, usages } = recordingContext({ userId });
+    const { context, usages } = recordingContext({ userId, client: prisma });
 
     const failed = await handler
       .run(context, { skus: ['LAMP', 'SOFA'] })
@@ -394,7 +406,7 @@ describe('the ai.enrich handler', () => {
   it('records nothing for a request the model refused as busy', async () => {
     // Its own product: the fake refuses each busy product once a process.
     const userId = await store(['STOOL', 'Stool [llm:busy]']);
-    const { context, usages } = recordingContext({ userId });
+    const { context, usages } = recordingContext({ userId, client: prisma });
 
     await expect(handler.run(context, { skus: ['STOOL'] })).rejects.toThrow(
       JobRateLimitedError,

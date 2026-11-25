@@ -159,11 +159,13 @@ export class PipelinesService {
   // each status, which is how it follows a run and finds a failed batch. The
   // fingerprint and the counters are not part of it: the counters count first
   // outcomes, which a re-drive leaves behind, and would read as a contradiction
-  // of the statuses beside them.
+  // of the statuses beside them. Nor is the fan-out's moment, which the status
+  // already says all a client needs of.
   private async describe({
     requestHash: _requestHash,
     pendingChildren: _pendingChildren,
     failedChildren: _failedChildren,
+    fannedOutAt: _fannedOutAt,
     ...pipeline
   }: Pipeline) {
     const [importJob, counted] = await Promise.all([

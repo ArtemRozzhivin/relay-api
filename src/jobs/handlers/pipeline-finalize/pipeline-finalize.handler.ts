@@ -44,7 +44,7 @@ export class PipelineFinalizeJobHandler extends JobHandler<
     const importJob = jobs.find((job) => job.idempotencyKey === importKey);
 
     const status = finalStatus(
-      importJob?.status === 'SUCCEEDED',
+      pipeline.fannedOutAt !== null,
       pipeline.failedChildren,
     );
     const summary = summarize(importJob, jobs);

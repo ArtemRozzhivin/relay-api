@@ -5,6 +5,7 @@ import {
   ErrorReportNotFoundError,
   IdempotencyKeyReusedError,
   JobAlreadyFinishedError,
+  JobNotCancellableError,
   JobNotDeadLetteredError,
   JobNotFoundError,
   UploadNotFoundError,
@@ -385,9 +386,16 @@ export class JobsService {
    * @throws JobAlreadyFinishedError when it had already succeeded or been
    * dead-lettered. The request changed nothing, and an "accepted" would make
    * the caller read the body to discover its cancel had no effect.
+   * @throws JobNotCancellableError for a pipeline's `pipeline.finalize`.
    */
   async cancel(userId: string, jobId: string) {
     const existing = await this.findOne(userId, jobId);
+
+    // Asked before the flag, which would be refused for it too, so the caller
+    // learns why rather than reading "already finished" about a queued job.
+    if (existing.type === 'pipeline.finalize') {
+      throw new JobNotCancellableError();
+    }
 
     const flagged = await this.transitions.requestCancel(existing.id);
 

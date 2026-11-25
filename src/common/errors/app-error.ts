@@ -203,6 +203,19 @@ export class JobAlreadyFinishedError extends AppError {
   }
 }
 
+// A conflict with the job's role, not its state: a pipeline is finished by its
+// one summary job, and nothing would ever write a second.
+export class JobNotCancellableError extends AppError {
+  readonly kind = 'CONFLICT' as const;
+  readonly code = 'JOB_NOT_CANCELLABLE';
+
+  constructor() {
+    super(
+      "A pipeline's summary job finishes the pipeline; it cannot be cancelled",
+    );
+  }
+}
+
 // 429, as a rate limit is: nothing is wrong with the request, and the same one
 // succeeds later. But no Retry-After — the place frees when one of the
 // account's jobs finishes, and only the jobs know when that is.

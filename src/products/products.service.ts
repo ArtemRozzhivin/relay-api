@@ -98,10 +98,24 @@ export class ProductsService {
    * product's `imageUrl`. An import that replaced the URL meanwhile wins: this
    * result describes an image the product no longer has.
    *
+   * @param client the transaction the job's tally is written in, so the
+   * product and its count commit together.
    * @returns whether it was recorded.
    */
-  recordImageReady(userId: string, productId: string, sourceUrl: string) {
-    return this.recordImage(userId, productId, sourceUrl, 'READY', null);
+  recordImageReady(
+    userId: string,
+    productId: string,
+    sourceUrl: string,
+    client: Prisma.TransactionClient = this.prisma,
+  ) {
+    return this.recordImage(
+      client,
+      userId,
+      productId,
+      sourceUrl,
+      'READY',
+      null,
+    );
   }
 
   /**
@@ -116,8 +130,16 @@ export class ProductsService {
     productId: string,
     sourceUrl: string,
     error: string,
+    client: Prisma.TransactionClient = this.prisma,
   ) {
-    return this.recordImage(userId, productId, sourceUrl, 'FAILED', error);
+    return this.recordImage(
+      client,
+      userId,
+      productId,
+      sourceUrl,
+      'FAILED',
+      error,
+    );
   }
 
   /**
@@ -166,14 +188,17 @@ export class ProductsService {
    * and description they were made from. An import that changed either
    * meanwhile wins: the answer is about text the product no longer has.
    *
+   * @param client the transaction the job's tally is written in, so the
+   * product and its count commit together.
    * @returns whether it was recorded.
    */
   recordEnrichmentReady(
     userId: string,
     product: EnrichedFrom,
     { category, tags }: Enrichment,
+    client: Prisma.TransactionClient = this.prisma,
   ) {
-    return this.recordEnrichment(userId, product, {
+    return this.recordEnrichment(client, userId, product, {
       enrichmentStatus: 'READY',
       enrichmentError: null,
       category,
@@ -189,8 +214,13 @@ export class ProductsService {
    *
    * @returns whether it was recorded.
    */
-  recordEnrichmentFailed(userId: string, product: EnrichedFrom, error: string) {
-    return this.recordEnrichment(userId, product, {
+  recordEnrichmentFailed(
+    userId: string,
+    product: EnrichedFrom,
+    error: string,
+    client: Prisma.TransactionClient = this.prisma,
+  ) {
+    return this.recordEnrichment(client, userId, product, {
       enrichmentStatus: 'FAILED',
       enrichmentError: error,
       category: null,
@@ -199,11 +229,12 @@ export class ProductsService {
   }
 
   private async recordEnrichment(
+    client: Prisma.TransactionClient,
     userId: string,
     { id, name, description }: EnrichedFrom,
     data: Prisma.ProductUpdateManyMutationInput,
   ) {
-    const { count } = await this.prisma.product.updateMany({
+    const { count } = await client.product.updateMany({
       where: { id, userId, name, description },
       data: {
         ...data,
@@ -215,13 +246,14 @@ export class ProductsService {
   }
 
   private async recordImage(
+    client: Prisma.TransactionClient,
     userId: string,
     productId: string,
     sourceUrl: string,
     status: 'READY' | 'FAILED',
     error: string | null,
   ) {
-    const { count } = await this.prisma.product.updateMany({
+    const { count } = await client.product.updateMany({
       where: { id: productId, userId, imageUrl: sourceUrl },
       data: {
         imageStatus: status,

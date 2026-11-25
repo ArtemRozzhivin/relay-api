@@ -17,6 +17,7 @@ import { ProductsService } from '../../../products/products.service.js';
 import { renderSizes } from '../../../images/image-variants.js';
 import { RetryableJobError } from '../../../common/errors/app-error.js';
 import { hasImageForCurrentUrl } from '../../../products/product-state.js';
+import { ProductTally } from '../product-tally.js';
 
 // What a seller uploads and sharp decodes. Not SVG: it is a document that can
 // refer to other files, and rendering one runs a parser on the seller's input.
@@ -74,16 +75,17 @@ export class ImageProcessJobHandler extends JobHandler<
         ? [{ id: product.id, imageUrl: product.imageUrl }]
         : [],
     );
+    const tally = new ProductTally(context.checkpoint, [
+      'processed',
+      'failed',
+    ] as const);
 
-    let processed = 0;
-    let failed = 0;
-    let superseded = 0;
+    let handled = 0;
     let retrying = 0;
     let firstRetryReason = '';
 
     for (const product of todo) {
       const made = await this.sizesOf(product.imageUrl);
-      let recorded: boolean | null = null;
 
       if ('sizes' in made) {
         for (const size of made.sizes) {
@@ -102,24 +104,30 @@ export class ImageProcessJobHandler extends JobHandler<
         // Written to S3 first and recorded second: a crash in between leaves
         // files nothing points at yet, which the next run overwrites with the
         // same bytes — never a row pointing at files that are not there.
-        recorded = await this.products.recordImageReady(
-          context.userId,
-          product.id,
-          product.imageUrl,
+        await tally.conclude(context, product.id, 'processed', (tx) =>
+          this.products.recordImageReady(
+            context.userId,
+            product.id,
+            product.imageUrl,
+            tx,
+          ),
         );
-        processed += recorded ? 1 : 0;
       } else if (made.permanent || context.lastAttempt) {
-        recorded = await this.products.recordImageFailed(
-          context.userId,
-          product.id,
-          product.imageUrl,
-          // One that might pass later is recorded as it stands when no retry
-          // is coming; left PENDING, nothing would ever finish it.
-          made.permanent
-            ? made.reason
-            : `Gave up after ${context.attempt} ${context.attempt === 1 ? 'attempt' : 'attempts'}: ${made.reason}`,
+        // One that might pass later is recorded as it stands when no retry is
+        // coming; left PENDING, nothing would ever finish it.
+        const reason = made.permanent
+          ? made.reason
+          : `Gave up after ${context.attempt} ${context.attempt === 1 ? 'attempt' : 'attempts'}: ${made.reason}`;
+
+        await tally.conclude(context, product.id, 'failed', (tx) =>
+          this.products.recordImageFailed(
+            context.userId,
+            product.id,
+            product.imageUrl,
+            reason,
+            tx,
+          ),
         );
-        failed += recorded ? 1 : 0;
       } else {
         // Left PENDING and passed over, not thrown: one slow host would
         // otherwise hold back every product after it, on every attempt.
@@ -127,12 +135,8 @@ export class ImageProcessJobHandler extends JobHandler<
         firstRetryReason ||= made.reason;
       }
 
-      superseded += recorded === false ? 1 : 0;
-
-      void context.reportProgress({
-        processed: processed + failed + superseded + retrying,
-        total: todo.length,
-      });
+      handled += 1;
+      void context.reportProgress({ processed: handled, total: todo.length });
 
       // Between products, never inside one: a stopped batch has recorded
       // whole images only.
@@ -153,12 +157,19 @@ export class ImageProcessJobHandler extends JobHandler<
 
     return {
       requested: requested.length,
-      processed,
-      failed,
+      // Across this job's attempts: what an earlier one made, this one skipped.
+      processed: tally.count('processed'),
+      failed: tally.count('failed'),
       // Its imageUrl changed while this job worked on the old one; the newer
       // URL is the next run's to process.
-      superseded,
-      alreadyReady: found.length - todo.length - countWithoutImage(found),
+      superseded: tally.count('superseded'),
+      // Ready before this job got to it — not by any attempt of its own.
+      alreadyReady: found.filter(
+        (product) =>
+          product.imageUrl !== null &&
+          hasImageForCurrentUrl(product) &&
+          !tally.has(product.id),
+      ).length,
       withoutImage: countWithoutImage(found),
       notFound: requested.filter((sku) => !foundSkus.has(sku)),
     };

@@ -358,8 +358,9 @@ what is about all of them.
 | `requestHash` | `text` | SHA-256 of the request body, so a reused key with a different body is refused (D28). Internal — never in a response |
 | `correlationId` | `text` | The creating request's. Every job of the pipeline carries it, so one id finds the whole run in the logs of both processes (§12.1) |
 | `status` | `PipelineStatus` enum | `RUNNING`, then once `COMPLETED`, `COMPLETED_WITH_ERRORS` or `FAILED`, written by `pipeline.finalize` |
-| `pendingChildren` | `int` | Default `1`, for the import. How many of its jobs have not yet finished for the first time; the transaction that takes it to `0` enqueues `pipeline.finalize` (D24). Internal. **DB** `CHECK (pendingChildren >= 0)` |
+| `pendingChildren` | `int` | Default `1`, for the import. How many of its jobs have not yet finished for the first time; the transaction that takes it to `0` writes `pipeline.finalize` and its outbox row, which the relay publishes (D24). Internal. **DB** `CHECK (pendingChildren >= 0)` |
 | `failedChildren` | `int` | Default `0`. How many of its jobs did not succeed the first time they finished. Internal. **DB** `CHECK (failedChildren >= 0)` |
+| `fannedOutAt` | `timestamptz(3)?` | When the import's batches were written, by the transaction that wrote them (§6.3e). Internal. **DB** `CHECK (status <> 'FAILED' OR fannedOutAt IS NULL)` |
 | `summary` | `jsonb?` | Written with the final status |
 | `createdAt` | `timestamptz(3)` | |
 | `finishedAt` | `timestamptz(3)?` | **DB** `CHECK ((status = 'RUNNING') = (finishedAt IS NULL))`, as on `Job` |
@@ -492,7 +493,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `GET` | `/products` | access | `200` | The caller's catalog in `sku` order, paged like `/jobs`: `?limit=`, `?cursor=` → `{ items, nextCursor }` (D14). Each product carries `image` (§6.3c) and `enrichment` (§6.3d) |
 | `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. Read a batch before sending it with `GET /jobs/dead-letters`. See D11 |
-| `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409` |
+| `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409`. `409 JOB_NOT_CANCELLABLE` for a pipeline's `pipeline.finalize`, which is what finishes the pipeline (§6.3e) |
 | `POST` | `/pipelines` | access | **`202`** / `422` / `429` | An import that goes on to enrich and image the products it imported, then sums them up. `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`. The same `422`s and `429` as `POST /jobs` for an `import.csv`, a replay included. See §6.3e |
 | `GET` | `/pipelines/:id` | access | `200` | Its status, how many of its jobs of each type are in each status, and the summary once finished. 404 for a pipeline you don't own. See §6.3e |
 | `POST` | `/api-keys` | session | **`201`** / `403` / `429` | `{ name, scopes }` → the key's view with `key`, the secret, which is in this response and nowhere else. `403 API_KEYS_DISABLED` while the operator has keys turned off; `429 TOO_MANY_API_KEYS` when the caller already has an unrevoked key. See §6.3f |
@@ -720,7 +721,11 @@ fixed the file behind the same URL, and naming the sku again is how they ask.
   "withoutImage": 0, "notFound": ["X-9"] }
 ```
 
-`superseded` counts products whose URL changed while the job worked on the old one. In
+The counts are the job's, over all its attempts. A retry, a hand-back or a re-drive skips the
+products an earlier attempt made, and still counts them: each product's conclusion is committed
+with a tally in the job's checkpoint, in one transaction. `alreadyReady` counts only those ready
+before the job got to them. `superseded` counts products whose URL changed while the job worked on
+the old one. In
 `GET /products`, each product's `image` is `null` without an `imageUrl`, `{ "status": "PENDING" }`
 until its current URL is processed, `{ "status": "READY", "thumb", "medium", "large" }` with links
 signed for an hour on each read, or `{ "status": "FAILED", "error" }`.
@@ -807,6 +812,9 @@ has now — never enriched, or changed since — then `{ "status": "READY", "cat
 { "requested": 4, "enriched": 1, "failed": 1, "superseded": 0, "alreadyReady": 1, "notFound": ["X-9"] }
 ```
 
+As for `image.process`, the counts are the job's over all its attempts: a 429 on the corrective
+request runs the job again, and that run skips, and still counts, what the first reply answered.
+
 ### 6.3e Pipelines — an import that enriches and images what it imported (PE)
 
 `POST /pipelines` takes `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`.
@@ -829,8 +837,13 @@ server and deterministic — `pipeline:<id>:enrich:<n>`, `pipeline:<id>:images:<
 import that runs again after its fan-out committed, because its worker died before its success
 was recorded, writes nothing twice: `UNIQUE (userId, idempotencyKey)` refuses each batch it
 already made (A23). One transaction, so a replay finds every batch or none. It is guarded by the
-import's lease and by the import still holding its place in the pipeline, so neither a worker
-that lost the import nor a re-drive of the import after the pipeline finished fans out. The
+import's lease, by the import still holding its place in the pipeline, and by no cancel having
+been asked of it — so neither a worker that lost the import, nor a re-drive of the import after
+the pipeline finished, nor an import its owner stopped fans out. The import also looks for a
+cancel as it starts planning, since its loop looks only at full batches of 500. Until the fan-out
+commits nothing is written that a cancel would leave behind; a cancel that arrives while it runs
+waits for its lock, and finds the batches written. The fan-out stamps `fannedOutAt`, once, even when no
+product needed a batch. The
 batches carry the pipeline's correlation id and reach their queues through the relay (§4.5).
 They count against no cap: the import that makes them does, and its file is at most 50 MB. A
 client's own `Idempotency-Key` may not begin with `pipeline:` (`400 IDEMPOTENCY_KEY_RESERVED`):
@@ -857,24 +870,35 @@ publishes (A24).
 **`pipeline.finalize`** is a job type no client submits: it is in `JobType`, so it needs a
 handler to build, and not in the submit union, so `POST /jobs` refuses it. It reads the
 pipeline's jobs, then writes the pipeline's `status`, `summary` and `finishedAt` in one update
-conditional on the status still being `RUNNING`, so a second delivery changes nothing. _Built in
-E.3, with the counter._
+conditional on the status still being `RUNNING`, so a second delivery changes nothing. Its owner
+cannot cancel it (`409 JOB_NOT_CANCELLABLE`): nothing would write a second, and the pipeline would
+stay `RUNNING`. _Built in E.3, with the counter._
 
 | Status | When |
 |---|---|
-| `COMPLETED` | Every job of the pipeline succeeded the first time it finished |
-| `COMPLETED_WITH_ERRORS` | The import succeeded, and some job did not (A22) |
-| `FAILED` | The import has not succeeded when the pipeline finalizes, so not everything was fanned out |
+| `COMPLETED` | The import wrote its batches, and every job of the pipeline succeeded the first time it finished |
+| `COMPLETED_WITH_ERRORS` | The import wrote its batches, and some job — the import included — did not succeed the first time it finished (A22) |
+| `FAILED` | The import never wrote its batches: it failed or was cancelled first, so nothing else in the pipeline had a file to come from |
+
+The status turns on `fannedOutAt`, not on the import's status. An import killed on its last
+attempt after its fan-out committed is dead-lettered, but every batch exists and runs; and an
+import dead-lettered before it, then re-driven to success, holds no place any more and writes no
+batch.
 
 A product that failed inside a batch that succeeded is not an error of the pipeline: it is data
 in the summary, as an import's invalid rows are data in its result (D22).
 
 ```jsonc
-// summary — products counted from the batches that succeeded
+// summary — products counted from the batches that succeeded, over every attempt of each
 { "import": { "rows": 120, "imported": 118, "invalid": 2 },
   "enrich": { "batches": 6, "failedBatches": 1, "enriched": 95, "failed": 3 },
   "images": { "batches": 3, "failedBatches": 0, "processed": 110, "failed": 2 } }
 ```
+
+`failedBatches` counts the batches that had not succeeded when the pipeline finished; the status
+counts first outcomes. So a batch that failed and was re-driven to success before the last job
+finished leaves `COMPLETED_WITH_ERRORS` with `failedBatches: 0`: the run had an error, and nothing
+is left failed.
 
 **A failed batch** leaves its products as they were and is re-drivable like any dead letter (A22).
 A re-drive does not reopen its pipeline: the status says how the run went, and the products show
@@ -2698,6 +2722,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-25 | §4.9, §6.2, §6.3c, §6.3d, §6.3e — review fixes, R.1: a pipeline finishes with the right status and counts. An `image.process` or `ai.enrich` batch commits each product's conclusion with a tally in its checkpoint, so its result counts every attempt's work and a summary no longer reads 1 image for a batch that made 50 after one retry. A pipeline's `pipeline.finalize` cannot be cancelled (`409 JOB_NOT_CANCELLABLE`); a cancelled one left the pipeline `RUNNING` for good. The fan-out refuses an import asked to stop, and the import looks for a cancel before planning. `Pipeline.fannedOutAt`, stamped by the fan-out, decides `FAILED`: an import that failed after writing its batches no longer fails a pipeline that ran, and one re-driven after giving its place up no longer completes one that never fanned out. **New migration** `20261125100000_pipeline_fanned_out`. |
 | 2026-11-24 | §6.2, §6.5, §10.2, §13.2 — the API reference, F.3, which closes PF. Swagger UI at `/docs` and the OpenAPI document at `/docs/openapi.json`, public. Requests documented from the Zod schemas the routes validate with; answers from strict Zod schemas of their own, which a test parses every public route's real answer with. `session` and `apiKey` bearer schemes, the second set by `@AllowApiKeys()` itself; the error envelope as every operation's `default`. The admin routes, `/health`, `/ready` and `GET /` left out. `@nestjs/swagger` 12.1 added. |
 | 2026-11-24 | §6.3f, §10.1, §10.2, §12.1, §14 — using an API key, F.2. `ApiKeyGuard`, beside `JwtAuthGuard`, lets in `Bearer relay_…` on the jobs, pipelines, uploads and products controllers (`@AllowApiKeys()`), `read` for a `GET` and `write` for the rest, as the key's owner; `403` on any other route. Looked up by hash on every request; `lastUsedAt` written at most once a minute, not awaited. The request log line names the key's id. A25 and A26 registered. |
 | 2026-11-24 | §4.10, §6.2, §6.3f, §10.2, §11 — API keys specified, F.1. `relay_` and 32 random bytes, stored as SHA-256 and shown once; `read` and `write` scopes over jobs, pipelines, uploads and products; only a session manages keys; looked up on every request, so revocation needs no restart; one unrevoked key per account. `POST /api-keys`, `GET /api-keys` and `POST /api-keys/:id/revoke` built, and the operator's `GET /admin/api-keys` and `POST /admin/api-keys/revoke`, the first admin routes, which register `RolesGuard`. `API_KEYS_ENABLED` turns keys off. **New migration** `20261124100000_api_key`. |

@@ -506,6 +506,33 @@ describe('the job API contract', () => {
     },
   );
 
+  // The pipeline's summary job is the one write that finishes its pipeline;
+  // the owner sees it in their list, and stopping the pipeline is no reason
+  // to leave it RUNNING for good.
+  it("refuses to cancel a pipeline's summary job", async () => {
+    const token = await register('cancel-finalize');
+    const { body: created } = await submit(token);
+
+    // Only the server writes one; made from a submitted job, which no worker
+    // in this tier will run.
+    await app.get(PrismaService).job.update({
+      where: { id: created.data.id },
+      data: { type: 'pipeline.finalize' },
+    });
+
+    const { status: code, body } = await request(server)
+      .post(`/jobs/${created.data.id}/cancel`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(code).toBe(409);
+    expect(body.error.code).toBe('JOB_NOT_CANCELLABLE');
+    expect(
+      await app
+        .get(PrismaService)
+        .job.findUniqueOrThrow({ where: { id: created.data.id } }),
+    ).toMatchObject({ status: 'QUEUED', cancelRequested: false });
+  });
+
   it('refuses a cancel of a job the caller does not own', async () => {
     const [owner, stranger] = await Promise.all([
       register('cancel-owner'),
