@@ -1,10 +1,14 @@
 import { z } from 'zod';
 import { ProductCategory } from '../generated/prisma/enums.js';
 import { storableText } from '../common/validation/storable-text.js';
+import type { LlmReply } from './llm-provider.js';
 
 // A reason is shown to the product's owner, and the model chose the value.
 const shown = (value: unknown) =>
   (JSON.stringify(value) ?? String(value)).slice(0, 40);
+
+export const MAX_TAGS = 5;
+export const TAG_MAX_LENGTH = 30;
 
 const replySchema = z.object({ items: z.array(z.unknown()) });
 
@@ -13,7 +17,7 @@ const itemSchema = z.object({
   category: z.enum(ProductCategory, {
     error: (issue) => `${shown(issue.input)} is not one of the categories`,
   }),
-  tags: z.array(storableText().trim().min(1).max(30)).max(5),
+  tags: z.array(storableText().trim().min(1).max(TAG_MAX_LENGTH)).max(MAX_TAGS),
 });
 
 export type Enrichment = Omit<z.infer<typeof itemSchema>, 'sku'>;
@@ -49,13 +53,17 @@ const skuOf = (item: unknown) =>
  * request to record it on.
  */
 export const checkReply = (
-  text: string,
+  { text, declined }: Pick<LlmReply, 'text' | 'declined'>,
   skus: readonly string[],
 ): CheckedReply => {
   const everyOne = (problem: string) => ({
     answers: new Map<string, Enrichment>(),
     problems: new Map(skus.map((sku) => [sku, problem])),
   });
+
+  if (declined !== undefined) {
+    return everyOne(`The model declined to answer (${declined})`);
+  }
 
   let parsed: unknown;
 

@@ -10,6 +10,8 @@ export default defineConfig({
     root: './',
     include: ['**/*.spec.ts'],
     exclude: ['test/assertions/**', 'node_modules/**', 'dist/**'],
+    // Whatever .env names: no test pays for a request to a model.
+    env: { LLM_PROVIDER: 'fake' },
 
     // `include` alone decides what is reported in Vitest 4 (`all` was removed),
     // so untested files read as 0% rather than vanishing from the average.

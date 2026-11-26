@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 // Raised when the instructions or the categories change, so that every
 // product's enrichment reads as out of date and the next run asks again.
-const ENRICHMENT_VERSION = 1;
+const ENRICHMENT_VERSION = 2;
 
 /**
  * Names what a product's enrichment is made from: its name, its description

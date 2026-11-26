@@ -1,5 +1,6 @@
 import ipaddr from 'ipaddr.js';
 import { z } from 'zod';
+import { CLAUDE_MODEL_IDS } from '../enrichment/claude-models.js';
 
 const duration = z
   .string()
@@ -79,6 +80,11 @@ export const sharedEnvSchema = z.object({
   // Unset, the process serves no metrics: a port is opened only where a
   // deployment asks for one.
   METRICS_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  // Which model answers `ai.enrich` (§6.3d). The fake costs nothing and needs
+  // no key. Read by the API too, which builds every handler without running
+  // one; the key is the worker's alone.
+  LLM_PROVIDER: z.enum(['fake', 'claude']).default('fake'),
+  LLM_MODEL: z.enum(CLAUDE_MODEL_IDS).default('claude-sonnet-5-5'),
   // Whether the fake model obeys `[llm:…]` in product names (§6.3d). On only
   // for the tests, like the RELAY_FAULT_ switches: never in production.
   FAKE_LLM_DIRECTIVES: z.stringbool().default(false),
@@ -112,15 +118,34 @@ export const apiEnvSchema = sharedEnvSchema.extend({
   ARGONID_MEMORY_COST: z.coerce.number().int().positive().default(19456),
 });
 
-export const workerEnvSchema = sharedEnvSchema.extend({
-  WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(5),
-  AI_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(2),
-  AI_QUEUE_LIMIT_MAX: z.coerce.number().int().min(1).default(20),
-  AI_QUEUE_LIMIT_DURATION_MS: z.coerce.number().int().min(100).default(60_000),
-  RELAY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1000).default(60_000),
-  RELAY_FAULT_SKIP_ABANDON: z.stringbool().default(false),
-  RELAY_FAULT_AFTER_FAN_OUT: z.stringbool().default(false),
-});
+export const workerEnvSchema = sharedEnvSchema
+  .extend({
+    // Blank reads as unset, as `.env.example` leaves it.
+    ANTHROPIC_API_KEY: z
+      .string()
+      .trim()
+      .optional()
+      .transform((key) => key || undefined),
+    WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(5),
+    AI_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(2),
+    AI_QUEUE_LIMIT_MAX: z.coerce.number().int().min(1).default(20),
+    AI_QUEUE_LIMIT_DURATION_MS: z.coerce
+      .number()
+      .int()
+      .min(100)
+      .default(60_000),
+    RELAY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1000).default(60_000),
+    RELAY_FAULT_SKIP_ABANDON: z.stringbool().default(false),
+    RELAY_FAULT_AFTER_FAN_OUT: z.stringbool().default(false),
+  })
+  .refine(
+    (env) =>
+      env.LLM_PROVIDER !== 'claude' || env.ANTHROPIC_API_KEY !== undefined,
+    {
+      path: ['ANTHROPIC_API_KEY'],
+      message: 'required when LLM_PROVIDER is claude',
+    },
+  );
 
 export type SharedEnv = z.infer<typeof sharedEnvSchema>;
 export type WorkerEnv = z.infer<typeof workerEnvSchema>;
