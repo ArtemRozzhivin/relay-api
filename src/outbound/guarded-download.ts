@@ -121,7 +121,7 @@ export class GuardedDownloader {
 
           // Checked like the first URL: a redirect to 169.254.169.254 is the
           // classic way past a guard that looks only at the URL it was given.
-          url = this.check(new URL(location, url).href);
+          url = this.check(location, url);
           continue;
         }
 
@@ -132,13 +132,20 @@ export class GuardedDownloader {
     }
   }
 
-  private check(raw: string) {
+  // `redirectedFrom` resolves a relative Location. One that resolves to no
+  // URL is the server's answer, and asking again gets the same one.
+  private check(raw: string, redirectedFrom?: URL) {
     let url: URL;
 
     try {
-      url = new URL(raw);
+      url = new URL(raw, redirectedFrom);
     } catch {
-      throw new DownloadFailedError('Not a URL', true);
+      throw new DownloadFailedError(
+        redirectedFrom
+          ? 'A redirect to something that is not a URL'
+          : 'Not a URL',
+        true,
+      );
     }
 
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
@@ -217,8 +224,10 @@ export class GuardedDownloader {
             // The size cap counts the bytes received, so they must be the
             // bytes of the file and not of a compressed stream of it.
             'accept-encoding': 'identity',
+            // Who is asking, for the owner of the host. No version: a copy
+            // of one here only drifts from package.json, as `1.0` had.
             'user-agent':
-              'Relay/1.0 (+https://github.com/ArtemRozzhivin/relay-api)',
+              'Relay (+https://github.com/ArtemRozzhivin/relay-api)',
           },
         },
         resolve,
@@ -312,8 +321,25 @@ export class GuardedDownloader {
     }
 
     return new DownloadFailedError(
-      `Could not download: ${describeError(error)}`,
+      `Could not download: ${networkReason(error)}`,
       false,
     );
   }
 }
+
+// The error's code, not its message: a connect error's message names the
+// address the host resolved to, which a reason never does (§7.9). A host none
+// of whose addresses answered is one AggregateError, with no message of its
+// own and each address's error inside.
+const networkReason = (error: unknown) => {
+  const errors = error instanceof AggregateError ? error.errors : [error];
+  const codes = new Set(
+    errors.flatMap((each: unknown) => {
+      const { code } = (each ?? {}) as NodeJS.ErrnoException;
+
+      return typeof code === 'string' ? [code] : [];
+    }),
+  );
+
+  return codes.size > 0 ? [...codes].join(', ') : describeError(error);
+};

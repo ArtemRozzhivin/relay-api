@@ -25,7 +25,7 @@ import {
   JobCancelledError,
   JobRateLimitedError,
 } from '../jobs/engine/job-handler.js';
-import { JobsProcessor } from './jobs.processor.js';
+import { FREE_HAND_BACKS, JobsProcessor } from './jobs.processor.js';
 import { JobMetrics, type AttemptOutcome } from './job-metrics.js';
 
 const claimed = {
@@ -39,8 +39,11 @@ const claimed = {
   checkpoint: null,
 } as unknown as Job;
 
+// Its first start, as BullMQ counts them.
 const message = {
   data: { jobId: 'a-job', correlationId: 'req-1' },
+  attemptsStarted: 1,
+  attemptsMade: 0,
 } as QueueJob<JobMessage>;
 
 // What Prisma says when it fails: a table, a column, the statement.
@@ -382,6 +385,75 @@ describe('JobsProcessor', () => {
 
       await expect(processor.process(message)).resolves.toBeUndefined();
       expect(pauses).toEqual([1500]);
+    });
+
+    // As BullMQ counts a delivery's starts: every hand-back starts it again,
+    // and only a failure is an attempt made.
+    const deliveredAfter = (handBacks: number, failures = 0) =>
+      ({
+        ...message,
+        attemptsStarted: 1 + handBacks + failures,
+        attemptsMade: failures,
+      }) as QueueJob<JobMessage>;
+
+    it.each([
+      ['hand-backs', FREE_HAND_BACKS - 1, 0],
+      ['hand-backs, failures aside', FREE_HAND_BACKS - 1, 3],
+    ])(
+      'still hands the attempt back after %s up to the free ones',
+      async (_label, handBacks, failures) => {
+        const release = vi.fn(async () => claimed);
+        const { processor, errors } = processorFor({
+          run: busy,
+          limited: true,
+          transitions: { release },
+        });
+
+        await expect(
+          processor.process(deliveredAfter(handBacks, failures)),
+        ).rejects.toBeInstanceOf(RateLimitError);
+        expect(release).toHaveBeenCalled();
+        expect(errors).toEqual([]);
+      },
+    );
+
+    // A quota spent for the month: waiting will not fix it this week.
+    it('counts the attempt once the free hand-backs are spent, telling the owner why', async () => {
+      const release = vi.fn(async () => claimed);
+      const { processor, errors, pauses } = processorFor({
+        run: busy,
+        limited: true,
+        transitions: { release },
+      });
+
+      await expect(
+        processor.process(deliveredAfter(FREE_HAND_BACKS)),
+      ).rejects.toBeInstanceOf(JobRateLimitedError);
+      expect(pauses).toEqual([1500]);
+      expect(release).not.toHaveBeenCalled();
+      expect(errors).toEqual([
+        {
+          code: 'ATTEMPT_FAILED',
+          message: 'A service the job calls is busy; retry after 1500 ms',
+          attempt: 1,
+        },
+      ]);
+    });
+
+    it('dead-letters on the last attempt once the free hand-backs are spent', async () => {
+      const { processor, errors } = processorFor({
+        attempt: claimed.maxAttempts,
+        run: busy,
+        limited: true,
+        transitions: { release: async () => claimed },
+      });
+
+      await expect(
+        processor.process(deliveredAfter(FREE_HAND_BACKS)),
+      ).rejects.toBeInstanceOf(UnrecoverableError);
+      expect(errors).toEqual([
+        expect.objectContaining({ code: 'ATTEMPTS_EXHAUSTED' }),
+      ]);
     });
 
     // BullMQ would hand the job straight back to ask the busy service again.

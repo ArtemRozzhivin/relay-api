@@ -27,15 +27,18 @@ describe('the pipeline.finalize handler', () => {
   const users: string[] = [];
 
   // A pipeline whose every job has finished: its import, then one batch per
-  // status given, `failedChildren` the failures among them.
+  // status given, `failedChildren` the failures among them. Its batches were
+  // written when its import succeeded, unless `fannedOut` says otherwise.
   const finished = async ({
     importStatus = 'SUCCEEDED',
     batches = [],
     failedChildren,
+    fannedOut = importStatus === 'SUCCEEDED',
   }: {
     importStatus?: JobStatus;
     batches?: JobStatus[];
     failedChildren?: number;
+    fannedOut?: boolean;
   } = {}) => {
     const userId = await createThrowawayUser(prisma, 'finalize');
 
@@ -48,6 +51,7 @@ describe('the pipeline.finalize handler', () => {
       userId,
       pendingChildren: 0,
       failedChildren: failedChildren ?? failures,
+      fannedOutAt: fannedOut ? new Date() : null,
     });
 
     await seedJob(prisma, {
@@ -152,7 +156,7 @@ describe('the pipeline.finalize handler', () => {
     });
   });
 
-  it('finishes one whose import did not succeed as FAILED', async () => {
+  it('finishes one whose import failed before writing its batches as FAILED', async () => {
     const { userId, pipelineId } = await finished({
       importStatus: 'DEAD_LETTERED',
     });
@@ -162,6 +166,40 @@ describe('the pipeline.finalize handler', () => {
     expect(await pipelineOf(pipelineId)).toMatchObject({
       status: 'FAILED',
       summary: { import: null },
+    });
+  });
+
+  // Killed on its last attempt after the fan-out committed: every batch was
+  // written and ran, so the run is not one that never started.
+  it('finishes one whose import failed after writing its batches as COMPLETED_WITH_ERRORS', async () => {
+    const { userId, pipelineId } = await finished({
+      importStatus: 'DEAD_LETTERED',
+      fannedOut: true,
+      batches: ['SUCCEEDED'],
+    });
+
+    await finalize(userId, pipelineId).result;
+
+    expect(await pipelineOf(pipelineId)).toMatchObject({
+      status: 'COMPLETED_WITH_ERRORS',
+      summary: { import: null, enrich: { batches: 1, failedBatches: 0 } },
+    });
+  });
+
+  // Dead-lettered, which gave its place up, then re-driven to success before
+  // the finalize ran: a re-driven import holds no place, so it wrote no batch.
+  it('finishes one whose import succeeded only after giving its place up as FAILED', async () => {
+    const { userId, pipelineId } = await finished({
+      importStatus: 'SUCCEEDED',
+      fannedOut: false,
+      failedChildren: 1,
+    });
+
+    await finalize(userId, pipelineId).result;
+
+    expect(await pipelineOf(pipelineId)).toMatchObject({
+      status: 'FAILED',
+      summary: { enrich: { batches: 0 }, images: { batches: 0 } },
     });
   });
 

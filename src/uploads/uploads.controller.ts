@@ -20,7 +20,7 @@ export class UploadsController {
   @ApiData(
     HttpStatus.OK,
     uploadSlipView,
-    'POST the file to `url`, with `fields`, then name `key` in an import or a pipeline',
+    'POST the file to `url`, with `fields`, starting before `expiresAt` (a minute), then name `key` in an import or a pipeline',
   )
   // Each slip lets its holder store up to 50 MB.
   @RateLimit(10, minutes(1))

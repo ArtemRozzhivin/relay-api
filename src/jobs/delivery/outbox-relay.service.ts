@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma/prisma.service.js';
-import { jobOptions, type OutboxMessage } from './job-queue.js';
+import { jobOptions, readOutboxMessage } from './job-queue.js';
 import { JobQueues } from './job-queues.js';
 import { describeError } from '../../common/errors/describe-error.js';
 import { nonOverlapping } from '../../common/scheduling/non-overlapping.js';
@@ -9,7 +9,9 @@ import { nonOverlapping } from '../../common/scheduling/non-overlapping.js';
 // At most 100 rows a second, and that is a pace, not a throughput limit: a
 // bulk re-drive writes thousands of outbox rows at once and relies on this to
 // release them as a ramp against a downstream that has only just recovered
-// (D11). The direct path carries normal submits, so raising it buys nothing.
+// (D11). A submit takes the direct path. A pipeline's batches come only this
+// way, oldest first for every account, so a fan-out delays the rows written
+// after it: the largest, a full store's 350 batches, by some 4 s (D32).
 const BATCH_SIZE = 100;
 
 @Injectable()
@@ -43,9 +45,7 @@ export class OutboxRelayService {
     let firstFailure: { rowId: bigint; reason: string } | undefined;
 
     for (const row of pending) {
-      // Json in the schema, so typed only by agreement: JobsService writes
-      // every row's payload as an OutboxMessage.
-      const message = row.payload as unknown as OutboxMessage;
+      const message = readOutboxMessage(row.payload);
 
       // Per row, not per tick: the next tick starts again from the oldest
       // unpublished row, so a row that always fails would otherwise hold back
@@ -53,6 +53,10 @@ export class OutboxRelayService {
       // every tick; the rows behind it go out in the meantime, which costs only
       // their order relative to it — and each row is a separate message.
       try {
+        if (!message) {
+          throw new Error('its payload is not an outbox message');
+        }
+
         // The queue the row names, which a queue unknown to this deploy fails
         // like any other publish: the row waits for a deploy that knows it.
         await this.queues

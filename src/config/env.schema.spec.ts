@@ -1,3 +1,4 @@
+import express from 'express';
 import { describe, expect, it } from 'vitest';
 import { apiEnvSchema } from './env.schema.js';
 
@@ -96,10 +97,56 @@ describe('apiEnvSchema', () => {
     ).toEqual(['loopback', '10.0.0.0/8']);
   });
 
-  it('refuses to trust every proxy', () => {
-    const result = apiEnvSchema.safeParse({ ...valid, TRUST_PROXY: 'true' });
+  it.each(['true', ' TRUE '])('refuses to trust every proxy (%j)', (raw) => {
+    const result = apiEnvSchema.safeParse({ ...valid, TRUST_PROXY: raw });
 
     expect(result.success).toBe(false);
     expect(result.error?.issues[0]?.message).toContain('not true');
+  });
+
+  // What configure-app hands Express: it throws on an entry it cannot read.
+  const trusted = (raw: string) => {
+    const value = apiEnvSchema.parse({
+      ...valid,
+      TRUST_PROXY: raw,
+    }).TRUST_PROXY;
+
+    express().set('trust proxy', value ?? false);
+
+    return value;
+  };
+
+  it.each(['false', 'False', ''])('reads TRUST_PROXY=%j as none', (raw) => {
+    expect(trusted(raw)).toBeUndefined();
+  });
+
+  it('accepts every form Express reads', () => {
+    expect(
+      trusted(
+        'loopback,linklocal,uniquelocal,10.0.0.1,172.16.0.0/12,::1,fd00::/8',
+      ),
+    ).toEqual([
+      'loopback',
+      'linklocal',
+      'uniquelocal',
+      '10.0.0.1',
+      '172.16.0.0/12',
+      '::1',
+      'fd00::/8',
+    ]);
+  });
+
+  it.each([
+    'caddy',
+    '10.0.0.0/33',
+    'fd00::/129',
+    '10.0.0.0/8/8',
+    'loopback,false',
+  ])('refuses a proxy Express cannot read, naming it (%j)', (raw) => {
+    const result = apiEnvSchema.safeParse({ ...valid, TRUST_PROXY: raw });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0]?.path).toEqual(['TRUST_PROXY']);
+    expect(result.error?.issues[0]?.message).toContain('is not an address');
   });
 });

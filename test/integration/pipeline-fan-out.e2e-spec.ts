@@ -38,7 +38,11 @@ describe("a pipeline's fan-out", () => {
 
   // A pipeline whose import is running on attempt 1, under lease 1.
   const importing = async (
-    job: { status?: JobStatus; pendingInPipeline?: boolean } = {},
+    job: {
+      status?: JobStatus;
+      pendingInPipeline?: boolean;
+      cancelRequested?: boolean;
+    } = {},
   ) => {
     const userId = await createThrowawayUser(prisma, 'fan-out');
 
@@ -70,6 +74,10 @@ describe("a pipeline's fan-out", () => {
   const pendingOf = async (pipelineId: string) =>
     (await prisma.pipeline.findUniqueOrThrow({ where: { id: pipelineId } }))
       .pendingChildren;
+
+  const fannedOutAt = async (pipelineId: string) =>
+    (await prisma.pipeline.findUniqueOrThrow({ where: { id: pipelineId } }))
+      .fannedOutAt;
 
   beforeAll(async () => {
     moduleRef = await createTestModule({
@@ -206,5 +214,36 @@ describe("a pipeline's fan-out", () => {
     ).resolves.toEqual({ holding: false, written: 0 });
     expect(await batchesOf(pipelineId)).toEqual([]);
     expect(await pendingOf(pipelineId)).toBe(1);
+    expect(await fannedOutAt(pipelineId)).toBeNull();
+  });
+
+  // How the pipeline ends turns on it (§6.3e): written means not FAILED.
+  it('marks the pipeline fanned out once, even when no product needed a batch', async () => {
+    const { pipelineId, importJobId } = await importing();
+
+    await transitions.fanOut(importJobId, 1, []);
+
+    const first = await fannedOutAt(pipelineId);
+
+    expect(first).toBeInstanceOf(Date);
+
+    await transitions.fanOut(importJobId, 1, [enrich('A')]);
+
+    expect(await fannedOutAt(pipelineId)).toEqual(first);
+  });
+
+  // The last point at which a cancel leaves nothing behind: past it, a whole
+  // pipeline of batches would run for an import its owner stopped.
+  it('writes nothing once its owner has asked the import to stop', async () => {
+    const { pipelineId, importJobId } = await importing({
+      cancelRequested: true,
+    });
+
+    await expect(
+      transitions.fanOut(importJobId, 1, [enrich('A'), images('A')]),
+    ).resolves.toBeNull();
+    expect(await batchesOf(pipelineId)).toEqual([]);
+    expect(await pendingOf(pipelineId)).toBe(1);
+    expect(await fannedOutAt(pipelineId)).toBeNull();
   });
 });

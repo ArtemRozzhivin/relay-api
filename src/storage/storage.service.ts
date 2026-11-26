@@ -18,6 +18,7 @@ import { Upload } from '@aws-sdk/lib-storage';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { SharedEnv } from '../config/env.schema.js';
+import { chunked } from '../common/collections/chunked.js';
 
 /** An object opened for reading, and the version of it being read. */
 export interface OpenedObject {
@@ -29,6 +30,12 @@ export interface OpenedObject {
    */
   etag: string;
 }
+
+// Taken before signing, and to the second, as a policy's expiry and a link's
+// X-Amz-Date are written: the time a client is told is never later than the
+// one S3 holds it to.
+const expiryFromNow = (seconds: number) =>
+  new Date(Math.floor(Date.now() / 1000 + seconds) * 1000);
 
 /** A signed permission to upload one object, as an HTML form would (presigned POST). */
 export interface UploadSlip {
@@ -94,9 +101,7 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
     maxBytes: number,
     expiresInSeconds: number,
   ): Promise<UploadSlip> {
-    // Taken before signing, so the time a client is told is never later than
-    // the one S3 will hold it to.
-    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
+    const expiresAt = expiryFromNow(expiresInSeconds);
 
     const { url, fields } = await createPresignedPost(this.client, {
       Bucket: this.bucket,
@@ -216,9 +221,7 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
     key: string,
     expiresInSeconds: number,
   ): Promise<DownloadLink> {
-    // Taken before signing, like an upload slip's, so the time a client is
-    // told is never later than the one S3 holds the link to.
-    const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
+    const expiresAt = expiryFromNow(expiresInSeconds);
 
     const url = await getSignedUrl(
       this.client,
@@ -262,14 +265,12 @@ export class StorageService implements OnModuleInit, OnModuleDestroy {
    * refusals, so they are checked here; the others in the request are gone.
    */
   async deleteObjects(keys: readonly string[]) {
-    for (let start = 0; start < keys.length; start += KEYS_PER_REQUEST) {
+    for (const chunk of chunked(keys, KEYS_PER_REQUEST)) {
       const { Errors: refused = [] } = await this.client.send(
         new DeleteObjectsCommand({
           Bucket: this.bucket,
           Delete: {
-            Objects: keys
-              .slice(start, start + KEYS_PER_REQUEST)
-              .map((Key) => ({ Key })),
+            Objects: chunk.map((Key) => ({ Key })),
             Quiet: true,
           },
         }),

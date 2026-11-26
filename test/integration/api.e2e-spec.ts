@@ -338,6 +338,22 @@ describe('the job API contract', () => {
         Date.now(),
       );
 
+      // What S3 holds the link to: signed at X-Amz-Date, to the second, for
+      // X-Amz-Expires seconds. The time the client is told is never later.
+      const signed = new URL(body.data.url).searchParams;
+      const signedAt = Date.parse(
+        signed
+          .get('X-Amz-Date')!
+          .replace(
+            /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/,
+            '$1-$2-$3T$4:$5:$6Z',
+          ),
+      );
+
+      expect(Date.parse(body.data.expiresAt)).toBeLessThanOrEqual(
+        signedAt + Number(signed.get('X-Amz-Expires')) * 1000,
+      );
+
       const download = await fetch(body.data.url);
 
       expect(download.status).toBe(200);
@@ -505,6 +521,33 @@ describe('the job API contract', () => {
       expect(after.data).toMatchObject({ status, cancelRequested: false });
     },
   );
+
+  // The pipeline's summary job is the one write that finishes its pipeline;
+  // the owner sees it in their list, and stopping the pipeline is no reason
+  // to leave it RUNNING for good.
+  it("refuses to cancel a pipeline's summary job", async () => {
+    const token = await register('cancel-finalize');
+    const { body: created } = await submit(token);
+
+    // Only the server writes one; made from a submitted job, which no worker
+    // in this tier will run.
+    await app.get(PrismaService).job.update({
+      where: { id: created.data.id },
+      data: { type: 'pipeline.finalize' },
+    });
+
+    const { status: code, body } = await request(server)
+      .post(`/jobs/${created.data.id}/cancel`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(code).toBe(409);
+    expect(body.error.code).toBe('JOB_NOT_CANCELLABLE');
+    expect(
+      await app
+        .get(PrismaService)
+        .job.findUniqueOrThrow({ where: { id: created.data.id } }),
+    ).toMatchObject({ status: 'QUEUED', cancelRequested: false });
+  });
 
   it('refuses a cancel of a job the caller does not own', async () => {
     const [owner, stranger] = await Promise.all([

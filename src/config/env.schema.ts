@@ -1,25 +1,67 @@
+import ipaddr from 'ipaddr.js';
 import { z } from 'zod';
 
 const duration = z
   .string()
   .regex(/^\d+(ms|s|m|h|d)$/, 'expected a duration such as 15m, 24h or 30d');
 
+// The names Express's proxy-addr gives its subnets.
+const PROXY_SUBNETS = new Set(['loopback', 'linklocal', 'uniquelocal']);
+
+// Checked here rather than left to Express, which refuses an entry it cannot
+// read only when the API starts — with an error that does not name the setting.
+const isProxy = (entry: string) => {
+  if (PROXY_SUBNETS.has(entry)) {
+    return true;
+  }
+
+  const [address, bits, ...rest] = entry.split('/');
+
+  if (rest.length > 0 || !ipaddr.isValid(address)) {
+    return false;
+  }
+
+  const widest = ipaddr.parse(address).kind() === 'ipv4' ? 32 : 128;
+
+  return bits === undefined || (/^\d+$/.test(bits) && Number(bits) <= widest);
+};
+
 // Express's own forms: a hop count, or the proxies' addresses and subnets.
 // `true` is refused: it trusts every hop, so a client that writes its own
-// X-Forwarded-For chooses the address it is limited by.
+// X-Forwarded-For chooses the address it is limited by. `false` is what an
+// operator writes to mean none, so it reads as unset.
 const trustProxy = z
   .string()
-  .refine((raw) => raw.trim() !== 'true', {
+  .trim()
+  .refine((raw) => raw.toLowerCase() !== 'true', {
     message: 'name a hop count or the proxy addresses, not true',
   })
-  .transform((raw) =>
-    /^\d+$/.test(raw.trim())
-      ? Number(raw)
-      : raw
-          .split(',')
-          .map((entry) => entry.trim())
-          .filter(Boolean),
-  );
+  .transform((raw, context) => {
+    if (raw === '' || raw.toLowerCase() === 'false') {
+      return undefined;
+    }
+
+    if (/^\d+$/.test(raw)) {
+      return Number(raw);
+    }
+
+    const proxies = raw
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const unreadable = proxies.find((entry) => !isProxy(entry));
+
+    if (unreadable !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        message: `${unreadable} is not an address, an address/bits subnet, or loopback, linklocal or uniquelocal`,
+      });
+
+      return z.NEVER;
+    }
+
+    return proxies;
+  });
 
 export const sharedEnvSchema = z.object({
   NODE_ENV: z
@@ -37,6 +79,9 @@ export const sharedEnvSchema = z.object({
   // Unset, the process serves no metrics: a port is opened only where a
   // deployment asks for one.
   METRICS_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  // Whether the fake model obeys `[llm:…]` in product names (§6.3d). On only
+  // for the tests, like the RELAY_FAULT_ switches: never in production.
+  FAKE_LLM_DIRECTIVES: z.stringbool().default(false),
 });
 
 export const apiEnvSchema = sharedEnvSchema.extend({

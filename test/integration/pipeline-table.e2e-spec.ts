@@ -87,6 +87,20 @@ describe('the Pipeline table', () => {
     ).rejects.toThrow(/Pipeline_finished_when_final/);
   });
 
+  it('refuses a FAILED pipeline whose batches were written', async () => {
+    const pipeline = await seedPipeline(prisma, {
+      userId: await owner(),
+      fannedOutAt: new Date(),
+    });
+
+    await expect(
+      prisma.pipeline.update({
+        where: { id: pipeline.id },
+        data: { status: 'FAILED', finishedAt: new Date() },
+      }),
+    ).rejects.toThrow(/Pipeline_failed_only_before_fan_out/);
+  });
+
   it('refuses a job holding a place in no pipeline', async () => {
     await expect(
       seedJob(prisma, { userId: await owner(), pendingInPipeline: true }),

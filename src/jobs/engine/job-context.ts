@@ -1,13 +1,14 @@
 import type { Prisma } from '../../generated/prisma/client.js';
 import type { JobProgress } from './job-progress.js';
 import type { JobType, PayloadOf } from '../jobs.schema.js';
+import type { PipelineStage } from './pipeline-keys.js';
 
 /**
  * One batch a pipeline's job hands on (§6.3e): a job of `type`, numbered by
  * its place among the batches of its `stage`.
  */
 export type PipelineBatch = {
-  [T in JobType]: { stage: string; type: T; payload: PayloadOf<T> };
+  [T in JobType]: { stage: PipelineStage; type: T; payload: PayloadOf<T> };
 }[JobType];
 
 /**
@@ -159,7 +160,10 @@ export interface JobContext {
    */
   fanOut(batches: PipelineBatch[]): Promise<number>;
 
-  /** Writes one line tagged with the job, the attempt and the request that submitted it. */
+  /**
+   * Writes one line tagged with the job, the attempt and the id of the request
+   * that queued this delivery: the submit's, or a re-drive's after one (§12.1).
+   */
   log(message: string): void;
 }
 

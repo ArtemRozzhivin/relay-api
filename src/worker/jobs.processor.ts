@@ -33,10 +33,18 @@ import { JobMetrics, type AttemptOutcome } from './job-metrics.js';
 // owner is told only that it happened and where to point, and the worker's log
 // keeps what. The correlation id is the id of the request that queued the
 // attempt, a submit's or a re-drive's, which the owner already holds.
+// A busy service's own words are ours, too: they name no table or address.
 const ownerMessage = (error: unknown, correlationId: string) =>
-  error instanceof AppError
+  error instanceof AppError || error instanceof JobRateLimitedError
     ? error.message
     : `Internal error; the worker's log has it under correlationId ${correlationId}`;
+
+// A busy service is no reason to give up, but one that stays busy — a model
+// whose monthly quota is spent answers 429 until the month ends — must not
+// hold a job, and pause its queue, for ever. Past this many hand-backs in one
+// delivery, each further one counts as an attempt, and the job ends as any
+// failure does. Twenty minutes of waiting at a Retry-After of a minute.
+export const FREE_HAND_BACKS = 20;
 
 /**
  * Runs the jobs one queue delivers. Each queue has a subclass below, which
@@ -222,28 +230,40 @@ abstract class QueueProcessor extends WorkerHost implements OnModuleDestroy {
         // same busy service. Kept in Redis, so every worker waits.
         await this.queues.named(this.worker.name).rateLimit(retryAfterMs);
 
-        const released = await this.transitions.release(jobId, lease);
+        // Every start of this delivery but this one and those that failed: its
+        // hand-backs, and a stall or two. A re-drive is a new delivery, and
+        // starts the count again.
+        const handedBack = message.attemptsStarted - message.attemptsMade - 1;
 
-        if (released) {
-          outcome = 'rate_limited';
-          await this.events.jobUpdated(released);
+        if (handedBack < FREE_HAND_BACKS) {
+          const released = await this.transitions.release(jobId, lease);
+
+          if (released) {
+            outcome = 'rate_limited';
+            await this.events.jobUpdated(released);
+            this.logger.warn(
+              `Job ${jobId} found a service busy on attempt ${attempt}; its queue waits ${retryAfterMs} ms, and the attempt is not counted`,
+            );
+
+            // BullMQ puts the entry back at the head of the queue, without
+            // spending one of its attempts or waiting out a backoff.
+            throw new RateLimitError();
+          }
+
+          outcome = 'superseded';
           this.logger.warn(
-            `Job ${jobId} found a service busy on attempt ${attempt}; its queue waits ${retryAfterMs} ms, and the attempt is not counted`,
+            `Job ${jobId} found a service busy on attempt ${attempt}, which no longer owns it`,
           );
 
-          // BullMQ puts the entry back at the head of the queue, without
-          // spending one of its attempts or waiting out a backoff.
-          throw new RateLimitError();
+          // Returned, as for a cancellation: whoever owns the job now has its
+          // own delivery, and this one handed back would claim the job from
+          // them.
+          return;
         }
 
-        outcome = 'superseded';
         this.logger.warn(
-          `Job ${jobId} found a service busy on attempt ${attempt}, which no longer owns it`,
+          `Job ${jobId} has found a service busy ${handedBack + 1} times in this delivery; attempt ${attempt} counts`,
         );
-
-        // Returned, as for a cancellation: whoever owns the job now has its own
-        // delivery, and this one handed back would claim the job from them.
-        return;
       }
 
       const detail = describeError(cause);

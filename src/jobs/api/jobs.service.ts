@@ -5,6 +5,7 @@ import {
   ErrorReportNotFoundError,
   IdempotencyKeyReusedError,
   JobAlreadyFinishedError,
+  JobNotCancellableError,
   JobNotDeadLetteredError,
   JobNotFoundError,
   UploadNotFoundError,
@@ -39,6 +40,7 @@ import {
 import { lockAccount } from '../../prisma/account-lock.js';
 import { toPage } from '../../common/pagination/cursor.js';
 import { describeError } from '../../common/errors/describe-error.js';
+import { isUniqueViolation } from '../../prisma/unique-violation.js';
 
 // Fetched when the seller clicks, so a short life costs nothing: a link that
 // leaks from a browser history is dead within minutes.
@@ -96,7 +98,7 @@ export class JobsService {
   /**
    * Accepts a job once per `(userId, idempotencyKey)`: the row and its outbox
    * row commit together, then the job is enqueued directly, with the relay as
-   * the backstop should that enqueue never happen (§7.2).
+   * the backstop should that enqueue never happen (§4.5, D5).
    *
    * @returns the job, and whether it is a replay: an earlier request with the
    * same key and body already created it, and nothing new was enqueued.
@@ -143,10 +145,7 @@ export class JobsService {
         return { job, outboxId: outbox.id };
       });
     } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
+      if (isUniqueViolation(error)) {
         const existing = await this.prisma.job.findUniqueOrThrow({
           where: { userId_idempotencyKey: { userId, idempotencyKey } },
         });
@@ -385,9 +384,16 @@ export class JobsService {
    * @throws JobAlreadyFinishedError when it had already succeeded or been
    * dead-lettered. The request changed nothing, and an "accepted" would make
    * the caller read the body to discover its cancel had no effect.
+   * @throws JobNotCancellableError for a pipeline's `pipeline.finalize`.
    */
   async cancel(userId: string, jobId: string) {
     const existing = await this.findOne(userId, jobId);
+
+    // Asked before the flag, which would be refused for it too, so the caller
+    // learns why rather than reading "already finished" about a queued job.
+    if (existing.type === 'pipeline.finalize') {
+      throw new JobNotCancellableError();
+    }
 
     const flagged = await this.transitions.requestCancel(existing.id);
 

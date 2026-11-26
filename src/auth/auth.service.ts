@@ -3,12 +3,12 @@ import { PrismaService } from '../prisma/prisma.service.js';
 import { PasswordService } from './password.service.js';
 import { JwtService } from '@nestjs/jwt';
 import { TokenService } from './token.service.js';
-import { Prisma } from '../generated/prisma/client.js';
 import { LoginInput, RegisterInput } from './auth.schema.js';
 import {
   EmailAlreadyRegisteredError,
   InvalidCredentialsError,
 } from '../common/errors/app-error.js';
+import { isUniqueViolation } from '../prisma/unique-violation.js';
 
 @Injectable()
 export class AuthService {
@@ -65,10 +65,7 @@ export class AuthService {
 
       return user;
     } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
+      if (isUniqueViolation(error)) {
         throw new EmailAlreadyRegisteredError();
       }
       throw error;

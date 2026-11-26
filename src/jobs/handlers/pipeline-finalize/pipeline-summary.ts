@@ -80,15 +80,17 @@ export const summarize = (
 };
 
 /**
- * How a pipeline ended (§6.3e). From the import's status as the pipeline
- * finishes, and from how many of its jobs did not succeed the first time they
- * finished — which a re-drive since cannot change.
+ * How a pipeline ended (§6.3e). From whether its import wrote its batches —
+ * not from the import's status, which may have failed after writing them, or
+ * been re-driven to success after the pipeline gave up its place and so wrote
+ * none — and from how many of its jobs did not succeed the first time they
+ * finished, which a re-drive since cannot change.
  */
 export const finalStatus = (
-  importSucceeded: boolean,
+  fannedOut: boolean,
   failedChildren: number,
 ): Exclude<PipelineStatus, 'RUNNING'> => {
-  if (!importSucceeded) {
+  if (!fannedOut) {
     return 'FAILED';
   }
 

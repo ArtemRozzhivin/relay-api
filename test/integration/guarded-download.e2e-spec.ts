@@ -46,6 +46,10 @@ const routes: Record<
     response.writeHead(302, { location: '/loop' });
     response.end();
   },
+  '/to-nowhere': (response) => {
+    response.writeHead(302, { location: 'http://[nowhere/' });
+    response.end();
+  },
   '/declared-too-large': (response) => {
     response.writeHead(200, {
       'content-type': 'image/png',
@@ -149,6 +153,11 @@ describe('the guarded download', () => {
     ],
     ['a redirect loop', '/loop', /More than 3 redirects/],
     [
+      'a redirect to something that is not a URL',
+      '/to-nowhere',
+      /^A redirect to something that is not a URL$/,
+    ],
+    [
       'a declared length over the cap',
       '/declared-too-large',
       /Larger than 1000 bytes/,
@@ -186,6 +195,39 @@ describe('the guarded download', () => {
       expect(error.permanent).toBe(false);
     },
   );
+
+  // Node tries each address in turn, and reports the lot as one error with no
+  // message of its own. Named by its code: the messages name the addresses.
+  it('names why when no address of a host answers, and no address', async () => {
+    const closed = createServer();
+
+    await new Promise<void>((resolve) =>
+      closed.listen(0, '127.0.0.1', resolve),
+    );
+    const { port } = closed.address() as AddressInfo;
+    await new Promise((resolve) => closed.close(resolve));
+
+    const twoAddresses = new GuardedDownloader({
+      lookup: ((
+        _hostname: string,
+        _options: object,
+        done: (error: null, found: LookupAddress[]) => void,
+      ) =>
+        done(null, [
+          { address: '127.0.0.1', family: 4 },
+          { address: '::1', family: 6 },
+        ])) as unknown as typeof import('node:dns').lookup,
+      isAllowed: () => true,
+      ports: [String(port)],
+    });
+
+    const error = await failure(
+      twoAddresses.download(`http://images.example.com:${port}/a.png`, limits),
+    );
+
+    expect(error.message).toBe('Could not download: ECONNREFUSED');
+    expect(error.permanent).toBe(false);
+  });
 
   it('times out a body that never finishes, as something worth retrying', async () => {
     const error = await failure(

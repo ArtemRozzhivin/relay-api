@@ -1,3 +1,6 @@
+// First, before any module: the processors' concurrency and limiter are read
+// from process.env as jobs.processor.ts loads, so .env must be loaded by then
+// (§8.4). Moved below another import, those settings fall back to defaults.
 import './load-env.js';
 import { NestFactory } from '@nestjs/core';
 import { Logger } from 'nestjs-pino';

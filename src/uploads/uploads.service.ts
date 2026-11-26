@@ -9,9 +9,11 @@ import { TooManyUploadsError } from '../common/errors/app-error.js';
 // wrong file — a video, a database dump — is refused by S3 before it is stored.
 export const UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
 
-// Long enough to pick a file and send it on a slow connection; short enough
-// that a leaked link is useless soon after.
-const UPLOAD_EXPIRES_IN_SECONDS = 300;
+// S3 holds a slip to it when the upload starts, not when it ends, so a slow
+// connection sending 50 MB still finishes. Short because a slip is not spent
+// by its first upload: until it expires, every POST of it stores the file
+// again, and each one is billed.
+const UPLOAD_EXPIRES_IN_SECONDS = 60;
 
 // A store that re-uploads after a mistake or two still has room many times
 // over. The bucket keeps an upload 7 days, so this holds what one account can

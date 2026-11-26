@@ -9,8 +9,9 @@ import { PinoLogger } from 'nestjs-pino';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { JobTransitionService } from '../jobs/engine/job-transition.service.js';
 import { JobEventsPublisher } from '../jobs/events/job-events.publisher.js';
-import { messageId, type OutboxMessage } from '../jobs/delivery/job-queue.js';
+import { messageId, readOutboxMessage } from '../jobs/delivery/job-queue.js';
 import { JobQueues } from '../jobs/delivery/job-queues.js';
+import { UNFINISHED_STATUSES } from '../jobs/engine/job-statuses.js';
 import type { JobStatus } from '../generated/prisma/enums.js';
 import type { WorkerEnv } from '../config/env.schema.js';
 import { describeError } from '../common/errors/describe-error.js';
@@ -92,7 +93,7 @@ export class StrandedJobSweeper
     for (;;) {
       const page = await this.prisma.job.findMany({
         where: {
-          status: { in: ['RUNNING', 'QUEUED'] },
+          status: { in: UNFINISHED_STATUSES },
           // Not Prisma's `cursor`, which reads from the cursor row and skips
           // it with OFFSET 1: once the sweep has finished a page's last row,
           // that row is out of the filter, and the offset skips the next one.
@@ -131,8 +132,11 @@ export class StrandedJobSweeper
         if (latest && (status === 'RUNNING' || latest.publishedAt !== null)) {
           // The delivery's own correlationId, a re-drive's when a re-drive
           // queued it, so the line that ends the job joins the run it ends
-          // (§12.1). Json in the schema: an OutboxMessage by agreement.
-          const { correlationId } = latest.payload as unknown as OutboxMessage;
+          // (§12.1). Only for the log: a payload it cannot read names no run,
+          // and the job is checked all the same.
+          const correlationId = readOutboxMessage(
+            latest.payload,
+          )?.correlationId;
 
           await this.logContext.runInContext(
             () =>
@@ -159,8 +163,8 @@ export class StrandedJobSweeper
    * are the queue still doing its job — a stalled one goes back to waiting and
    * is redelivered — so they are left alone.
    *
-   * @returns the dead-lettered row, or `null` if the job is not stranded or
-   * something else finished it first.
+   * @returns the dead-lettered row, or `null` if the job is not stranded,
+   * something else finished it first, or Postgres refused to finish it.
    */
   async finishIfStranded(job: SweepCandidate, now = Date.now()) {
     const entry = await this.queues
@@ -180,14 +184,28 @@ export class StrandedJobSweeper
       return null;
     }
 
-    const abandoned = await this.transitions.abandonStranded(
-      job.id,
-      { status: job.status, lease: job.lease, outboxId: job.outboxId },
-      {
-        code: 'DELIVERY_ABANDONED',
-        message: `The queue no longer delivers this job (its entry is ${found})`,
-      },
-    );
+    let abandoned: Awaited<ReturnType<JobTransitionService['abandonStranded']>>;
+
+    try {
+      abandoned = await this.transitions.abandonStranded(
+        job.id,
+        { status: job.status, lease: job.lease, outboxId: job.outboxId },
+        {
+          code: 'DELIVERY_ABANDONED',
+          message: `The queue no longer delivers this job (its entry is ${found})`,
+        },
+      );
+    } catch (error) {
+      // A finish Postgres refuses — a CHECK the row's own data breaks — is that
+      // row's, and refused again on every sweep: thrown, it would stop each one
+      // here, and no row after it would ever be checked. A queue that cannot
+      // be asked still stops the sweep above, as it would for every row.
+      this.logger.error(
+        `Job ${job.id} is stranded, but the sweep could not dead-letter it: ${describeError(error)}`,
+      );
+
+      return null;
+    }
 
     if (abandoned) {
       await this.events.jobUpdated(abandoned);

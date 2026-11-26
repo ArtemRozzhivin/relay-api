@@ -24,7 +24,7 @@ export interface CheckedReply {
   problems: Map<string, string>;
 }
 
-const describe = (error: z.ZodError) =>
+const describeIssues = (error: z.ZodError) =>
   error.issues
     .map(({ path, message }) =>
       path.length > 0 ? `${path.join('.')}: ${message}` : message,
@@ -100,7 +100,7 @@ export const checkReply = (
         tags: checked.data.tags,
       });
     } else {
-      problems.set(sku, describe(checked.error));
+      problems.set(sku, describeIssues(checked.error));
     }
   }
 
