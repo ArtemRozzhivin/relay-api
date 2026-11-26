@@ -25,7 +25,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.build.json",
     "test:assertions": "npm run build && vitest run --config ./vitest.config.assertions.ts",
     "test:integration": "vitest run --config ./vitest.config.e2e.ts",
-    "test:live": "vitest run --config ./vitest.config.live.ts",
+    "test:live": "npm run build && vitest run --config ./vitest.config.live.ts",
     "test:all": "npm run test && npm run test:integration && npm run test:assertions"
   },
   "dependencies": {

@@ -864,8 +864,9 @@ nothing: a 429 with a `Retry-After` becomes the queue's pause above, and anythin
 without one, which is a spent monthly limit, a 5xx, a request still unanswered after 60 s, a
 refused key — fails the attempt. Changing the instructions raises the version in a product's
 enrichment hash, so every product is asked again; it was raised once, to 2, for these.
-`npm run test:live` asks the real model about three products, billed to the key in `.env`: run
-by hand only, never in CI. _Built in J.1._
+`npm run test:live` asks the real model about three products, then runs a pipeline of 24 through
+the API and a worker told to use it, and checks each product's category and each batch's cost.
+Billed to the key in `.env`: run by hand only, never in CI. _Built in J.1; the pipeline in J.2._
 
 The corrective request names only the products that need it, each with its reason, and only the
 text the model needs — sku, name and description, never an id or the owner. A failure clears any
@@ -2798,10 +2799,11 @@ fake, and 2026-11-24 put a real model after billing (PI), because nothing limits
 spends: the AI queue's 20 jobs a minute bound every account together. That left the demo (PH),
 which comes first, showing the fake. Now `ClaudeLlmProvider` is built (PJ), off unless
 `LLM_PROVIDER=claude`, with Claude Sonnet 5.5 by default. The spend risk is a public server's,
-not a developer's: locally the key is the developer's own. Roughly, at an assumed 1 500 tokens in
-and 1 000 out a batch, a full store of 5 000 products costs $3 with Sonnet, $0.20 with Haiku and
-$6.50 with Opus; an account that kept the AI queue full for a day could spend some $400–750 with
-Sonnet. **Trigger:** M11 gives the deployed worker a key. Before that, either a daily AI budget
+not a developer's: locally the key is the developer's own. Measured (J.2), a batch of 20 on
+Sonnet took 1 515 tokens in and 981 out, $0.0128, and 6.5 s. A full store of 5 000 products, 250
+batches, costs about $3.20 with Sonnet and, at the same tokens, $0.16 with Haiku and $6.40 with
+Opus. An account that kept the AI queue full for a day, 20 batches a minute, could spend some $370
+with Sonnet, or $740 if every batch also needed its corrective request. **Trigger:** M11 gives the deployed worker a key. Before that, either a daily AI budget
 per account — the cost each job records (D.6) is what it would count — or the deployment stays on
 the fake. Whatever is decided, the key's own account limit in the Anthropic Console is the ceiling
 nothing in Relay can exceed.
@@ -2886,6 +2888,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-26 | §6.3d, D33 — the real model, asked for real (PJ, J.2). `npm run test:live` also runs a pipeline of 24 products through the API and a worker told to use Claude, and checks each category and each batch's recorded cost. D33's assumed tokens are replaced by measured ones: a batch of 20 on Sonnet 5.5 took 1 515 in and 981 out, $0.0128, in 6.5 s, so a full store costs about $3.20. |
 | 2026-11-26 | §2, §6.3d, §10.1, §11, §13.2, D33 — a real model (PJ, J.1). `ClaudeLlmProvider` behind `LlmProvider`, chosen by `LLM_PROVIDER` (`fake` by default, and in every test tier), with `LLM_MODEL` (Sonnet 5.5 by default) and the worker's `ANTHROPIC_API_KEY`. The reply is held to a JSON schema and checked as before; a refusal fails the batch's products with its category; a 429 with `Retry-After` pauses the queue, and the SDK retries nothing. The enrichment version is raised to 2, so every product is asked again. `npm run test:live` asks the real model, by hand only. **D33 decided:** built now, before M10, rather than after billing; what a public deployment may spend is decided in M11. |
 | 2026-11-25 | §2, §3, §6.2, §6.3, §6.3e, §10.1, §10.4, §11, §15.2 — review fixes, R.6: the docs brought back in line with the code. §2 lists `ai.enrich` and `pipeline.finalize`, and its non-goals no longer rule out the model and the pipeline it builds. §3: the worker serves `/metrics`, calls seller URLs and the model. §6.2: any route may answer `400`, `401`, `429`, `413` or `415`, and `POST /jobs` and `POST /pipelines` `400 IDEMPOTENCY_KEY_RESERVED`; §6.3 gains the `ai.enrich` payload, §6.3e the pipeline's answer, and its timing a full store's. §10.1's module tree is the registered one: the guards in `AppModule`, in their order, and the metrics, throttler and enrichment modules. §10.4's recipe for a job type adds `AI_TYPES` and `UNFINISHED_CAPS`. §11: `process.env` is read through `ConfigService` but for the worker's processor options. §15.2's rate limits gain `POST /pipelines` and the two API-key routes. |
 | 2026-11-25 | §15.2 — review fixes, R.5: conventions. The JSON body limit is worked out from the batch and sku limits it follows (60 000 bytes, was a hand-set 64 KB). In the code, one home each for: which statuses are unfinished; whether a product's image or enrichment is about its current input, now used by the product view too; the rendered image format; a unique-key refusal; an outbox row's payload, now checked when read. Pipeline stage names are a type. The image sizes and format sit apart from the renderer, which the keys and the product view no longer import. The larger refactors the review proposed are listed in the plan, under Later. |

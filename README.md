@@ -124,11 +124,12 @@ LLM_MODEL=claude-sonnet-5-5       # or claude-haiku-5-5, claude-opus-5-5
 ANTHROPIC_API_KEY=...             # from console.anthropic.com; the worker reads it
 ```
 
-Every request is billed to that key: a full store of 5 000 products costs about $3 with Sonnet and
-$0.20 with Haiku. Set a spend limit on the key's account in the Anthropic Console. Nothing yet limits
+Every request is billed to that key: a batch of 20 products cost $0.013 with Sonnet, measured, so a
+full store of 5 000 costs about $3.20 with Sonnet and $0.16 with Haiku. Set a spend limit on the key's account in the Anthropic Console. Nothing yet limits
 what one account of Relay's spends on AI, so a public deployment should not get a key until it does
-([D33](docs/TECH_SPEC.md#16-open-decisions-register)). `npm run test:live` asks the real model
-about three products, to check the key and the setup; it costs about a cent.
+([D33](docs/TECH_SPEC.md#16-open-decisions-register)). `npm run test:live` checks the key and the
+setup: it asks the real model about three products, then runs a pipeline of 24 through the API and a
+worker, so it needs the stack running, as the assertions do. It costs about two cents.
 
 ## Tests
 

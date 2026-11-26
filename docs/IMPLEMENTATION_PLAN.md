@@ -947,14 +947,17 @@ after the demo (D33).
   ```
   _The fake stays the default: no test, and no developer without a key, pays for a request._
   ```
-- [ ] **J.2 · Asked for real** — `npm run test:live` passes with a real key, and a pipeline run by
+- [x] **J.2 · Asked for real** — `npm run test:live` passes with a real key, and a pipeline run by
   the worker with `LLM_PROVIDER=claude` enriches a small catalog; the measured cost of a batch
   replaces the estimate in D33 and the README.
+  ```
+  _24 products, 2 batches, every category as expected: $0.017 on Sonnet 5.5, 6.5 s for 20._
+  ```
 
 ### Done when
 
-- [ ] A real model categorizes an imported catalog, end to end, with its cost on each job
-- [ ] No test tier can reach the real model, whatever `.env` says
+- [x] A real model categorizes an imported catalog, end to end, with its cost on each job
+- [x] No test tier can reach the real model, whatever `.env` says
 
 ---
 

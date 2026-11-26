@@ -9,6 +9,10 @@ export default defineConfig({
     globals: true,
     root: './',
     include: ['test/live/**/*.live-spec.ts'],
-    testTimeout: 120_000,
+    // A Relay worker already running would take the pipeline's batches and
+    // answer them with whatever model it was started with.
+    globalSetup: ['test/harness/global-setup.ts'],
+    testTimeout: 240_000,
+    hookTimeout: 60_000,
   },
 });
