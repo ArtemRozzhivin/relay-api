@@ -509,11 +509,14 @@ Each step is motivated by the failure of the one before it.
 
 ### Tasks
 
-- [ ] **10.1 · Fix numeric targets first** — p95 submit latency, throughput, max queue depth, drain time.
+- [x] **10.1 · Fix numeric targets first** — p95 submit latency, throughput, max queue depth, drain time.
+  Written in §15.3 with the box they hold on and the four scenarios they are measured in.
   ```
   _A target chosen after seeing the result is not a target._
   ```
-- [ ] **10.2 · k6 scenarios** — sustained submit, burst, and a mixed job-type profile.
+- [ ] **10.2 · k6 scenarios** — sustained submit, burst, and a mixed job-type profile, on the box
+  (§15.3): the API, two workers and Redis on two pinned cores and 4 GB, from 11.1's Dockerfile,
+  built here so what is measured is what ships.
   ```
   _Different shapes expose different bottlenecks._
   ```
@@ -558,6 +561,7 @@ Each step is motivated by the failure of the one before it.
 ### Tasks
 
 - [ ] **11.1 · Multi-stage Dockerfile**, non-root user, config from the environment only.
+  Built in M10 (10.2), for the box the load runs on; here it ships.
   ```
   _One image runs in any environment; nothing baked in._
   ```
@@ -596,6 +600,11 @@ Each step is motivated by the failure of the one before it.
   account, counted from the cost each job records, before it gets a key; or it stays on the fake.
   ```
   _A key on a public server with no per-account limit lets any sign-up spend the owner's money._
+  ```
+- [ ] **11.10 · Run A18 once on the VPS** — image batches on the real host's cores, where M10's box
+  only stood in for them (D10, §15.3).
+  ```
+  _Two pinned cores in a laptop's VM are a model of a 2-vCPU server, not one._
   ```
 
 ### Done when

@@ -2142,7 +2142,7 @@ Specifying them now would produce prose that is wrong by the time it is used.
 |---|---|---|---|
 | **8 · Observability & hardening** | Prometheus `/metrics` from both processes: queue depth, duration histogram, failure rate, dead-letter count. Rate limiting, per-account caps on S3-backed work (D32), `trust proxy`, helmet, CORS allowlist, body limits. Dead-letter inspection and re-drive | Queue depth observably rises and drains under load; one job's full story is retrievable from logs by `correlationId` alone | **§15.2** |
 | **9 · Test harness & CI** | The shared harness, fixtures and CI — **not** the tests themselves, which are written with the code throughout (§14). A1–A7 become automated cases including process kill/restart | `npm run test:all` reproduces every reliability assertion with no manual steps; CI green from a clean checkout | **§15.1** |
-| **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a closed with measurements attached, D10's repeated on the target host | Start of phase 10 |
+| **10 · Load** | k6 scenarios and A9 under sustained load with ≥2 workers. Numeric targets fixed **before** the run | Targets met or the gap documented; D6a closed with measurements attached, D10's repeated on the target host | **§15.3** |
 | **11 · Deploy** | One VPS: Docker running API + worker, Caddy for auto-HTTPS, `ufw`, managed Postgres, restart policies, migrations as a release step. Multi-instance socket.io (D13) becomes real here | HTTPS on a real domain; a reboot restores both processes unattended; a restore from backup has been rehearsed | Start of phase 11 |
 
 **Note for phase 8:** `@nestjs/throttler` 6.5.0 declares peers stopping at Nest 11. Re-verify its
@@ -2460,6 +2460,73 @@ import that changes the URL leaves the old folder behind, and `products/` never 
   run; a sweep of all of `products/` from a test would judge their images by its own database's
   rows.
 - The IAM policy already allows `s3:ListBucket` and `s3:DeleteObject` (§13.4).
+
+### 15.3 Phase 10 — written 2026-11-26
+
+Load testing asks two things. Does the invariant — every accepted job ends once, and its side
+effect with it — hold when the system is contended? And where is the ceiling? The second is a
+number only against a named machine and targets named beforehand, so both are fixed here, before
+any run.
+
+#### The box
+
+A laptop's twelve cores say nothing about a server. The API, two workers and Redis run as
+containers pinned to the same two cores, with 4 GB between them: the smallest VPS phase 11 will
+buy, which must therefore have at least that. Postgres runs on four other cores, standing in for
+the managed database, and k6 on cores of its own, so the load does not spend the box's CPU making
+itself. The image is phase 11's Dockerfile (11.1), built here instead, so what is measured is what
+ships. The box stands in for the target host in D10 too; phase 11 runs A18 once on the real one.
+
+What it does not reproduce: a managed Postgres is a network hop away, a millisecond or two a query
+rather than a tenth, and Docker Desktop runs Linux in a VM. Measured latency is a floor, and is
+reported as one.
+
+#### The load
+
+- **Accounts:** 100, each seeded with a write API key before the run, since sign-up allows 5 an
+  hour from one address. Each submits at most once every two seconds, under `POST /jobs`' 60 a
+  minute: the rate limits stay on, because their Redis round trip is part of every submit.
+- **Jobs:** `MOCK` of 100 ms in 2 steps (80 %) and `CHARGE` with a 50 ms delay (20 %), each with
+  its own `Idempotency-Key`. Both are uncapped, and the test sets how long they run, so what is
+  measured is the engine — claim, outbox, queue, progress, finish — not a handler. `CHARGE` writes
+  the side effect A3 counts.
+- **Capacity, by arithmetic:** two workers at `WORKER_CONCURRENCY` 5 run 10 jobs at once, about
+  110 a second at 90 ms each before the engine's own time. The sustained rate is half that.
+
+#### Scenarios
+
+| Scenario | Shape | Answers |
+|---|---|---|
+| **Sustained** | 50 submits a second for 10 minutes: 30 000 jobs | Whether latency holds and the workers keep up |
+| **Burst** | 2 000 submits, unpaced, from 100 virtual users | How fast the API accepts, and how the queue absorbs and drains |
+| **Kill (A9)** | Sustained, one of the two workers `SIGKILL`ed at minute 5 and restarted 30 s later | Whether A2 and A3 hold under load |
+| **Starvation (D6a)** | 100 `MOCK` jobs of 10 s at once, then `CHARGE` at 5 a second for 60 s | Whether a slow job type holds a fast one back in the shared queue |
+
+#### Targets — fixed 2026-11-26, before any run
+
+| What | Scenario | Target |
+|---|---|---|
+| Submit latency | Sustained | p95 ≤ 100 ms, p99 ≤ 250 ms |
+| Submit latency | Burst | p95 ≤ 500 ms |
+| Failed submits | Every one | None: a 5xx, a timeout or a refused connection fails the run |
+| Keeping up | Sustained | Jobs finished each minute within 5 % of jobs submitted |
+| Queue depth | Sustained | ≤ 200 waiting at every sample: four seconds of input |
+| Drain | Sustained, burst, kill | Every job terminal ≤ 60 s after the last submit |
+| A2 | Every one | Terminal jobs = accepted submits; none `QUEUED` or `RUNNING` after the drain |
+| A3 | Kill | `SideEffect` rows = `CHARGE` jobs: none missing, none twice |
+| Run once | Every one | Every job finished on its first attempt, but those the killed worker held |
+| D6a | Starvation | `CHARGE`'s wait, `startedAt − createdAt`, p95 ≤ 5 s; over it, the queue is split |
+| D10 | A18, on the box | No stalled job, and the worker's event loop never late by more than 1 s |
+
+A target missed is reported with its measurement and what meeting it would take, not moved
+(§15's exit criterion).
+
+#### What a run records
+
+k6's latency percentiles and failed requests; `relay_queue_depth` from `/metrics`, every 5 s;
+from `Job`, each job's wait and run time and when the last one finished; the `SideEffect` count;
+and each container's CPU and memory from `docker stats`. Each run's numbers are kept in the repo
+with the commit they ran against.
 
 ---
 
@@ -2888,6 +2955,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-26 | §15, §15.3 — phase 10 written, 10.1: the box the load runs on (the API, two workers and Redis on two pinned cores and 4 GB, Postgres apart, as the managed one will be), the load (100 seeded accounts under the real rate limits, `MOCK` and `CHARGE` jobs), four scenarios (sustained, burst, kill for A9, starvation for D6a) and their numeric targets, fixed before any run. Phase 11's Dockerfile is built in phase 10, and phase 11 repeats A18 on the real host. |
 | 2026-11-26 | §6.3d, D33 — the real model, asked for real (PJ, J.2). `npm run test:live` also runs a pipeline of 24 products through the API and a worker told to use Claude, and checks each category and each batch's recorded cost. D33's assumed tokens are replaced by measured ones: a batch of 20 on Sonnet 5.5 took 1 515 in and 981 out, $0.0128, in 6.5 s, so a full store costs about $3.20. |
 | 2026-11-26 | §2, §6.3d, §10.1, §11, §13.2, D33 — a real model (PJ, J.1). `ClaudeLlmProvider` behind `LlmProvider`, chosen by `LLM_PROVIDER` (`fake` by default, and in every test tier), with `LLM_MODEL` (Sonnet 5.5 by default) and the worker's `ANTHROPIC_API_KEY`. The reply is held to a JSON schema and checked as before; a refusal fails the batch's products with its category; a 429 with `Retry-After` pauses the queue, and the SDK retries nothing. The enrichment version is raised to 2, so every product is asked again. `npm run test:live` asks the real model, by hand only. **D33 decided:** built now, before M10, rather than after billing; what a public deployment may spend is decided in M11. |
 | 2026-11-25 | §2, §3, §6.2, §6.3, §6.3e, §10.1, §10.4, §11, §15.2 — review fixes, R.6: the docs brought back in line with the code. §2 lists `ai.enrich` and `pipeline.finalize`, and its non-goals no longer rule out the model and the pipeline it builds. §3: the worker serves `/metrics`, calls seller URLs and the model. §6.2: any route may answer `400`, `401`, `429`, `413` or `415`, and `POST /jobs` and `POST /pipelines` `400 IDEMPOTENCY_KEY_RESERVED`; §6.3 gains the `ai.enrich` payload, §6.3e the pipeline's answer, and its timing a full store's. §10.1's module tree is the registered one: the guards in `AppModule`, in their order, and the metrics, throttler and enrichment modules. §10.4's recipe for a job type adds `AI_TYPES` and `UNFINISHED_CAPS`. §11: `process.env` is read through `ConfigService` but for the worker's processor options. §15.2's rate limits gain `POST /pipelines` and the two API-key routes. |
