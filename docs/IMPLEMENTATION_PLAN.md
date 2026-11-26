@@ -27,9 +27,9 @@ in a runnable, demonstrable state.
 - [x] **PA** · Handler registry, progress, cancellation
 - [x] **PB** · Object storage, `Product` domain, `import.csv`
 - [x] **PC** · `image.process`
-- [ ] **PD** · `ai.enrich`
-- [ ] **PE** · Pipeline fan-out
-- [ ] **PF** · API keys and public docs
+- [x] **PD** · `ai.enrich`
+- [x] **PE** · Pipeline fan-out
+- [x] **PF** · API keys and public docs
 - [ ] **PH** · Presentation — README, diagram, demo
 - [ ] **PI** · Billing
 

@@ -98,7 +98,7 @@ export class JobsService {
   /**
    * Accepts a job once per `(userId, idempotencyKey)`: the row and its outbox
    * row commit together, then the job is enqueued directly, with the relay as
-   * the backstop should that enqueue never happen (§7.2).
+   * the backstop should that enqueue never happen (§4.5, D5).
    *
    * @returns the job, and whether it is a replay: an earlier request with the
    * same key and body already created it, and nothing new was enqueued.

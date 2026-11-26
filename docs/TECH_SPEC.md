@@ -74,6 +74,8 @@ add real ones on top of it:
 | `CHARGE` | Writes one row to the side-effect ledger, logs "charged". No gateway, no network | The job whose double-execution is observably wrong — the subject of A1/A3 |
 | `import.csv` | Reads a seller's uploaded CSV from S3 and upserts it as products, a checkpointed batch at a time; invalid rows go to an error report (§6.3b) | The first real job: long, resumable, partly failing (PB) |
 | `image.process` | Downloads the named products' images through the guarded downloader and stores three WebP sizes in S3 (§6.3c) | Untrusted URLs, and per-item failure inside one job (PC) |
+| `ai.enrich` | Asks a language model for each named product's category and tags, behind `LlmProvider`; a deterministic fake by default, with no key (§6.3d) | Output that cannot be trusted, a provider's 429, and a cost per job (PD) |
+| `pipeline.finalize` | Written by the server only, when a pipeline's last job finishes: sums what its jobs did into the pipeline's summary (§6.3e) | Fan-in: the parent that runs once, after every child (PE) |
 
 `MOCK` must `await`, never spin. A CPU-blocking processor starves the event loop, fails to renew
 its BullMQ lock, and stalls itself — a self-inflicted redelivery that invalidates every
@@ -81,8 +83,9 @@ reliability measurement (§7.6).
 
 ### Explicit non-goals (v2)
 
-Real payment or email side effects · real heavy processing (transcode, LLM calls) · job DAGs
-and workflow orchestration · scheduled/repeating jobs (BullMQ Job Schedulers) · multi-tenant
+Real payment or email side effects · real heavy processing (transcode) · a real, paid language
+model (PD builds the interface and a fake; one waits for billing, PI) · general job DAGs and
+workflow orchestration (v1 has one fixed pipeline shape, §6.3e) · scheduled/repeating jobs (BullMQ Job Schedulers) · multi-tenant
 billing · Kubernetes or autoscaling · distributed tracing across services · any frontend
 (the realtime contract is verified by a scripted socket client; a dashboard is a separate
 deliverable and is not what §9 is specified against) · GraphQL · read replicas.
@@ -116,7 +119,7 @@ Four processes, two of them ours, and one service outside them: the S3 bucket (D
 | Process | Nest bootstrap | Owns | Never does |
 |---|---|---|---|
 | **API** | `NestFactory.create()` (HTTP + WS) | Auth, job submission, job reads, the socket server, signing S3 upload and download links | Instantiate a BullMQ `Worker`. Execute job side effects. Carry a file's bytes. |
-| **WORKER** | `NestFactory.createApplicationContext()` (no HTTP server) | The `@Processor`, the stranded-job sweep, all side effects, all status transitions after `QUEUED`, every read and write of a file in S3 | Serve HTTP. Hold client sockets. |
+| **WORKER** | `NestFactory.createApplicationContext()` (no Nest HTTP server) | The `@Processor`, the stranded-job sweep, all side effects, all status transitions after `QUEUED`, every read and write of a file in S3, every request to a seller's image URL (§7.9) and to the language model | Serve the API: its only HTTP is `GET /metrics` on `METRICS_PORT`, when set (§12.3). Hold client sockets. |
 
 **S3** holds files, never state a job's correctness depends on: a client uploads a CSV straight to
 the bucket with a presigned POST, and downloads error reports and product images through signed
@@ -485,7 +488,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/auth/login` | — | `200` | Access + refresh pair |
 | `POST` | `/auth/refresh` | refresh token | `200` | Rotation: presented token revoked, new pair issued |
 | `POST` | `/auth/logout` | refresh token | `204` | Idempotent — revoking an already-revoked token is a no-op |
-| `POST` | `/jobs` | access | **`202`** / `422` / `429` | Persist + enqueue. `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded; `429 TOO_MANY_UNFINISHED_JOBS` when the caller already has 3 `import.csv`, 50 `image.process` or 10 `ai.enrich` jobs queued or running, a pipeline's batches still holding their place not counted — a replay is answered as one all the same (D32). See §6.3 |
+| `POST` | `/jobs` | access | **`202`** / `400` / `422` / `429` | Persist + enqueue. `400 IDEMPOTENCY_KEY_RESERVED` for a key beginning `pipeline:`, which the server keeps for a pipeline's own jobs (§7.2). `422 IDEMPOTENCY_KEY_REUSED` when the key was first used with a different body; `422 UPLOAD_NOT_FOUND` when an `import.csv` names a key that is not the caller's or was never uploaded; `429 TOO_MANY_UNFINISHED_JOBS` when the caller already has 3 `import.csv`, 50 `image.process` or 10 `ai.enrich` jobs queued or running, a pipeline's batches still holding their place not counted — a replay is answered as one all the same (D32). See §6.3 |
 | `GET` | `/jobs/:id` | access | `200` | 404 for a job you don't own — never 403 |
 | `GET` | `/jobs/:id/error-report` | access | `200` / `404` | `{ url, expiresAt }`: a link, signed on each call and valid for 5 minutes, that downloads a succeeded import's error report. `404 JOB_NOT_FOUND` for a job you don't own; `404 ERROR_REPORT_NOT_FOUND` when it has not succeeded, every row was valid, or the report has expired. See §6.3b |
 | `GET` | `/jobs` | access | `200` | Newest first. Filter `?status=`, `?type=`; `?limit=` (1–100, default 20) and `?cursor=` from the previous page. Returns `{ items, nextCursor }`, `nextCursor` `null` on the last page. No `total`, no `offset` (D14) |
@@ -494,7 +497,7 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 | `POST` | `/jobs/:id/retry` | access | `202` / `409` / `429` | Re-drive a `DEAD_LETTERED` job. It resumes from its checkpoint; `?from=start` discards it and does the work again from the beginning. `409 JOB_NOT_DEAD_LETTERED` for any other; `429 TOO_MANY_UNFINISHED_JOBS` past the same caps as a submit (D32). Phase 6. See D6b, D26 |
 | `POST` | `/jobs/retry` | access | `202` | Re-drive the caller's dead letters matching `{ type?, errorCode?, deadLetteredFrom?, deadLetteredTo? }` — at least one required — a bounded batch (`limit`, default 500, max 1000) per call. Returns `{ redriven, remaining }`; call again until `remaining` is 0, with `deadLetteredTo` set so jobs that die again meanwhile are not picked up again. `dryRun: true` counts and changes nothing. Every job resumes from its checkpoint — there is no bulk `from=start`; restart one with `POST /jobs/:id/retry?from=start`. An `import.csv` whose upload has expired (7 days, §13.4) dead-letters again at once, `TERMINAL_FAILURE`. `import.csv` and `image.process` come back only as far as the caller's caps have room (D32); the rest stay in `remaining`. Read a batch before sending it with `GET /jobs/dead-letters`. See D11 |
 | `POST` | `/jobs/:id/cancel` | access | `202` / `409` | `202`: `CANCELLED` if it had not started; still `RUNNING` with `cancelRequested` if a handler has it; still `QUEUED` with `cancelRequested` if its effect has already committed — it will end `SUCCEEDED`, since a charge that went through cannot be undone by saying so (§5.2); or **already** `CANCELLED`, so a retried cancel gets the first answer again. `409 JOB_ALREADY_FINISHED` if it had succeeded or been dead-lettered — the cancel changed nothing, the same way a re-drive of a job that is not dead-lettered is a `409`. `409 JOB_NOT_CANCELLABLE` for a pipeline's `pipeline.finalize`, which is what finishes the pipeline (§6.3e) |
-| `POST` | `/pipelines` | access | **`202`** / `422` / `429` | An import that goes on to enrich and image the products it imported, then sums them up. `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`. The same `422`s and `429` as `POST /jobs` for an `import.csv`, a replay included; `429 TOO_MANY_RUNNING_PIPELINES` while another of the caller's pipelines is running (D32). See §6.3e |
+| `POST` | `/pipelines` | access | **`202`** / `400` / `422` / `429` | An import that goes on to enrich and image the products it imported, then sums them up. `{ key }`, an upload as `import.csv` takes it, and an `Idempotency-Key`. The same `400`, `422`s and `429` as `POST /jobs` for an `import.csv`, a replay included; `429 TOO_MANY_RUNNING_PIPELINES` while another of the caller's pipelines is running (D32). See §6.3e |
 | `GET` | `/pipelines/:id` | access | `200` | Its status, how many of its jobs of each type are in each status, and the summary once finished. 404 for a pipeline you don't own. See §6.3e |
 | `POST` | `/api-keys` | session | **`201`** / `403` / `429` | `{ name, scopes }` → the key's view with `key`, the secret, which is in this response and nowhere else. `403 API_KEYS_DISABLED` while the operator has keys turned off; `429 TOO_MANY_API_KEYS` when the caller already has an unrevoked key. See §6.3f |
 | `GET` | `/api-keys` | session | `200` | The caller's keys, newest first, revoked ones included; never the secret or its hash |
@@ -508,6 +511,15 @@ is echoed in the `X-Request-Id` response header and is the same value stored on
 
 `404`-before-`403` on ownership: a job belonging to another user is *not found*. The API does not
 reveal that a resource exists to someone with no right to it.
+
+**Any route can also answer:**
+
+- `400 VALIDATION_FAILED` for a body, query or path its schema refuses, naming each field (§6.4).
+- `401` without a valid access token or API key, on every route not marked public.
+- `429 TOO_MANY_REQUESTS` past its rate limit, with `Retry-After` in seconds (§15.2).
+- `413 PAYLOAD_TOO_LARGE` for a body over 60 000 bytes, and `415 UNSUPPORTED_MEDIA_TYPE` for one in
+  a charset the parser cannot read — both from the parser, before any route, still with a
+  `requestId` and the CORS headers a browser needs to read them (§15.2).
 
 ### 6.3 `POST /jobs` — the submit contract
 
@@ -563,6 +575,7 @@ the place frees when one of the account's own jobs finishes, which `job.updated`
 | | `delayMs` | `0`–`60000` | `0` |
 | `import.csv` | `key` | a key from `POST /uploads` (§6.3a), the caller's own, uploaded | required |
 | `image.process` | `skus` | 1–50 skus, each 1–100 chars; any the caller has no product for are reported, not refused | required |
+| `ai.enrich` | `skus` | 1–20 skus, each 1–100 chars; any the caller has no product for are reported, not refused | required |
 
 `maxAttempts` is on the body itself, not the payload: `1`–`20`, default `5`.
 
@@ -947,10 +960,30 @@ is no cancel for a whole pipeline. _Built in E.4: A22 takes the model down for o
 
 `GET /pipelines/:id` answers with the status, the import's job id, how many of the pipeline's
 jobs of each type are in each status — which is how a client follows a run, and finds a failed
-batch — and the summary once finished.
+batch — and the summary once finished. `POST /pipelines` answers with the same, and `replayed`:
 
-AI batches run at the AI queue's 20 a minute (§8.4): a 20 000-product import's 1 000 enrichment
-batches take 50 minutes, and the pipeline finishes when the last of them does.
+```jsonc
+// running
+{ "id": "…", "userId": "…", "idempotencyKey": "nightly-2026-11-25", "correlationId": "…",
+  "status": "RUNNING", "importJobId": "…",
+  "jobs": { "import.csv": { "SUCCEEDED": 1 },
+            "ai.enrich": { "SUCCEEDED": 3, "RUNNING": 1, "QUEUED": 46 },
+            "image.process": { "SUCCEEDED": 20 } },
+  "summary": null, "createdAt": "…", "finishedAt": null }
+
+// finished — the summary adds up what each stage's succeeded batches did
+{ …, "status": "COMPLETED_WITH_ERRORS", "finishedAt": "…",
+  "summary": {
+    "import": { "rows": 1001, "imported": 1000, "invalid": 1 },
+    "enrich": { "batches": 50, "failedBatches": 1, "enriched": 975, "failed": 5 },
+    "images": { "batches": 20, "failedBatches": 0, "processed": 990, "failed": 10 } } }
+```
+
+`import` is `null` when the import did not succeed. Its counter and the fan-out time are kept
+from the answer: they are the server's bookkeeping, not the run's.
+
+AI batches run at the AI queue's 20 a minute (§8.4): a full store's 5 000 products are 250
+enrichment batches, some 12 minutes, and the pipeline finishes when the last of them does.
 
 ### 6.3f API keys — a seller's own system, without a login (PF)
 
@@ -1665,12 +1698,14 @@ AppModule  (bootstrap: NestFactory.create)
 ├── ConfigModule.forRoot({ isGlobal: true, validationSchema: apiEnvSchema })
 ├── LoggerModule.forRootAsync        (nestjs-pino)
 ├── BullModule.forRootAsync          (connection only — no queue registered at the root)
+├── MetricsModule.forRoot('api')     (the registry and HTTP metrics, §12.3)
+├── ThrottlerModule.forRootAsync     (the rate limits' counters, §15.2)
 ├── PrismaModule            (global; exports PrismaService)
 ├── RedisModule             (global; exports the ioredis client)
-├── AuthModule              → AuthController, AuthService, TokenService, PasswordService,
-│                             APP_GUARD: JwtAuthGuard, ApiKeyGuard (§10.2)
+├── AuthModule              → AuthController, AuthService, TokenService, PasswordService
 ├── JobsModule              → JobsController, JobsService, OutboxRelayService,
-│                             PipelinesController, PipelinesService (§6.3e)
+│                             PipelinesController, PipelinesService (§6.3e),
+│                             QueueMetrics, JobQueues (§12.3)
 │    ├── imports JobCoreModule, StorageModule
 │    ├── imports ScheduleModule.forRoot()                            // the relay's tick
 │    └── imports BullModule.registerQueue relay-jobs, relay-ai       // PRODUCER ONLY
@@ -1678,10 +1713,14 @@ AppModule  (bootstrap: NestFactory.create)
 ├── HealthModule            → Terminus: Postgres + Redis
 ├── UploadsModule           → UploadsController, UploadsService (signs upload slips)
 ├── ProductsModule          → ProductsController, ProductsService
-└── ApiKeysModule           → ApiKeysController, ApiKeysService (§6.3f)
+├── ApiKeysModule           → ApiKeysController, ApiKeysService (§6.3f)
+└── providers               APP_GUARD: JwtAuthGuard, ApiKeyGuard, RateLimitGuard, RolesGuard —
+                            in that order, which is the order they run (§10.2); APP_PIPE,
+                            APP_FILTER, APP_INTERCEPTOR
 
 WorkerModule  (bootstrap: NestFactory.createApplicationContext)
 ├── ConfigModule / LoggerModule / PrismaModule   (same modules, worker env schema)
+├── MetricsModule.forRoot('worker'), JobMetrics  (served on METRICS_PORT when set, §12.3)
 ├── JobCoreModule
 ├── BullModule.registerQueue relay-jobs, relay-ai                    // CONSUMER
 ├── JobsProcessor           (WorkerHost, relay-jobs)
@@ -1691,7 +1730,7 @@ WorkerModule  (bootstrap: NestFactory.createApplicationContext)
 └── ImageFolderSweeper      (deletes image folders no product uses, §6.3c)
 
 JobCoreModule  (imported by BOTH roots: the domain, with no queue and no transport)
-├── imports RedisModule, StorageModule, ProductsModule, OutboundModule
+├── imports RedisModule, StorageModule, ProductsModule, OutboundModule, EnrichmentModule
 ├── JobTransitionService    (every guarded status transition, §7.3)
 ├── JobHandlerRegistry      (resolves Job.type → handler; refuses to construct if a
 │                            submittable type has none, so a gap fails at boot)
@@ -1700,11 +1739,13 @@ JobCoreModule  (imported by BOTH roots: the domain, with no queue and no transpo
 └── one handler provider per `JOB_TYPES` entry
 
 Leaf modules both roots reach: StorageModule (StorageService, the one S3 client), OutboundModule
-(GuardedDownloader, §7.9).
+(GuardedDownloader, §7.9), EnrichmentModule (`LLM_PROVIDER` → `FakeLlmProvider`, where a real
+model is bound, §6.3d).
 ```
 
 `ProductsModule` reaches the worker through `JobCoreModule` with its controller; in an application
-context nothing mounts it, so the worker still serves no HTTP.
+context nothing mounts it, so the worker serves none of the API — only `/metrics`, from a plain
+Node server of its own, when `METRICS_PORT` is set.
 
 **`AppModule` must never transitively import `WorkerModule`.** Shared code (Prisma, Redis,
 config, the domain services the processor calls) lives in `JobCoreModule`, which both roots
@@ -1772,6 +1813,9 @@ src/jobs/
 handler uses only `engine/` and `jobs.schema.ts`: never `api/`, never another handler. Only
 `jobs.module.ts` imports `api/`, and the worker never loads that module. A new job type is an option
 in `jobs.schema.ts`, a folder under `handlers/` and an entry in `job-core.module.ts`'s `HANDLERS`.
+One that calls the language model also goes in `AI_TYPES` (`delivery/job-queue.ts`), for the
+queue whose limiter a 429 pauses: on `relay-jobs` the 429 is an ordinary failure. One that costs
+money or holds a shared queue gets a cap in `UNFINISHED_CAPS` (`api/unfinished-caps.ts`, D32).
 
 **No repository layer.** Services call Prisma themselves. Prisma's client is already the typed data
 access a repository would wrap, and what this system guarantees lives in the queries: the lease in
@@ -1790,7 +1834,10 @@ later (§6.3d). Revisit when a second store holds jobs.
 
 Validated at boot with a Zod schema through `@nestjs/config` (v12 accepts Standard Schema
 validators directly — no Joi). **Misconfiguration crashes startup, never a request at 3am.**
-`process.env` is read in exactly one file.
+`process.env` is read through `ConfigService`, with one exception: the worker's processor options
+(`WORKER_CONCURRENCY`, `AI_WORKER_CONCURRENCY`, `AI_QUEUE_LIMIT_*`) are read as their module
+loads, before Nest exists, which is why `worker.ts` loads `.env` first (§8.4). A config loader
+that fed only `ConfigService` would leave those four on their defaults.
 
 | Variable | Type | API | Worker | Notes |
 |---|---|---|---|---|
@@ -2235,6 +2282,9 @@ Limits are per route: a caller refused on one still reaches the others.
 | `POST /jobs/:id/retry` | account | 60 a minute | A re-drive runs a job again, as a submit does — and a job that always fails could otherwise be re-driven without end |
 | `POST /jobs/retry` | account | 10 a minute | Each call re-drives up to 1000 dead letters |
 | `POST /uploads` | account | 10 a minute | Each slip lets its holder store up to 50 MB |
+| `POST /pipelines` | account | 60 a minute | As a submit: one more is one more import, and the import's cap and one running pipeline bound the work |
+| `POST /api-keys` | account | 10 an hour | An account holds one unrevoked key; this bounds how often it can be replaced |
+| `POST /admin/api-keys/revoke` | account | 10 a minute | One call can revoke every key there is |
 
 - **Over the limit: `429 TOO_MANY_REQUESTS`, with `Retry-After` in seconds** — exposed through
   CORS, since a dashboard has to read it to know when to try again. The request that goes over,
@@ -2798,6 +2848,7 @@ A spec line that survives contact with code should be **edited, not defended**.
 | 2026-10-28 | §9.2 — `job.updated` carries `progress`, and progress emits are throttled to one per job per 500 ms with the last one always sent. The window governs the database write too: one clock, one staleness window, and it also bounds the write amplification a client could ask for with `steps: 100`. A12b registered for both halves. |
 | 2026-10-28 | §5, §6.2, §9.2, D22 — `CANCELLED` and `cancelRequested` added, with `POST /jobs/:id/cancel`. The API may finish only a `QUEUED` job; a `RUNNING` one is finished by the worker when its handler stops at a boundary. The worker checks the flag before claiming, so a cancel never strands a job and a retry never re-runs a cancelled handler. A cancel of a job that already succeeded or was dead-lettered is `409 JOB_ALREADY_FINISHED`; only an already-cancelled job answers `202`. §4.3's `progress` row corrected to `<=`. |
 | 2026-10-28 | §6.2, §14, D11 — **decided**: `POST /jobs/retry` re-drives dead letters by type, error code and dead-letter window, one bounded batch per call, writing outbox rows in the same transaction so the relay publishes them. A5c registered. The dead-letter error codes are one list the worker's writes are checked against at compile time. |
+| 2026-11-25 | §2, §3, §6.2, §6.3, §6.3e, §10.1, §10.4, §11, §15.2 — review fixes, R.6: the docs brought back in line with the code. §2 lists `ai.enrich` and `pipeline.finalize`, and its non-goals no longer rule out the model and the pipeline it builds. §3: the worker serves `/metrics`, calls seller URLs and the model. §6.2: any route may answer `400`, `401`, `429`, `413` or `415`, and `POST /jobs` and `POST /pipelines` `400 IDEMPOTENCY_KEY_RESERVED`; §6.3 gains the `ai.enrich` payload, §6.3e the pipeline's answer, and its timing a full store's. §10.1's module tree is the registered one: the guards in `AppModule`, in their order, and the metrics, throttler and enrichment modules. §10.4's recipe for a job type adds `AI_TYPES` and `UNFINISHED_CAPS`. §11: `process.env` is read through `ConfigService` but for the worker's processor options. §15.2's rate limits gain `POST /pipelines` and the two API-key routes. |
 | 2026-11-25 | §15.2 — review fixes, R.5: conventions. The JSON body limit is worked out from the batch and sku limits it follows (60 000 bytes, was a hand-set 64 KB). In the code, one home each for: which statuses are unfinished; whether a product's image or enrichment is about its current input, now used by the product view too; the rendered image format; a unique-key refusal; an outbox row's payload, now checked when read. Pipeline stage names are a type. The image sizes and format sit apart from the renderer, which the keys and the product view no longer import. The larger refactors the review proposed are listed in the plan, under Later. |
 | 2026-11-25 | §6.3a, §6.3d, §7.6, §7.9, §11, §12.1, §12.3, D32 — review fixes, R.4: the edges. `TRUST_PROXY=false` reads as unset, `TRUE` is refused like `true`, and an entry Express could not read is refused by name before the API starts — it used to pass and crash the boot. A client's `X-Request-Id` is kept only when it is up to 128 letters, digits and `_.:-`; it is stored on jobs and shown to their owner. An upload slip lasts 60 s, not 300: until it expires every `POST` of it stores the file again, and S3 checks the time when an upload starts, so a slow upload still finishes. The `expiresAt` of a slip and a download link is to the second, as S3 writes its own, so it is never later than S3's. The download guard allows IPv6 only in `2000::/3`, refusing `::/96`, which `ipaddr.js` calls unicast; a redirect to something that is not a URL fails for good; a host none of whose addresses answered is named by its error code, not an empty reason, and no network failure names an address. A busy service's hand-backs are free 20 times a delivery, then each counts as an attempt, and its owner is told the service was busy. The stranded-job sweep logs a row Postgres refuses to finish and goes on to the next; one such row stopped every sweep. |
 | 2026-11-25 | §4.7, §6.3b, §6.3c, §6.3d, §15.2, D32 — review fixes, R.3: images and storage. Each size is fitted inside a square, not bounded by width alone: a 1200 × 16 000 source made 13 MB a product in a folder that never expires, and now makes about 1.2 MB at worst. A store holds at most 5 000 products: an import writes a known sku always and a new one while there is room, counted under the account's lock, and reports a row past the limit as invalid, with its line, in the result and the error report. The bytes' format is checked as well as the header, so an SVG or TIFF under an image header is refused; `image/jpg`, `image/pjpeg` and `image/x-png` are accepted. A `FAILED` is never written over a `READY` for the same URL or text. `Product_imageError_only_on_failure` is written with `IS NOT DISTINCT FROM`, so it no longer passes on a NULL status. **New migration** `20261125110000_product_image_error_check`. |

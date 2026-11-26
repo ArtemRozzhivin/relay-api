@@ -160,7 +160,10 @@ export interface JobContext {
    */
   fanOut(batches: PipelineBatch[]): Promise<number>;
 
-  /** Writes one line tagged with the job, the attempt and the request that submitted it. */
+  /**
+   * Writes one line tagged with the job, the attempt and the id of the request
+   * that queued this delivery: the submit's, or a re-drive's after one (§12.1).
+   */
   log(message: string): void;
 }
 

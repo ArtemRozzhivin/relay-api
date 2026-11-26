@@ -7,8 +7,10 @@ const ACCOUNT_CAPS = 1;
 /**
  * Holds the account's lock until the transaction ends, so a count of what the
  * account has and the write that depends on it happen as one step (D32): two
- * requests that each see one free place cannot both take it. Other accounts
- * never wait on it. Commit or rollback releases it; there is no unlock.
+ * requests that each see one free place cannot both take it. Another account
+ * waits on it only when its id hashes to the same 32-bit key — rare, and for
+ * no longer than one count and write. Commit or rollback releases it; there is
+ * no unlock.
  *
  * Needs READ COMMITTED, Postgres's default: each statement after the lock
  * then sees what the previous holder committed. Under REPEATABLE READ the

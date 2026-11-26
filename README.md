@@ -14,6 +14,17 @@ those claims has a test that kills real processes to prove it.
 - **CSV catalog import.** The client uploads straight to S3 with a presigned POST, so the API never
   carries the file. The worker streams it into Postgres 500 rows at a time in flat memory, resumes
   from its last committed batch after a crash, and leaves a downloadable report of the bad rows.
+- **Product images.** The worker downloads each product's image from the seller's URL through a
+  guard that reaches only public addresses, so a URL cannot point it at the cloud metadata
+  service, and stores three WebP sizes in S3.
+- **AI enrichment.** A language model gives each product a category from a fixed list and some
+  tags, and every answer is checked before anything is written. The model sits behind one
+  interface; the one bound by default is a deterministic fake that needs no key and costs nothing.
+- **Pipelines.** `POST /pipelines` imports a catalog, fans out into enrichment and image batches,
+  and sums up what they did once the last one finishes.
+- **Limits per account.** Caps on unfinished jobs, one running pipeline, 5 000 products a store
+  and 20 uploads a day, so one account cannot fill the queues or the bucket for the others.
+- **API keys** for a seller's own scripts, with read and write scopes, and the reference at `/docs`.
 - **Live progress.** Status and progress reach the browser over Socket.IO, while `GET /jobs/:id`
   stays the source of truth a client reconciles with after a reconnect.
 
@@ -58,7 +69,9 @@ client ──HTTP──► API ──► Postgres: the Job and its Outbox row, i
                            │
                            ▼
                         worker ──► Postgres: status, progress, products
-                           │   └─► S3: reads uploads, writes error reports
+                           │   ├─► S3: reads uploads; writes error reports and product images
+                           │   ├─► the web: seller image URLs, through the guard (public only)
+                           │   └─► the language model (a built-in fake unless one is bound)
                            ▼
 client ◄─Socket.IO─ API ◄─Redis pub/sub─ job.updated
 ```

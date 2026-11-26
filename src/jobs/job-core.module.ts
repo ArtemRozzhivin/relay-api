@@ -21,7 +21,10 @@ import type { JobType } from './jobs.schema.js';
 // no handler a compile error, which is the one guarantee lost when the
 // processor's `switch (job.type)` went away. Adding a job type means adding an
 // option to the submit union — or, for one only the server writes, to `JobType`
-// — and an entry here. Nothing in src/worker/ changes.
+// — and an entry here. A type that calls the model also goes in `AI_TYPES`
+// (delivery/job-queue.ts), for the queue whose limiter a 429 pauses; one that
+// costs money or holds a shared queue gets a cap in `UNFINISHED_CAPS`
+// (api/unfinished-caps.ts, D32). Nothing in src/worker/ changes.
 const HANDLERS: Record<JobType, Type<RunnableJobHandler>> = {
   MOCK: MockJobHandler,
   CHARGE: ChargeJobHandler,
