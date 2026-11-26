@@ -185,7 +185,7 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
     });
 
     return checkReply(
-      reply.text,
+      reply,
       products.map(({ sku }) => sku),
     );
   }

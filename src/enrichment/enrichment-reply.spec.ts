@@ -11,7 +11,7 @@ const good = (sku: string) => ({
 
 // Every requested sku lands in exactly one of the two maps.
 const verdicts = (text: string, skus: string[]) => {
-  const { answers, problems } = checkReply(text, skus);
+  const { answers, problems } = checkReply({ text }, skus);
 
   return Object.fromEntries(
     skus.map((sku) => [
@@ -103,12 +103,27 @@ describe('checkReply', () => {
     });
   });
 
+  // What a declining model sends may still read as JSON; none of it counts.
+  it('answers no product of a reply the model declined', () => {
+    const { answers, problems } = checkReply(
+      { text: reply(good('A')), declined: 'general_harms' },
+      ['A', 'B'],
+    );
+
+    expect(answers.size).toBe(0);
+    expect(Object.fromEntries(problems)).toEqual({
+      A: 'The model declined to answer (general_harms)',
+      B: 'The model declined to answer (general_harms)',
+    });
+  });
+
   // An answer for another sku — or another account's — has no product of this
   // request to be written to.
   it('drops an item about a sku the request did not name', () => {
-    const { answers, problems } = checkReply(reply(good('A'), good('Z')), [
-      'A',
-    ]);
+    const { answers, problems } = checkReply(
+      { text: reply(good('A'), good('Z')) },
+      ['A'],
+    );
 
     expect([...answers.keys()]).toEqual(['A']);
     expect([...problems.keys()]).toEqual([]);

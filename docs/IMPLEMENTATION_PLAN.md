@@ -30,6 +30,7 @@ in a runnable, demonstrable state.
 - [x] **PD** · `ai.enrich`
 - [x] **PE** · Pipeline fan-out
 - [x] **PF** · API keys and public docs
+- [ ] **PJ** · A real model for `ai.enrich`
 - [ ] **PH** · Presentation — README, diagram, demo
 - [ ] **PI** · Billing
 
@@ -39,7 +40,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF ✓ → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF ✓ → PJ → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -591,6 +592,11 @@ Each step is motivated by the failure of the one before it.
   with a 500. Without CORS a browser's presigned POST is refused, though every script and test
   passes._
   ```
+- [ ] **11.9 · Decide what the deployed worker may spend on AI** (D33) — a daily AI budget per
+  account, counted from the cost each job records, before it gets a key; or it stays on the fake.
+  ```
+  _A key on a public server with no per-account limit lets any sign-up spend the owner's money._
+  ```
 
 ### Done when
 
@@ -924,6 +930,34 @@ partial failure as a first-class outcome.
 
 ---
 
+# PJ · A real model for `ai.enrich`
+
+**Goal:** a product's category and tags can come from a real model, so the demo shows real
+answers. Added 2026-11-26, ahead of M10: PD left the provider open and PI was its only home,
+after the demo (D33).
+**Spec:** §6.3d, §11, D33 · _Consumes: D33._
+
+### Tasks
+
+- [x] **J.1 ·** `ClaudeLlmProvider` behind `LlmProvider`, chosen by `LLM_PROVIDER` (`fake` by
+  default and in every test tier), `LLM_MODEL` (Sonnet 5.5 by default) and the worker's
+  `ANTHROPIC_API_KEY`. The reply held to a JSON schema and checked as before; a refusal fails
+  the batch's products with its reason; a 429 with `Retry-After` pauses the queue, and the SDK
+  retries nothing. The enrichment version raised, so every product is asked again.
+  ```
+  _The fake stays the default: no test, and no developer without a key, pays for a request._
+  ```
+- [ ] **J.2 · Asked for real** — `npm run test:live` passes with a real key, and a pipeline run by
+  the worker with `LLM_PROVIDER=claude` enriches a small catalog; the measured cost of a batch
+  replaces the estimate in D33 and the README.
+
+### Done when
+
+- [ ] A real model categorizes an imported catalog, end to end, with its cost on each job
+- [ ] No test tier can reach the real model, whatever `.env` says
+
+---
+
 # PH · Presentation
 
 - [ ] README: problem → architecture diagram → the reliability guarantees and the assertion that
@@ -958,8 +992,8 @@ Shape only, so the earlier phases leave room for it:
 - [ ] **AI spend per account.** Until this phase nothing limits it: the AI queue's 20 jobs a minute
   bound every account together, so one account can use all of it. Each job already records what
   its requests cost (`modelUsage`, D.6), which is what a plan's AI limit counts. Decided
-  2026-11-24 to wait for billing rather than add an interim cap — so a real, paid model is not
-  connected before it
+  2026-11-24 to wait for billing rather than add an interim cap; revised 2026-11-26 (D33): the
+  real model is built in PJ, and a public deployment gets a key only with a limit (M11.9)
 
 ### Done when
 

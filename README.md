@@ -18,8 +18,8 @@ those claims has a test that kills real processes to prove it.
   guard that reaches only public addresses, so a URL cannot point it at the cloud metadata
   service, and stores three WebP sizes in S3.
 - **AI enrichment.** A language model gives each product a category from a fixed list and some
-  tags, and every answer is checked before anything is written. The model sits behind one
-  interface; the one bound by default is a deterministic fake that needs no key and costs nothing.
+  tags, and every answer is checked before anything is written. The model is Claude when you give
+  the worker a key, and otherwise a deterministic fake that needs no key and costs nothing.
 - **Pipelines.** `POST /pipelines` imports a catalog, fans out into enrichment and image batches,
   and sums up what they did once the last one finishes.
 - **Limits per account.** Caps on unfinished jobs, one running pipeline, 5 000 products a store
@@ -71,7 +71,7 @@ client ──HTTP──► API ──► Postgres: the Job and its Outbox row, i
                         worker ──► Postgres: status, progress, products
                            │   ├─► S3: reads uploads; writes error reports and product images
                            │   ├─► the web: seller image URLs, through the guard (public only)
-                           │   └─► the language model (a built-in fake unless one is bound)
+                           │   └─► the language model: Claude, or a built-in fake
                            ▼
 client ◄─Socket.IO─ API ◄─Redis pub/sub─ job.updated
 ```
@@ -83,7 +83,7 @@ given up on matches no rows.
 ## Stack
 
 NestJS 12 (ESM) · TypeScript · Prisma 7 · PostgreSQL 17 · Redis 7 and BullMQ · AWS S3 · Socket.IO ·
-Zod · Vitest · GitHub Actions
+Zod · Claude API · Vitest · GitHub Actions
 
 ## Run it locally
 
@@ -114,6 +114,22 @@ register it, then run the line below and log in again; the role reaches the toke
 echo "UPDATE \"User\" SET role = 'ADMIN' WHERE email = 'you@example.com';" | npx prisma db execute --stdin
 ```
 
+## A real model for AI enrichment
+
+Enrichment uses the fake until you switch it on in `.env`:
+
+```bash
+LLM_PROVIDER=claude
+LLM_MODEL=claude-sonnet-5-5       # or claude-haiku-5-5, claude-opus-5-5
+ANTHROPIC_API_KEY=...             # from console.anthropic.com; the worker reads it
+```
+
+Every request is billed to that key: a full store of 5 000 products costs about $3 with Sonnet and
+$0.20 with Haiku. Set a spend limit on the key's account in the Anthropic Console. Nothing yet limits
+what one account of Relay's spends on AI, so a public deployment should not get a key until it does
+([D33](docs/TECH_SPEC.md#16-open-decisions-register)). `npm run test:live` asks the real model
+about three products, to check the key and the setup; it costs about a cent.
+
 ## Tests
 
 | Tier        | Command                    | What it covers                                                          |
@@ -122,7 +138,8 @@ echo "UPDATE \"User\" SET role = 'ADMIN' WHERE email = 'you@example.com';" | npx
 | Integration | `npm run test:integration` | The HTTP contract and the handlers, against real Postgres, Redis and S3 |
 | Assertions  | `npm run test:assertions`  | The guarantees above, with real API and worker processes; ~16 minutes   |
 
-CI runs all three on every pull request.
+CI runs all three on every pull request. They always use the fake model, whatever `.env` says.
+`npm run test:live` is the one that calls the real one, and only by hand.
 
 ## Documentation
 
