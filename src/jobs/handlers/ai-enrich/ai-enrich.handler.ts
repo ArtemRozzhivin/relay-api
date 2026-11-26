@@ -17,6 +17,7 @@ import {
   type Enrichment,
 } from '../../../enrichment/enrichment-reply.js';
 import { isEnrichedForCurrentText } from '../../../products/product-state.js';
+import { ProductTally } from '../product-tally.js';
 
 type Target = Awaited<ReturnType<ProductsService['forEnrichment']>>[number];
 
@@ -49,10 +50,12 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
     // from one request to the next, and naming the sku again is how its owner
     // asks.
     const todo = found.filter((product) => !isEnrichedForCurrentText(product));
+    const tally = new ProductTally(context.checkpoint, [
+      'enriched',
+      'failed',
+    ] as const);
 
-    let enriched = 0;
-    let failed = 0;
-    let superseded = 0;
+    let handled = 0;
 
     const record = async (
       product: Target,
@@ -60,31 +63,28 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
     ) => {
       // Recorded only while the product still has the text the model was
       // given; an import that changed it meanwhile wins.
-      const recorded =
-        'answer' in outcome
-          ? await this.products.recordEnrichmentReady(
-              context.userId,
-              product,
-              outcome.answer,
-            )
-          : await this.products.recordEnrichmentFailed(
-              context.userId,
-              product,
-              outcome.problem,
-            );
-
-      if (!recorded) {
-        superseded += 1;
-      } else if ('answer' in outcome) {
-        enriched += 1;
+      if ('answer' in outcome) {
+        await tally.conclude(context, product.id, 'enriched', (tx) =>
+          this.products.recordEnrichmentReady(
+            context.userId,
+            product,
+            outcome.answer,
+            tx,
+          ),
+        );
       } else {
-        failed += 1;
+        await tally.conclude(context, product.id, 'failed', (tx) =>
+          this.products.recordEnrichmentFailed(
+            context.userId,
+            product,
+            outcome.problem,
+            tx,
+          ),
+        );
       }
 
-      void context.reportProgress({
-        processed: enriched + failed + superseded,
-        total: todo.length,
-      });
+      handled += 1;
+      void context.reportProgress({ processed: handled, total: todo.length });
     };
 
     const first = await this.ask(context, todo);
@@ -119,10 +119,16 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
 
     return {
       requested: requested.length,
-      enriched,
-      failed,
-      superseded,
-      alreadyReady: found.length - todo.length,
+      // Across this job's attempts: a 429 on the corrective request runs the
+      // job again, and that run skips what the first answer recorded.
+      enriched: tally.count('enriched'),
+      failed: tally.count('failed'),
+      superseded: tally.count('superseded'),
+      // Ready before this job got to it — not by any attempt of its own.
+      alreadyReady: found.filter(
+        (product) =>
+          isEnrichedForCurrentText(product) && !tally.has(product.id),
+      ).length,
       notFound: requested.filter((sku) => !foundSkus.has(sku)),
     };
   }
@@ -179,7 +185,7 @@ export class AiEnrichJobHandler extends JobHandler<PayloadOf<'ai.enrich'>> {
     });
 
     return checkReply(
-      reply.text,
+      reply,
       products.map(({ sku }) => sku),
     );
   }

@@ -122,9 +122,11 @@ describe('A5e · SIGTERM hands a running job back without spending an attempt', 
     );
 
     expect(done).toMatchObject({ status: 'SUCCEEDED', attempts: 1 });
+    // One job's work across both workers: what the first made before the
+    // hand-back is counted as the job's, not as found ready.
     expect(done.result).toMatchObject({
-      processed: PRODUCTS - readyAtExit,
-      alreadyReady: readyAtExit,
+      processed: PRODUCTS,
+      alreadyReady: 0,
     });
     expect(await ready()).toBe(PRODUCTS);
   });

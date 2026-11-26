@@ -1,5 +1,7 @@
 import type { JobsOptions } from 'bullmq';
+import { z } from 'zod';
 import type { Job } from '../../generated/prisma/client.js';
+import type { JobType } from '../jobs.schema.js';
 
 export const JOBS_QUEUE = 'relay-jobs';
 
@@ -10,7 +12,9 @@ export const AI_QUEUE = 'relay-ai';
 
 export const QUEUES = [JOBS_QUEUE, AI_QUEUE] as const;
 
-const AI_TYPES: ReadonlySet<string> = new Set(['ai.enrich']);
+// Typed as job types, so a renamed type fails to compile rather than quietly
+// leaving the AI queue.
+const AI_TYPES: ReadonlySet<string> = new Set<JobType>(['ai.enrich']);
 
 /**
  * The queue a job of `type` is delivered through. Decided when the job's
@@ -25,11 +29,31 @@ export interface JobMessage {
   correlationId: string;
 }
 
+const outboxMessageSchema = z.object({
+  jobId: z.string(),
+  correlationId: z.string(),
+  maxAttempts: z.number().int().positive(),
+});
+
 /**
  * An outbox row's `payload`: the queue message, plus what the queue entry's
- * options need. Written by {@link outboxEntry}, read back by the relay.
+ * options need. Written by {@link outboxEntry}, read back by
+ * {@link readOutboxMessage}.
  */
-export type OutboxMessage = JobMessage & { maxAttempts: number };
+export type OutboxMessage = z.infer<typeof outboxMessageSchema>;
+
+/**
+ * An outbox row's `payload`, checked. The column is Json, so without the check
+ * its shape is only agreed: a field renamed in {@link OutboxMessage} would still
+ * compile, and every reader would read `undefined`.
+ *
+ * @returns `null` for a payload {@link outboxEntry} did not write.
+ */
+export const readOutboxMessage = (payload: unknown): OutboxMessage | null => {
+  const parsed = outboxMessageSchema.safeParse(payload);
+
+  return parsed.success ? parsed.data : null;
+};
 
 /**
  * The outbox row that delivers `job`. One shape for every message the outbox

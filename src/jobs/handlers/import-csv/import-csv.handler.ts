@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { pipeline } from 'node:stream/promises';
+import { pipeline as streamPipeline } from 'node:stream/promises';
 import { CsvError } from 'csv-parse';
 import { stringify } from 'csv-stringify';
 import { z } from 'zod';
@@ -10,6 +10,7 @@ import { TerminalJobError } from '../../../common/errors/app-error.js';
 import { StorageService } from '../../../storage/storage.service.js';
 import { errorReportKey, uploadPrefix } from '../../../storage/object-keys.js';
 import {
+  PRODUCTS_PER_ACCOUNT,
   ProductsService,
   type ProductRow,
 } from '../../../products/products.service.js';
@@ -43,6 +44,10 @@ const JUDGED_ROWS = 100;
 
 const REPORT_COLUMNS = ['line', 'reason', ...IMPORT_COLUMNS];
 
+// A valid row the store had no room for (D32): reported like an invalid one,
+// since either way the seller's row is not in the catalog.
+const OVER_LIMIT = `The store already holds the most products it can (${PRODUCTS_PER_ACCOUNT}); this row's sku would be another`;
+
 // How many of the file's skus a pipeline's import looks up at once: one query
 // for each, rather than one per product or one for the whole file.
 const LOOKUP_BATCH = 1000;
@@ -56,11 +61,22 @@ const checkpointSchema = z.object({
   records: count,
   imported: count,
   invalid: count,
+  // Of `invalid`, the rows refused for the store's limit: the report looks
+  // their skus up only when there are some.
+  overLimit: count.default(0),
   invalidSamples: z.array(z.object({ line: count, reason: z.string() })),
   etag: z.string().min(1),
 });
 
 type ImportCheckpoint = z.infer<typeof checkpointSchema>;
+
+/** A row of the file on its way to the error report. */
+interface Held {
+  row: Record<string, unknown>;
+  // Invalid, and why; or valid, with the sku to look up.
+  reason?: string;
+  sku?: string;
+}
 
 @Injectable()
 export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
@@ -94,8 +110,11 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
     let rows = 0;
     let imported = saved?.imported ?? 0;
     let invalid = saved?.invalid ?? 0;
-    const invalidSamples = [...(saved?.invalidSamples ?? [])];
+    let overLimit = saved?.overLimit ?? 0;
+    let invalidSamples = [...(saved?.invalidSamples ?? [])];
     let batch: ProductRow[] = [];
+    // Each batched row's line in the file, for a row the store has no room for.
+    let lines: number[] = [];
 
     if (resumeAfter > 0) {
       context.log(`resuming after record ${resumeAfter}`);
@@ -103,20 +122,45 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
     }
 
     const write = async () => {
-      const written = await context.commit(
-        (tx) => this.products.upsertBatch(context.userId, batch, tx),
-        (upserted): ImportCheckpoint => ({
-          records: rows,
-          imported: imported + upserted,
-          invalid,
-          // A copy: the array keeps growing after this batch commits.
-          invalidSamples: [...invalidSamples],
-          etag,
-        }),
+      // What the batch brings the totals to, worked out once for the
+      // checkpoint and the import alike.
+      const after = ({
+        written,
+        refused,
+      }: {
+        written: number;
+        refused: string[];
+      }) => {
+        const over = new Set(refused);
+        const refusedLines = batch.flatMap(({ sku }, index) =>
+          over.has(sku) ? [lines[index]!] : [],
+        );
+
+        return {
+          imported: imported + written,
+          invalid: invalid + refusedLines.length,
+          overLimit: overLimit + refusedLines.length,
+          invalidSamples: [
+            ...invalidSamples,
+            ...refusedLines.map((line) => ({ line, reason: OVER_LIMIT })),
+          ].slice(0, INVALID_SAMPLES),
+        };
+      };
+
+      const totals = after(
+        await context.commit(
+          (tx) => this.products.upsertWithinLimit(context.userId, batch, tx),
+          (outcome): ImportCheckpoint => ({
+            records: rows,
+            ...after(outcome),
+            etag,
+          }),
+        ),
       );
 
-      imported += written;
+      ({ imported, invalid, overLimit, invalidSamples } = totals);
       batch = [];
+      lines = [];
       void context.reportProgress({ processed: rows });
     };
 
@@ -135,7 +179,7 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       // A pipeline rather than .pipe(): when the loop stops early — a
       // cancellation, a failed write — every stage is destroyed, the S3
       // download included, instead of left open.
-      await pipeline(
+      await streamPipeline(
         file,
         parseFile(),
         nameColumns,
@@ -157,6 +201,7 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
 
             if (parsed.success) {
               batch.push(parsed.data);
+              lines.push(info.lines);
             } else {
               invalid += 1;
 
@@ -207,13 +252,20 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
     }
 
     if (invalid > 0) {
-      await this.writeReport(context, key, etag);
+      await this.writeReport(context, key, etag, overLimit > 0);
     }
 
     const result = { rows, imported, invalid, invalidSamples };
 
     if (context.pipelineId === null) {
       return result;
+    }
+
+    // Before the plan reads the file again: a cancel during the last batch
+    // came after the loop's last look. The fan-out refuses one that arrives
+    // while the plan is made.
+    if (await context.shouldStop()) {
+      throw new JobCancelledError();
     }
 
     // Last, after the report: a pipeline's batches are written once the
@@ -247,8 +299,31 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
   // resumed import never checked the rows before its checkpoint, and the report
   // must list those too. It reads, but writes nothing to the database, which is
   // where an import spends its time.
-  private async writeReport(context: JobContext, key: string, etag: string) {
+  //
+  // A row refused for the store's limit is found as the import left it: valid,
+  // with no product. Its sku is looked up only when the import refused some.
+  private async writeReport(
+    context: JobContext,
+    key: string,
+    etag: string,
+    refusedSome: boolean,
+  ) {
     const { body } = await this.open(key, etag);
+    const reportable = async (held: Held[]) => {
+      const skus = held.flatMap(({ sku }) => (sku === undefined ? [] : [sku]));
+      const known =
+        skus.length > 0
+          ? await this.products.knownSkus(context.userId, skus)
+          : new Set<string>();
+
+      return held.flatMap(({ row, sku, reason }) => {
+        if (reason !== undefined) {
+          return [{ ...row, reason }];
+        }
+
+        return known.has(sku!) ? [] : [{ ...row, reason: OVER_LIMIT }];
+      });
+    };
 
     const report = stringify({
       header: true,
@@ -275,22 +350,32 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       });
 
     await Promise.all([
-      pipeline(
+      streamPipeline(
         body,
         parseFile(),
         nameColumns,
         async function* (records: AsyncIterable<ParsedRecord>) {
+          // Rows wait here for their skus to be looked up together, so the
+          // report keeps the file's order.
+          let held: Held[] = [];
+
           for await (const { record, info } of records) {
             const parsed = csvRowSchema.safeParse(record);
+            const row = { ...record, line: info.lines };
 
             if (!parsed.success) {
-              yield {
-                ...record,
-                line: info.lines,
-                reason: describeInvalidRow(parsed.error),
-              };
+              held.push({ row, reason: describeInvalidRow(parsed.error) });
+            } else if (refusedSome) {
+              held.push({ row, sku: parsed.data.sku });
+            }
+
+            if (!refusedSome || held.length === LOOKUP_BATCH) {
+              yield* await reportable(held);
+              held = [];
             }
           }
+
+          yield* await reportable(held);
         },
         report,
       ),
@@ -326,7 +411,7 @@ export class ImportCsvJobHandler extends JobHandler<PayloadOf<'import.csv'>> {
       unread = [];
     };
 
-    await pipeline(
+    await streamPipeline(
       body,
       parseFile(),
       nameColumns,

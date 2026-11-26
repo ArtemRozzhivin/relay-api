@@ -27,9 +27,10 @@ in a runnable, demonstrable state.
 - [x] **PA** · Handler registry, progress, cancellation
 - [x] **PB** · Object storage, `Product` domain, `import.csv`
 - [x] **PC** · `image.process`
-- [ ] **PD** · `ai.enrich`
-- [ ] **PE** · Pipeline fan-out
-- [ ] **PF** · API keys and public docs
+- [x] **PD** · `ai.enrich`
+- [x] **PE** · Pipeline fan-out
+- [x] **PF** · API keys and public docs
+- [ ] **PJ** · A real model for `ai.enrich`
 - [ ] **PH** · Presentation — README, diagram, demo
 - [ ] **PI** · Billing
 
@@ -39,7 +40,7 @@ M1–M11 are the engine; PA–PI are the product built on it. They are lettered,
 because **they do not run in numeric order**:
 
 ```
-M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF ✓ → M10 → M11 → PH → PI
+M7 ✓ → M9 ✓ → PA ✓ → PB ✓ → PC ✓ → M8 ✓ → PD ✓ → PE ✓ → PF ✓ → PJ → M10 → M11 → PH → PI
 ```
 
 M9 comes before PA because PA–PE add roughly twenty acceptance criteria and the suite already
@@ -508,11 +509,14 @@ Each step is motivated by the failure of the one before it.
 
 ### Tasks
 
-- [ ] **10.1 · Fix numeric targets first** — p95 submit latency, throughput, max queue depth, drain time.
+- [x] **10.1 · Fix numeric targets first** — p95 submit latency, throughput, max queue depth, drain time.
+  Written in §15.3 with the box they hold on and the four scenarios they are measured in.
   ```
   _A target chosen after seeing the result is not a target._
   ```
-- [ ] **10.2 · k6 scenarios** — sustained submit, burst, and a mixed job-type profile.
+- [ ] **10.2 · k6 scenarios** — sustained submit, burst, and a mixed job-type profile, on the box
+  (§15.3): the API, two workers and Redis on two pinned cores and 4 GB, from 11.1's Dockerfile,
+  built here so what is measured is what ships.
   ```
   _Different shapes expose different bottlenecks._
   ```
@@ -557,6 +561,7 @@ Each step is motivated by the failure of the one before it.
 ### Tasks
 
 - [ ] **11.1 · Multi-stage Dockerfile**, non-root user, config from the environment only.
+  Built in M10 (10.2), for the box the load runs on; here it ships.
   ```
   _One image runs in any environment; nothing baked in._
   ```
@@ -590,6 +595,16 @@ Each step is motivated by the failure of the one before it.
   _Without ListBucket a missing key answers 403, and a submit naming an expired upload fails
   with a 500. Without CORS a browser's presigned POST is refused, though every script and test
   passes._
+  ```
+- [ ] **11.9 · Decide what the deployed worker may spend on AI** (D33) — a daily AI budget per
+  account, counted from the cost each job records, before it gets a key; or it stays on the fake.
+  ```
+  _A key on a public server with no per-account limit lets any sign-up spend the owner's money._
+  ```
+- [ ] **11.10 · Run A18 once on the VPS** — image batches on the real host's cores, where M10's box
+  only stood in for them (D10, §15.3).
+  ```
+  _Two pinned cores in a laptop's VM are a model of a 2-vCPU server, not one._
   ```
 
 ### Done when
@@ -869,7 +884,8 @@ partial failure as a first-class outcome.
   children would bypass the outbox. Minting the key server-side also means
   `UNIQUE (userId, idempotencyKey)` makes the fan-out itself idempotent, for free._
   ```
-- [x] **E.3 · The parent is enqueued by the transaction that takes** `pendingChildren` **to zero.**
+- [x] **E.3 · The parent is written, with its outbox row, by the transaction that takes**
+  `pendingChildren` **to zero.**
   Every finish of a pipeline's job leaves its place in its own transaction; the one that reaches
   zero writes `pipeline.finalize`, which sets the status and summary once. A24 stops both
   processes around the last batch's commit and proves the relay still delivers the parent.
@@ -923,6 +939,37 @@ partial failure as a first-class outcome.
 
 ---
 
+# PJ · A real model for `ai.enrich`
+
+**Goal:** a product's category and tags can come from a real model, so the demo shows real
+answers. Added 2026-11-26, ahead of M10: PD left the provider open and PI was its only home,
+after the demo (D33).
+**Spec:** §6.3d, §11, D33 · _Consumes: D33._
+
+### Tasks
+
+- [x] **J.1 ·** `ClaudeLlmProvider` behind `LlmProvider`, chosen by `LLM_PROVIDER` (`fake` by
+  default and in every test tier), `LLM_MODEL` (Sonnet 5.5 by default) and the worker's
+  `ANTHROPIC_API_KEY`. The reply held to a JSON schema and checked as before; a refusal fails
+  the batch's products with its reason; a 429 with `Retry-After` pauses the queue, and the SDK
+  retries nothing. The enrichment version raised, so every product is asked again.
+  ```
+  _The fake stays the default: no test, and no developer without a key, pays for a request._
+  ```
+- [x] **J.2 · Asked for real** — `npm run test:live` passes with a real key, and a pipeline run by
+  the worker with `LLM_PROVIDER=claude` enriches a small catalog; the measured cost of a batch
+  replaces the estimate in D33 and the README.
+  ```
+  _24 products, 2 batches, every category as expected: $0.017 on Sonnet 5.5, 6.5 s for 20._
+  ```
+
+### Done when
+
+- [x] A real model categorizes an imported catalog, end to end, with its cost on each job
+- [x] No test tier can reach the real model, whatever `.env` says
+
+---
+
 # PH · Presentation
 
 - [ ] README: problem → architecture diagram → the reliability guarantees and the assertion that
@@ -957,11 +1004,44 @@ Shape only, so the earlier phases leave room for it:
 - [ ] **AI spend per account.** Until this phase nothing limits it: the AI queue's 20 jobs a minute
   bound every account together, so one account can use all of it. Each job already records what
   its requests cost (`modelUsage`, D.6), which is what a plan's AI limit counts. Decided
-  2026-11-24 to wait for billing rather than add an interim cap — so a real, paid model is not
-  connected before it
+  2026-11-24 to wait for billing rather than add an interim cap; revised 2026-11-26 (D33): the
+  real model is built in PJ, and a public deployment gets a key only with a limit (M11.9)
 
 ### Done when
 
 - [ ] The same webhook delivered twice changes state once; out-of-order events still converge
 - [ ] Two parallel imports near the limit never exceed it in total
 - [ ] Access is never granted without a verified webhook
+
+# Later · What the review fixes parked
+
+The review of PC–PE (2026-11-24) proposed these too. Each is sound, and none is a bug: they make
+the code easier to change, at the cost of a change wide enough to deserve its own branch and test
+pass. Listed so they are not lost; R.5 did the small ones.
+
+- [ ] **One accept flow for a submit and a pipeline.** `PipelinesService.start` copies `submit`'s
+  upload check and its replay on a taken idempotency key, and injects `JobsService` only for
+  `publishNow`. Extract `isOwnUpload` beside the upload keys, and `publishNow` into a publisher in
+  `jobs/delivery/` that both services inject
+- [ ] **One owner of the `Pipeline` row.** The finalize handler is the only handler given
+  `PrismaService`, and writes the pipeline's final status itself while `JobTransitionService` writes
+  its counter. Move the finalize read and write beside `leavePipeline`
+- [ ] **One list of queues.** It is kept in five places: `QUEUES`, `JobQueues`, and
+  `BullModule.registerQueue` and the providers in both root modules. A `JobDeliveryModule` built
+  from `QUEUES`, imported by both roots
+- [ ] **`JobsProcessor.run()` split by outcome.** About 250 lines, one `catch` holding the
+  cancellation, the shutdown hand-back, the rate limit and the failure. Private methods that each
+  return the attempt's outcome
+- [ ] **Shared test setup.** Some 15 specs copy a register-and-clean-up wrapper, and three the
+  upload of a CSV through a slip. A tracked-accounts helper and `uploadCsv` in `test/support`,
+  which would also delete the accounts the harness creates — it deletes none today
+- [ ] **The product status columns as an enum.** `imageStatus` and `enrichmentStatus` are text with
+  a `CHECK`, every other status a Prisma enum. The code now types them as `Conclusion`; the enum
+  is a migration
+- [ ] **One way to read an import's file.** `import.csv` opens the upload and pipes it through the
+  parser in three places that differ only in what consumes the rows
+- [ ] **One formatter of Zod issues**, for a model's reply and an import's row alike
+- [ ] **A18 to prove the batches ran at once.** It shows none stalled, not that two overlapped
+- [ ] **A14's eleven claims.** Twice on 2026-11-25 the import was claimed 11 times in a second
+  with one queue delivery in Redis, then passed seven runs in a row on a clean database. Not
+  explained; look again if CI shows it

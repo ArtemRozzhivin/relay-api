@@ -5,18 +5,19 @@ import type { INestApplication } from '@nestjs/common';
 import type { Server } from 'node:http';
 import request from 'supertest';
 import { PrismaService } from '../../src/prisma/prisma.service.js';
-import { lockAccount } from '../../src/prisma/account-lock.js';
 import { StorageService } from '../../src/storage/storage.service.js';
 import type { Prisma } from '../../src/generated/prisma/client.js';
 import type { JobStatus } from '../../src/generated/prisma/enums.js';
 import { postUploadForm } from '../support/upload-form.js';
 import { registerAndLogin, startApp } from '../support/http.js';
-import { deleteUsers } from '../support/db.js';
+import { deleteUsers, seedPipeline } from '../support/db.js';
+import { whileLastPlaceIsTaken } from '../support/account-lock.js';
 
 // The documented numbers (§15.2), not the constants that hold them: a client
 // is told these, so changing one is changing the contract.
 const IMPORTS = 3;
 const IMAGE_BATCHES = 50;
+const AI_BATCHES = 10;
 const UPLOAD_SLIPS_PER_DAY = 20;
 
 // Caps are filled with seeded rows wherever the test needs them to stay full:
@@ -55,7 +56,15 @@ describe('per-account caps', () => {
     {
       status = 'QUEUED',
       finishedAt,
-    }: { status?: JobStatus; finishedAt?: Date } = {},
+      pipelineId,
+      holding = pipelineId !== undefined,
+    }: {
+      status?: JobStatus;
+      finishedAt?: Date;
+      /** Batches of this pipeline, holding their place in it unless told not. */
+      pipelineId?: string;
+      holding?: boolean;
+    } = {},
   ) =>
     prisma.job.createManyAndReturn({
       data: Array.from({ length: count }, () => ({
@@ -63,6 +72,8 @@ describe('per-account caps', () => {
         type,
         payload: {},
         status,
+        pipelineId,
+        pendingInPipeline: holding,
         // A job has a finishedAt exactly when it is finished (a CHECK).
         finishedAt:
           finishedAt ??
@@ -121,66 +132,6 @@ describe('per-account caps', () => {
     expect(res.body.error.code).toBe('TOO_MANY_UNFINISHED_JOBS');
     // Nothing here knows when one of the account's jobs will finish.
     expect(res.headers['retry-after']).toBeUndefined();
-  };
-
-  // Whether some connection is waiting on a lock the backend `pid` holds,
-  // asked until one is or the time runs out.
-  const blockedBehind = async (pid: number) => {
-    const deadline = Date.now() + 3_000;
-
-    while (Date.now() < deadline) {
-      const [{ waiting }] = await prisma.$queryRaw<{ waiting: number }[]>`
-        SELECT count(*)::int AS waiting FROM pg_stat_activity
-        WHERE ${pid}::int = ANY (pg_blocking_pids(pid))`;
-
-      if (waiting > 0) {
-        return true;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-
-    return false;
-  };
-
-  // A cap is a count and then a write, and two requests that overlap between
-  // them could both take one free place. Fired together over HTTP they never
-  // overlap — each transaction lasts a couple of milliseconds — so the test
-  // plays the other request itself: it takes the account's lock, fills the
-  // last place, and holds its transaction open while `send` makes the request
-  // under test. That request must be seen waiting behind it — the only thing
-  // the two share is the lock — and, let through, must find the place taken.
-  const whileLastPlaceIsTaken = async <T>(
-    userId: string,
-    fill: (tx: Prisma.TransactionClient) => Promise<unknown>,
-    send: () => Promise<T>,
-  ) => {
-    let filled!: (pid: number) => void;
-    let release!: () => void;
-    const placeFilled = new Promise<number>((resolve) => (filled = resolve));
-    const released = new Promise<void>((resolve) => (release = resolve));
-
-    const other = prisma.$transaction(
-      async (tx) => {
-        await lockAccount(tx, userId);
-        const [{ pid }] = await tx.$queryRaw<{ pid: number }[]>`
-          SELECT pg_backend_pid() AS pid`;
-        await fill(tx);
-        filled(pid);
-        await released;
-      },
-      { timeout: 10_000 },
-    );
-
-    const holder = await placeFilled;
-    const answer = send();
-    const waited = await blockedBehind(holder);
-    release();
-    await other;
-
-    expect(waited, 'the request never waited for the account lock').toBe(true);
-
-    return answer;
   };
 
   const unfinishedRow = (userId: string, type: string) => ({
@@ -287,11 +238,57 @@ describe('per-account caps', () => {
       );
     });
 
+    it(`refuses an enrichment past ${AI_BATCHES} unfinished`, async () => {
+      const { token, userId } = await register('enrich');
+      await seed(userId, 'ai.enrich', AI_BATCHES);
+
+      expectCapped(
+        await submit(token, { type: 'ai.enrich', payload: { skus: ['A-1'] } }),
+      );
+    });
+
+    // A pipeline is limited as a whole (§6.3e). Counting its batches would
+    // refuse the owner's own work until a large catalog drained.
+    it("counts no pipeline's batch still holding its place", async () => {
+      const { token, userId } = await register('pipeline-held');
+      const { id: pipelineId } = await seedPipeline(prisma, { userId });
+      await seed(userId, 'image.process', IMAGE_BATCHES + 10, { pipelineId });
+      await seed(userId, 'ai.enrich', AI_BATCHES + 10, { pipelineId });
+
+      await submit(token, {
+        type: 'image.process',
+        payload: { skus: ['A-1'] },
+      }).expect(202);
+      await submit(token, {
+        type: 'ai.enrich',
+        payload: { skus: ['A-1'] },
+      }).expect(202);
+    });
+
+    // Its first finish gave its place up: from then on it is the owner's to
+    // re-drive, and counts like any job.
+    it("counts a pipeline's batch re-driven after its first finish", async () => {
+      const { token, userId } = await register('pipeline-redriven');
+      const { id: pipelineId } = await seedPipeline(prisma, { userId });
+      await seed(userId, 'image.process', IMAGE_BATCHES, {
+        pipelineId,
+        holding: false,
+      });
+
+      expectCapped(
+        await submit(token, {
+          type: 'image.process',
+          payload: { skus: ['A-1'] },
+        }),
+      );
+    });
+
     it('waits for a request taking the last place, then refuses', async () => {
       const { token, userId } = await register('race');
       await seed(userId, 'image.process', IMAGE_BATCHES - 1);
 
       const answer = await whileLastPlaceIsTaken(
+        prisma,
         userId,
         (tx) => tx.job.create({ data: unfinishedRow(userId, 'image.process') }),
         async () =>
@@ -325,6 +322,34 @@ describe('per-account caps', () => {
       await redrive(first!.id).expect(202);
       expectCapped(await redrive(second!.id));
       expect(await statusOf(second!.id)).toBe('DEAD_LETTERED');
+    });
+
+    // A22's re-drive, with the rest of its pipeline still queued: the review
+    // found it refused while 50 of the pipeline's image batches waited.
+    it("re-drives a pipeline's failed batch while its siblings hold their places", async () => {
+      const { token, userId } = await register('redrive-pipeline');
+      const { id: pipelineId } = await seedPipeline(prisma, { userId });
+      await seed(userId, 'image.process', IMAGE_BATCHES + 10, { pipelineId });
+      const [one, other] = await seed(userId, 'image.process', 2, {
+        status: 'DEAD_LETTERED',
+        finishedAt: died(5),
+        pipelineId,
+        holding: false,
+      });
+
+      await request(server)
+        .post(`/jobs/${one!.id}/retry`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(202);
+
+      const { body } = await request(server)
+        .post('/jobs/retry')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ type: 'image.process', errorCode: 'ATTEMPTS_EXHAUSTED' })
+        .expect(202);
+
+      expect(body.data).toEqual({ redriven: 1, remaining: 0 });
+      expect(await statusOf(other!.id)).toBe('QUEUED');
     });
 
     it('brings back in bulk only as many as there is room for', async () => {
@@ -392,7 +417,7 @@ describe('per-account caps', () => {
         tx.job.create({ data: unfinishedRow(userId, 'import.csv') });
 
       expectCapped(
-        await whileLastPlaceIsTaken(userId, fill, async () =>
+        await whileLastPlaceIsTaken(prisma, userId, fill, async () =>
           request(server)
             .post(`/jobs/${dead!.id}/retry`)
             .set('Authorization', `Bearer ${token}`),
@@ -404,7 +429,7 @@ describe('per-account caps', () => {
         data: { status: 'CANCELLED', finishedAt: new Date() },
       });
 
-      const bulk = await whileLastPlaceIsTaken(userId, fill, async () =>
+      const bulk = await whileLastPlaceIsTaken(prisma, userId, fill, async () =>
         request(server)
           .post('/jobs/retry')
           .set('Authorization', `Bearer ${token}`)
@@ -473,6 +498,7 @@ describe('per-account caps', () => {
       });
 
       const answer = await whileLastPlaceIsTaken(
+        prisma,
         userId,
         (tx) => tx.uploadSlip.create({ data: slipRow() }),
         async () => slip(token),

@@ -21,6 +21,11 @@ export interface LlmReply {
   text: string;
   tokensIn: number;
   tokensOut: number;
+  /**
+   * Set when the model declined to answer, to the reason the provider gave.
+   * A refusal is paid for like an answer, and answers no product.
+   */
+  declined?: string;
 }
 
 /** What a model charges, in US dollars per million tokens each way. */
@@ -50,9 +55,7 @@ export const estimateCostUsd = (
  * the job is retried until its attempts are spent.
  */
 export interface LlmProvider {
-  readonly model: string;
-
-  /** What {@link model} charges, which each job's estimated cost uses. */
+  /** What the model charges, which each job's estimated cost uses. */
   readonly price: ModelPrice;
 
   enrich(request: LlmRequest): Promise<LlmReply>;

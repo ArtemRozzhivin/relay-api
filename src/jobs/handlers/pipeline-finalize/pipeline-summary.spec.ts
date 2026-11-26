@@ -72,13 +72,13 @@ describe('finalStatus', () => {
     [true, 0, 'COMPLETED'],
     [true, 1, 'COMPLETED_WITH_ERRORS'],
     [false, 1, 'FAILED'],
-    // Whatever the count: without its import, nothing else in the pipeline
-    // had a file to come from.
+    // Whatever the count: without the import's batches, nothing else in the
+    // pipeline had a file to come from.
     [false, 0, 'FAILED'],
   ] as const)(
-    'import succeeded %s, %i failed first finishes: %s',
-    (importSucceeded, failedChildren, status) => {
-      expect(finalStatus(importSucceeded, failedChildren)).toBe(status);
+    'batches written %s, %i failed first finishes: %s',
+    (fannedOut, failedChildren, status) => {
+      expect(finalStatus(fannedOut, failedChildren)).toBe(status);
     },
   );
 });

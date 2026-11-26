@@ -1,9 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { Prisma } from '../../../generated/prisma/client.js';
 import { JobHandler } from '../../engine/job-handler.js';
 import type { JobContext } from '../../engine/job-context.js';
 import { chargePayloadSchema, type PayloadOf } from '../../jobs.schema.js';
+import { isUniqueViolation } from '../../../prisma/unique-violation.js';
 
 @Injectable()
 export class ChargeJobHandler extends JobHandler<PayloadOf<'CHARGE'>> {
@@ -40,10 +40,7 @@ export class ChargeJobHandler extends JobHandler<PayloadOf<'CHARGE'>> {
       // concurrent redelivery would pass that read and charge twice. Losing
       // the insert proves the charge already happened, so report success
       // without performing it again.
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
+      if (isUniqueViolation(error)) {
         return {
           charged: payload.amountCents,
           reference: payload.reference,

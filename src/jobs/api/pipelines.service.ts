@@ -1,10 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
-import { Prisma, type Pipeline } from '../../generated/prisma/client.js';
+import type { Pipeline } from '../../generated/prisma/client.js';
 import type { JobStatus } from '../../generated/prisma/enums.js';
 import {
   IdempotencyKeyReusedError,
   PipelineNotFoundError,
+  TooManyRunningPipelinesError,
   UploadNotFoundError,
 } from '../../common/errors/app-error.js';
 import { StorageService } from '../../storage/storage.service.js';
@@ -16,6 +17,7 @@ import type { StartPipelineInput } from '../jobs.schema.js';
 import { JobsService } from './jobs.service.js';
 import { requestHash } from './request-hash.js';
 import { assertUnderCap } from './unfinished-caps.js';
+import { isUniqueViolation } from '../../prisma/unique-violation.js';
 
 interface StartArgs {
   userId: string;
@@ -45,6 +47,8 @@ export class PipelinesService {
    * @throws TooManyUnfinishedJobsError (429) when the caller already has as many
    * unfinished imports as it may (D32). A replay is answered as one all the
    * same.
+   * @throws TooManyRunningPipelinesError (429) when another of the caller's
+   * pipelines is still running.
    */
   async start({ userId, idempotencyKey, correlationId, input }: StartArgs) {
     await this.checkUpload(userId, idempotencyKey, input.key);
@@ -77,6 +81,17 @@ export class PipelinesService {
 
         await assertUnderCap(tx, userId, job.type);
 
+        // One at a time (D32): its batches count against no cap, so the
+        // pipeline as a whole is what is limited. Counted after the write, as
+        // the caps are, so the count includes this one.
+        const running = await tx.pipeline.count({
+          where: { userId, status: 'RUNNING' },
+        });
+
+        if (running > 1) {
+          throw new TooManyRunningPipelinesError();
+        }
+
         const outbox = await tx.outbox.create({
           data: outboxEntry(job, correlationId),
         });
@@ -84,10 +99,7 @@ export class PipelinesService {
         return { pipeline, job, outboxId: outbox.id };
       });
     } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
+      if (isUniqueViolation(error)) {
         const existing = await this.prisma.pipeline.findUniqueOrThrow({
           where: { userId_idempotencyKey: { userId, idempotencyKey } },
         });
@@ -159,11 +171,13 @@ export class PipelinesService {
   // each status, which is how it follows a run and finds a failed batch. The
   // fingerprint and the counters are not part of it: the counters count first
   // outcomes, which a re-drive leaves behind, and would read as a contradiction
-  // of the statuses beside them.
+  // of the statuses beside them. Nor is the fan-out's moment, which the status
+  // already says all a client needs of.
   private async describe({
     requestHash: _requestHash,
     pendingChildren: _pendingChildren,
     failedChildren: _failedChildren,
+    fannedOutAt: _fannedOutAt,
     ...pipeline
   }: Pipeline) {
     const [importJob, counted] = await Promise.all([

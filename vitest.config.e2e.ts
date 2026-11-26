@@ -7,9 +7,13 @@ export default defineConfig({
     globals: true,
     root: './',
     include: ['test/integration/**/*.e2e-spec.ts'],
-    // Every file registers its accounts from one address, far past the
-    // limits; the files that test the limits switch them back on.
-    env: { RATE_LIMITS: 'false' },
+    env: {
+      // Every file registers its accounts from one address, far past the
+      // limits; the files that test the limits switch them back on.
+      RATE_LIMITS: 'false',
+      // Whatever .env names: no test pays for a request to a model.
+      LLM_PROVIDER: 'fake',
+    },
     fileParallelism: false,
     testTimeout: 60_000,
     hookTimeout: 60_000,

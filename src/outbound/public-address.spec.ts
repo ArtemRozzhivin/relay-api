@@ -19,15 +19,21 @@ describe('isPublicAddress', () => {
     ['::ffff:169.254.169.254', 'the metadata service inside an IPv6 address'],
     ['64:ff9b::7f00:1', 'NAT64 of 127.0.0.1'],
     ['2002:7f00:1::', '6to4 of 127.0.0.1'],
+    ['::7f00:1', 'IPv4-compatible 127.0.0.1, which ipaddr.js calls unicast'],
+    ['::a9fe:a9fe', 'the metadata service, IPv4-compatible'],
+    ['4000::1', 'IPv6 outside the block public addresses come from'],
     ['not-an-address', 'not an address at all'],
   ])('refuses %s (%s)', (address) => {
     expect(isPublicAddress(address)).toBe(false);
   });
 
-  it.each(['8.8.8.8', '52.219.170.1', '2606:4700:4700::1111'])(
-    'allows %s, a public address',
-    (address) => {
-      expect(isPublicAddress(address)).toBe(true);
-    },
-  );
+  it.each([
+    '8.8.8.8',
+    '52.219.170.1',
+    '2606:4700:4700::1111',
+    '2a00:1450:4001:80b::200e',
+    '2001:4860:4860::8888',
+  ])('allows %s, a public address', (address) => {
+    expect(isPublicAddress(address)).toBe(true);
+  });
 });

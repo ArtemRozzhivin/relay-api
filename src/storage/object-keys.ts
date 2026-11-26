@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { RENDERED_FORMAT } from '../images/image-output.js';
 
 // Every key the bucket holds is built here, each under its account's id, so
 // what belongs to whom is readable from the key alone.
@@ -41,7 +42,7 @@ export const productImageKey = (
   sourceUrl: string,
   size: string,
 ) =>
-  `${productImagesPrefix(userId)}${productId}/${imageSourceHash(sourceUrl)}/${size}.webp`;
+  `${productImagesPrefix(userId)}${productId}/${imageSourceHash(sourceUrl)}/${size}.${RENDERED_FORMAT.extension}`;
 
 const PRODUCT_IMAGE_KEY =
   /^products\/([0-9a-f-]{36})\/([0-9a-f-]{36})\/([0-9a-f]{16})\/[^/]+$/;

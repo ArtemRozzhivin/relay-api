@@ -12,8 +12,8 @@ import type { AttemptFailedError, DeadLetterError } from './job-error-codes.js';
 import type { ModelUsage, PipelineBatch } from './job-context.js';
 import { outboxEntry } from '../delivery/job-queue.js';
 import { pipelineKey } from './pipeline-keys.js';
-
-const NOT_FINISHED: JobStatus[] = ['QUEUED', 'RUNNING'];
+import { UNFINISHED_STATUSES } from './job-statuses.js';
+import { chunked } from '../../common/collections/chunked.js';
 
 const FINISHED: ReadonlySet<unknown> = new Set<JobStatus>([
   'SUCCEEDED',
@@ -173,7 +173,7 @@ export class JobTransitionService {
   }
 
   claim(jobId: string) {
-    return this.move(jobId, NOT_FINISHED, {
+    return this.move(jobId, UNFINISHED_STATUSES, {
       status: 'RUNNING',
       attempts: { increment: 1 },
       lease: { increment: 1 },
@@ -232,7 +232,7 @@ export class JobTransitionService {
   abandon(jobId: string, error: DeadLetterError) {
     return this.move(
       jobId,
-      NOT_FINISHED,
+      UNFINISHED_STATUSES,
       { status: 'DEAD_LETTERED', error, finishedAt: new Date() },
       { where: { attempts: { gt: 0 } } },
     );
@@ -313,10 +313,20 @@ export class JobTransitionService {
    * unfinished states, so a job bouncing between them — a retry moves `RUNNING`
    * back to `QUEUED` — cannot slip between two checks and lose the request.
    *
-   * @returns the row as written, or `null` when the job had already finished.
+   * Never on `pipeline.finalize`: it is what finishes its pipeline, and its key
+   * stops a second one being written (§6.3e). The flag is what every cancel
+   * after this one requires, so refusing it here refuses them all.
+   *
+   * @returns the row as written, or `null` when the job had already finished
+   * or is a pipeline's finalize.
    */
   requestCancel(jobId: string) {
-    return this.move(jobId, NOT_FINISHED, { cancelRequested: true });
+    return this.move(
+      jobId,
+      UNFINISHED_STATUSES,
+      { cancelRequested: true },
+      { where: { type: { not: 'pipeline.finalize' } } },
+    );
   }
 
   /**
@@ -350,7 +360,7 @@ export class JobTransitionService {
   cancelBeforeClaim(jobId: string) {
     return this.move(
       jobId,
-      NOT_FINISHED,
+      UNFINISHED_STATUSES,
       { status: 'CANCELLED', finishedAt: new Date() },
       { where: { cancelRequested: true, effectCommitted: false } },
     );
@@ -511,8 +521,13 @@ export class JobTransitionService {
    * this read waits for it. Either way the counter is never raised for a
    * pipeline whose last place has just been given up.
    *
+   * Refused once the job's owner has asked it to stop: until this commits the
+   * import has written nothing a cancel would leave behind, and a cancel that
+   * arrives after it waits for the lock, and finds the batches written.
+   *
    * @returns how many batches were written, and whether the job held its place
-   * at all; `null` when this attempt no longer owns the job.
+   * at all; `null` when this attempt no longer owns the job or has been asked
+   * to stop.
    */
   fanOut(jobId: string, lease: number, batches: PipelineBatch[]) {
     return this.prisma.$transaction(
@@ -521,6 +536,7 @@ export class JobTransitionService {
           SELECT "userId", "correlationId", "pipelineId", "pendingInPipeline"
           FROM "Job"
           WHERE "id" = ${jobId}::uuid AND "status" = 'RUNNING' AND "lease" = ${lease}
+            AND NOT "cancelRequested"
           FOR SHARE`;
 
         if (!job) {
@@ -552,11 +568,11 @@ export class JobTransitionService {
 
         let written = 0;
 
-        for (let start = 0; start < rows.length; start += INSERT_CHUNK) {
+        for (const chunk of chunked(rows, INSERT_CHUNK)) {
           // A batch an earlier attempt wrote is skipped, not returned, so only
           // the new ones get an outbox row and a place in the counter.
           const created = await tx.job.createManyAndReturn({
-            data: rows.slice(start, start + INSERT_CHUNK),
+            data: chunk,
             skipDuplicates: true,
             select: { id: true, type: true, maxAttempts: true },
           });
@@ -576,6 +592,13 @@ export class JobTransitionService {
             data: { pendingChildren: { increment: written } },
           });
         }
+
+        // Even when nothing needed a batch: every one the import plans exists.
+        // Stamped once, by the fan-out that wrote them; a retry's finds it set.
+        await tx.pipeline.updateMany({
+          where: { id: pipelineId, fannedOutAt: null },
+          data: { fannedOutAt: new Date() },
+        });
 
         return { holding: true, written };
       },

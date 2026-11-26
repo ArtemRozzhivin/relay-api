@@ -70,11 +70,14 @@ export interface RunnableJobHandler {
  *   needs its own guard (§7.1).
  * - Its return value is stored as `Job.result` and returned to the job's owner,
  *   so it must be JSON-serialisable and must hold nothing the owner may not see.
- * - Throwing `Error` means retry. Throwing `TerminalJobError` means dead-letter
+ * - Throwing `Error` means retry, its message kept from the owner, who is
+ *   shown where the log has it; throw `RetryableJobError` when the message is
+ *   written for them (§7.7). Throwing `TerminalJobError` means dead-letter
  *   now, without spending the remaining attempts. Throwing `JobCancelledError`
  *   means "I was asked to stop, and stopped somewhere safe". Throwing
  *   `JobRateLimitedError` means "a service I call is busy for this long", and
- *   the whole run happens again after it, from the start.
+ *   the whole run happens again after it, from the start — uncounted the
+ *   first 20 times a delivery, then as an attempt.
  * - A handler that does its work in batches should call `context.shouldStop()`
  *   between them — never in the middle of one, so a stopped job leaves no
  *   batch half applied. A handler with a single atomic effect need not call it

@@ -50,9 +50,11 @@ describe('uploads', () => {
   it("signs an upload to a key under the caller's own prefix", async () => {
     const { token, userId } = await register('prefix');
 
+    const before = Date.now();
     const { status, body } = await request(server)
       .post('/uploads')
       .set('Authorization', `Bearer ${token}`);
+    const after = Date.now();
 
     expect(status).toBe(200);
     expect(body.data.key).toMatch(
@@ -60,7 +62,18 @@ describe('uploads', () => {
     );
     expect(body.data.fields.key).toBe(body.data.key);
     expect(body.data.maxBytes).toBe(UPLOAD_MAX_BYTES);
-    expect(new Date(body.data.expiresAt).getTime()).toBeGreaterThan(Date.now());
+
+    // The policy's own expiry is what S3 holds an upload to; until then, every
+    // POST of the slip stores the file again.
+    const { expiration } = JSON.parse(
+      Buffer.from(body.data.fields.Policy, 'base64').toString(),
+    ) as { expiration: string };
+
+    expect(Date.parse(expiration)).toBeGreaterThanOrEqual(before + 59_000);
+    expect(Date.parse(expiration)).toBeLessThanOrEqual(after + 60_000);
+    expect(Date.parse(body.data.expiresAt)).toBeLessThanOrEqual(
+      Date.parse(expiration),
+    );
   });
 
   it('stores the file at that key and serves it back through a signed link', async () => {
